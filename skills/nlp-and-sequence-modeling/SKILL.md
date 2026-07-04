@@ -68,6 +68,18 @@ Pitfall: very long beams (>10) on open-ended tasks *degrade* output (generic, re
 - Span extraction (QA-style start/end pointers) beats generation for extraction whenever the answer must be verbatim from the source: it cannot hallucinate, gives calibrated confidences, and is cheap. If using an LLM for extraction, force verbatim quoting + string-match verification against the source; unverified generative extraction *will* paraphrase and invent.
 - LLM-for-NER pattern that works: generate structured JSON of (entity, type, verbatim_text), then locate each verbatim_text in the source; drop non-matching spans. This converts hallucination into a detectable failure.
 
+## Task → approach selection (encoder finetune vs LLM)
+
+| Task | Default approach | Switch when |
+|---|---|---|
+| Text classification, high volume, fixed labels | finetuned small encoder (DeBERTa/ModernBERT class): cheap, fast, calibrated probabilities | < ~500 labeled examples or labels shift often → LLM few-shot/zero-shot; use the LLM to *bootstrap labels*, then distill to the encoder for serving |
+| NER / PII / tagging, production | finetuned encoder + BIO (+ verbatim rules for high-precision types like emails/regex-able IDs) | open-ended entity types or no training data → LLM with verbatim-quote verification (pattern below) |
+| Semantic search / dedup / clustering | contrastively trained embedding model + ANN index | reranking quality matters → add a cross-encoder reranker over top-k; cross-encoders beat bi-encoders on accuracy but can't scale to the full corpus |
+| Summarization / rewriting / open generation | instruction-tuned LLM | never a small seq2seq from scratch unless domain is extremely narrow and latency-critical |
+| Pairwise similarity with a threshold decision | cross-encoder classifier trained on pairs | embeddings + cosine only for the candidate-generation stage |
+
+Cost/latency rule: if a task runs > ~100k times/day with fixed structure, the LLM is the *teacher*, not the server — generate silver labels, train the small model, keep the LLM for the tail. Calibration rule: encoder classifiers give usable probabilities after temperature scaling; LLM token-choice "probabilities" from sampled text are not calibrated class probabilities — if you need thresholds, get logprobs of the label tokens or train a proper classifier.
+
 ## Cross-lingual transfer realities
 
 - Multilingual encoders transfer zero-shot (train on English, apply to language X) surprisingly well between typologically close, well-represented languages, and poorly for low-resource/distant ones — quality tracks the language's pretraining share and tokenizer efficiency (see inequity above).

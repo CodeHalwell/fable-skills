@@ -77,6 +77,13 @@ Priority order: **data quality ≫ LR > epochs > everything else.** Batch size, 
 - System prompt consistency: if training examples have no system prompt but serving does (or a different one), you've created train/serve skew. Bake the serving system prompt into training data, or vary it deliberately across examples to teach robustness.
 - Invisible characters: mixed `\r\n` vs `\n`, non-breaking spaces, or a stray leading space before completions each tokenize differently and the model learns them. Diff a fully-rendered training string against a fully-rendered serving prompt **at the token-ID level** before any run.
 
+## Serving the tuned model
+
+- Two deployment shapes: **adapter serving** (base model + LoRA weights loaded per request/tenant — e.g. vLLM `--enable-lora`; near-zero marginal memory per task, small latency overhead) vs **merged weights** (`model.merge_and_unload()` → a standalone checkpoint; simplest ops, but one full model copy per task).
+- Merge-then-quantize is not the same model as train-time QLoRA: the adapter was trained against the *4-bit* base, and merging into fp16 then re-quantizing (GPTQ/AWQ/GGUF) shifts numerics. Always rerun the task eval on the exact artifact you deploy, in the exact serving engine — engine-level differences (KV-cache precision, sampler implementations) are small but your tune's margin may be small too.
+- Pin the serving-side chat template with the model artifact (ship `tokenizer_config.json` together); a serving engine falling back to its default template silently reintroduces the template-mismatch bug in production only.
+- Version tunes like models in any ML system: adapter/checkpoint + base model version + training data snapshot + eval report travel together; rollback is repointing to the previous adapter.
+
 ## How much data do you actually need?
 
 - Format/style/schema adaptation: 500–2,000 examples is usually enough; beyond ~5k you get diminishing returns unless task diversity is genuinely high.

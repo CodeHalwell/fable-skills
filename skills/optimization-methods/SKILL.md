@@ -7,85 +7,102 @@ description: Loads when solving or debugging optimization problems — choosing 
 
 ## Core mental model
 
-1. **Reformulation beats algorithm choice.** The top expert move is changing the problem: log-transform to make a product objective additive, substitute variables to remove a constraint, relax integrality then round, take the dual when constraints outnumber variables, add slack variables to convert max/abs into linear constraints. An hour of reformulation routinely beats a week of solver tuning.
-2. **Convexity is a certificate, not a vibe.** If the problem is convex, any local minimum is global, duality is (usually) tight, and off-the-shelf solvers give reliable answers with optimality guarantees. Learn to *recognize* convexity compositionally (the DCP rules): affine ∘ convex is convex; max of convex is convex; nonnegative sums preserve it; log/exp/norms/quadratics have known curvature. If you can express it in CVXPY without errors, it's convex — that's a practical test, not a metaphor.
-3. **Condition number is the speed limit of first-order methods.** On a quadratic with Hessian eigenvalues in [μ, L], gradient descent with optimal step converges like ((κ−1)/(κ+1))^t, κ = L/μ. κ = 10⁴ means ~5000 iterations per digit. Everything in the modern toolkit — momentum (√κ dependence), preconditioning, Adam's per-coordinate scaling, batch/layer norm — is an attack on κ.
-4. **In high dimensions, saddle points, not local minima, are the obstacle.** For random-ish landscapes, critical points with high loss are overwhelmingly saddles (some negative curvature to escape); poor local minima are rarer than folklore says, which is why plain SGD + noise works on ugly non-convex problems. Diagnose "stuck" as: saddle/plateau (gradient tiny, loss mediocre → add noise/momentum, check init) before assuming "bad local min".
-5. **Structure determines the tool.** Smooth + unconstrained → quasi-Newton (L-BFGS) or GD-family. Linear/quadratic + constraints → LP/QP solver. Integer decisions → MIP or accept heuristics. Black-box, expensive, low-dim → Bayesian optimization. Black-box, cheap, weird → CMA-ES/simulated annealing. Reaching for gradient descent on everything is the generalist tell.
+1. **Reformulation beats algorithm choice.** The top expert move is changing the problem: log-transform to make a product objective additive, substitute variables to eliminate a constraint, relax integrality then round, take the dual when constraints outnumber variables, introduce slacks to turn max/|·| into linear constraints. An hour of reformulation routinely beats a week of solver tuning.
+2. **Convexity is a certificate, not a vibe.** Convex ⟹ every local minimum is global, duality is (usually) tight, and off-the-shelf solvers return answers with optimality guarantees. Recognize convexity *compositionally* (the DCP rules): affine ∘ convex is convex; max of convex is convex; nonnegative-weighted sums preserve it; norms, quadratics, exp, −log have known curvature. Practical test: if CVXPY accepts the formulation without a DCP error, it's convex.
+3. **Condition number is the speed limit of first-order methods.** On a quadratic with Hessian eigenvalues in [μ, L], optimally-stepped GD converges like ((κ−1)/(κ+1))^t with κ = L/μ. κ = 10⁴ means thousands of iterations per digit. Everything in the modern toolkit — momentum (√κ dependence), preconditioning, Adam's per-coordinate scaling, batch/layer norm, feature standardization — is an attack on κ.
+4. **In high dimensions, saddles and plateaus, not local minima, are the obstacle.** For random-ish landscapes, high-loss critical points are overwhelmingly saddles (with escape directions); genuinely bad local minima are rarer than folklore says — which is why SGD + noise works on ugly non-convex problems. Diagnose "stuck" as saddle/plateau (tiny gradient, mediocre loss → noise, momentum, better init) before blaming "local minima".
+5. **Structure determines the tool.** Smooth + deterministic → L-BFGS. Stochastic minibatch → SGD/Adam family. Linear/quadratic + constraints → LP/QP solver. Integer decisions → MIP/CP-SAT or admit heuristics. Expensive black-box → Bayesian optimization. Cheap rugged black-box → CMA-ES. Reaching for gradient descent on everything is the generalist tell.
+6. **Optimality is a checkable claim.** Gradient norms, KKT residuals, duality gaps, and MIP bounds are certificates. An answer without its certificate is a guess with confidence.
 
 ## Decision frameworks
 
 ### Solver selection table
 | Problem shape | Tool | Notes |
 |---|---|---|
-| Smooth, deterministic, ≤ ~10⁶ vars, full gradients affordable | L-BFGS (`scipy.optimize.minimize(method='L-BFGS-B')`) | Superlinear near optimum; almost always beats hand-tuned GD on deterministic objectives |
-| Stochastic objective (minibatch losses) | SGD+momentum or Adam family | L-BFGS breaks under gradient noise; line searches lie |
-| Linear objective + linear constraints | LP solver (HiGHS via `scipy.optimize.linprog(method='highs')`) | Exact optimum in seconds up to millions of vars; do not gradient-descend an LP |
-| Convex quadratic + constraints | QP/conic solver (OSQP, Clarabel; model in CVXPY) | Portfolio, SVM-like, MPC problems |
-| Discrete choices, need quality guarantees, ≤ ~10⁵ binaries | MIP (HiGHS, CBC; OR-Tools CP-SAT for scheduling/logic) | Branch-and-bound gives an optimality *gap* — you know how far off you are |
-| Discrete, huge, time-boxed | Heuristics: local search, LNS, greedy + 2-opt; keep the MIP as a small-instance oracle | Validate heuristic on instances small enough for exact solve |
-| Black-box, expensive evaluations (< ~1000 evals), ≤ ~20 dims | Bayesian optimization (Optuna, botorch) | Hyperparameters, simulations |
-| Black-box, cheap, rugged, ≤ ~100 dims | CMA-ES (`cma` package) | Shockingly strong default; beats random/anneal in most benchmarks |
-| Nonlinear least squares specifically | Levenberg–Marquardt (`scipy.optimize.least_squares`) | Exploits residual structure; never use generic minimize for curve fitting |
+| Smooth, deterministic, full gradients affordable | L-BFGS (`scipy.optimize.minimize(method='L-BFGS-B')`) | Superlinear near optimum; nearly always beats hand-tuned GD on deterministic objectives |
+| Stochastic objective (minibatch losses) | SGD+momentum or AdamW | L-BFGS breaks under gradient noise; line searches chase noise |
+| Linear objective + linear constraints | LP solver (HiGHS via `scipy.optimize.linprog(method='highs')`) | Exact optimum, huge scale; never gradient-descend an LP |
+| Convex quadratic / conic + constraints | QP/conic solver (OSQP, Clarabel), modeled in CVXPY | Portfolio, SVM-style, MPC |
+| Discrete choices, need quality guarantees | MIP (HiGHS, CBC, Gurobi) or CP-SAT (OR-Tools) for scheduling/logic | Branch-and-bound reports an optimality *gap* — you know how far off you are |
+| Discrete, huge, time-boxed | Heuristics: greedy + local search, LNS; keep an exact solver as small-instance oracle | Validate the heuristic against exact solves on shrunk instances |
+| Black-box, expensive (< ~10³ evals), ≤ ~20 dims | Bayesian optimization (Optuna, BoTorch) | Hyperparameters, simulator tuning |
+| Black-box, cheap, rugged, ≤ ~100 dims | CMA-ES (`cma` package) | Strong default; usually beats annealing and random search |
+| Nonlinear least squares | `scipy.optimize.least_squares` (Levenberg–Marquardt / TRF) | Exploits residual structure; never use generic `minimize` for curve fitting |
+| Assignment / matching | `scipy.optimize.linear_sum_assignment` | Hungarian algorithm: exact, poly-time — not a search problem |
 
-### Adam vs SGD — the evidence-based rules
-- **Default Adam(W)** for: transformers/attention, sparse gradients (embeddings), anything with heterogeneous per-parameter gradient scales, and any situation where you can't afford an LR search. Its per-coordinate normalization is a cheap diagonal preconditioner.
-- **SGD+momentum can match or beat Adam** mainly on vision-style convnets with well-tuned LR schedules; its advantage there is small and costs tuning effort. The "Adam generalizes worse" folklore largely dissolved once weight decay was fixed: use **AdamW** (decoupled decay), because in plain Adam, L2 penalty gets divided by the second-moment estimate and effectively vanishes for high-gradient weights.
-- Adam's ε is a real hyperparameter, not a formality: with tiny second moments, effective LR ≈ lr/ε-scaled; raising ε (1e-8 → 1e-4) tames spikes in low-signal regimes.
-- Learning-rate warmup matters for Adam because early second-moment estimates are noisy; a few hundred–few thousand warmup steps is standard, not superstition.
+### Adam vs SGD — folklore vs evidence
+- **Default AdamW** for: transformers/attention stacks, sparse gradients (embeddings), heterogeneous per-parameter gradient scales, and whenever you can't afford a careful LR search. Per-coordinate second-moment scaling is a cheap diagonal preconditioner.
+- **SGD+momentum** can match or beat Adam mainly on vision-style convnets with well-tuned schedules; the edge is small and costs tuning. The "Adam generalizes worse" folklore largely dissolved once weight decay was fixed: in plain Adam, an L2 penalty gets divided by the second-moment estimate and effectively vanishes for high-gradient weights. Use decoupled decay — `torch.optim.AdamW` — and note that `weight_decay` in `torch.optim.Adam` is the broken coupled version.
+- Adam's ε is a real hyperparameter: with tiny second moments the effective step scales like lr/√(v̂+ε); raising ε (1e-8 → 1e-4) damps spikes in low-signal regimes.
+- Warmup for Adam is not superstition: early second-moment estimates are noisy, so the first steps are wildly mis-scaled without a few hundred–few thousand warmup steps.
+- Gradient clipping (by global norm, e.g. 1.0) is cheap insurance against loss spikes from rare large gradients; it changes the direction only on the clipped steps.
 
-### Step size: line search vs fixed
-- Deterministic full-batch objective → always line search (Armijo/Wolfe; built into L-BFGS). Hand-picking a step for a deterministic problem is leaving free accuracy on the table.
-- Stochastic minibatch → fixed schedule (cosine/linear decay + warmup). Line search on noisy gradients chases noise. If loss diverges immediately: LR above 2/L for the sharpest curvature — cut 10×. If loss plateaus early and high: usually too *low* an LR or bad conditioning, not a "local minimum".
-- Batch size tradeoff: larger batches reduce gradient variance (allowing ~proportionally larger LR up to a critical batch size) but cost linearly more compute per step; past the critical size you pay compute for no optimization speedup. Small batches also act as implicit regularization noise.
+### Step size: line search vs fixed schedule
+- Deterministic full-batch → always line search (Armijo/Wolfe; built into L-BFGS/CG). Hand-picking a fixed step for a deterministic problem leaves free accuracy on the table.
+- Stochastic minibatch → fixed schedule (warmup + cosine/linear decay). Line search on noisy gradients fits the noise of the current batch.
+- Diagnosis table: loss diverges immediately → LR above 2/L for the sharpest direction, cut 10×. Loss plateaus early and high → usually too *low* an LR or bad conditioning/scaling, not a local minimum. Loss oscillates with period ~2 steps → at the stability edge, cut 2–3×. Train improves, eval doesn't → not an optimization problem; stop tuning the optimizer.
+- Batch size: larger batches cut gradient variance, allowing ~proportionally larger LR up to a critical batch size; beyond it you spend compute for no optimization speedup. Small batches add implicit regularization noise. When you scale batch ×k, start by scaling LR ×k (linear scaling) and re-check stability.
 
-### Constrained problems — the KKT ladder
-1. Try to **eliminate** the constraint: reparameterize (x = exp(z) for x>0; softmax for simplex; x = l + (u−l)·sigmoid(z) for boxes).
-2. Simple set you can project onto (box, ball, simplex) → **projected gradient**.
-3. General smooth constraints → model it in CVXPY if convex; otherwise SLSQP/IPOPT-class solvers.
-4. **Penalties last, and start soft**: a huge penalty weight from step one wrecks conditioning (κ scales with the penalty weight); use augmented Lagrangian or increase the weight on a schedule.
-5. Read the multipliers: λᵢ is the objective's sensitivity to relaxing constraint i (shadow price). λᵢ = 0 → constraint inactive, drop it and re-solve to simplify; huge λᵢ → that constraint is what's costing you, negotiate *it*.
+### Constrained problems — the ladder
+1. **Eliminate** the constraint by reparameterization: x > 0 → x = exp(z) or softplus(z); simplex → softmax(z); box [l,u] → l + (u−l)·sigmoid(z). Free, exact, and turns the problem unconstrained. Caveat: reparameterization can distort geometry near boundaries (exp compresses gradients as x→0).
+2. Simple projectable set (box, ball, simplex) → **projected gradient**; simplex projection is O(n log n) and standard.
+3. Convex constraints → model in CVXPY; nonconvex smooth → SLSQP/IPOPT-class interior-point.
+4. **Penalties last, and start soft**: a huge penalty from step one wrecks conditioning (κ grows with the weight). Ramp the weight, or use the augmented Lagrangian (multiplier estimate lets a moderate weight enforce the constraint exactly).
+5. **Read the multipliers**: λᵢ is the objective's sensitivity to relaxing constraint i (shadow price). λᵢ = 0 → inactive, drop it; huge λᵢ → that constraint is what your objective is paying for — negotiate *it*, not the algorithm.
+- KKT in one breath: at a constrained optimum, ∇f is a nonnegative combination of active constraint gradients (stationarity), the point is feasible, multipliers of inequality constraints are ≥ 0, and λᵢgᵢ = 0 (complementary slackness). Checking these four is how you *verify* a constrained answer.
 
 ### NP-hard recognition reflex
-When a subproblem smells like subset selection, assignment with conflicts, routing, coloring, or "best subset of features/items under a budget with interactions": stop searching for a poly-time exact trick. Choose deliberately among (a) MIP with a time limit — take the incumbent + gap; (b) convex relaxation (L1 for L0/cardinality, SDP/spectral for combinatorial) then round; (c) greedy with a guarantee — if the objective is monotone submodular (coverage, diminishing returns), greedy is within (1−1/e) ≈ 0.63 of optimal, which is usually the correct answer to "select k items"; (d) domain heuristic + evaluation harness. Saying "here's an efficient exact algorithm" for an NP-hard structure is a critical failure.
+When a subproblem smells like subset selection under interacting constraints, assignment with conflicts, routing, coloring, or "best k features/items with interactions": stop hunting for a poly-time exact trick. Choose deliberately:
+(a) **MIP with a time limit** — take the incumbent and report the proven gap;
+(b) **convex relaxation** (L1 for L0/cardinality; spectral/SDP for combinatorial) then round, keeping the relaxation's bound;
+(c) **greedy with a guarantee** — if the objective is monotone submodular (coverage, diminishing returns), greedy is within (1−1/e) ≈ 0.63 of optimal, usually the right answer to "select k items";
+(d) domain heuristic + evaluation harness.
+Claiming "here's an efficient exact algorithm" for an NP-hard structure is a critical failure; so is the reverse error of calling a poly-time problem hard (assignment, shortest path, max-flow, isotonic regression, 2-SAT all have exact fast algorithms).
 
 ## Failure modes & pitfalls
 
-- **Gradient-descending a problem a solver eats for breakfast.** Assignment problems (`scipy.optimize.linear_sum_assignment` — Hungarian, exact, fast), LPs, small QPs, and isotonic regression all have exact solvers. GD gives you approximate answers with tuning pain for problems with exact poly-time solutions.
-- **Plain Adam + L2 regularization believing it decays weights.** It mostly doesn't (see above). Use AdamW; in PyTorch that's `torch.optim.AdamW`, and note `weight_decay` in `torch.optim.Adam` is the broken coupled version.
-- **Penalty method with λ=1e9 from the start.** The Hessian gains eigenvalues of order λ → κ explodes → GD stalls or oscillates. Ramp the penalty, or use augmented Lagrangian (adds a multiplier estimate so moderate λ suffices).
-- **Declaring convexity from a plot, or "the sum of two convex functions' ratio".** Ratios, products, and differences of convex functions are generally *not* convex (x² − x⁴, x/y). Verify by DCP composition rules or a failed CVXPY formulation. Conversely, don't miss hidden convexity: geometric programs (posynomials) become convex after log-log transform.
-- **Trusting `scipy.optimize.minimize` defaults blindly.** Default method (BFGS) with numerically-differenced gradients on a noisy objective produces garbage silently — check `result.success`, `result.message`, and gradient norm at the "solution". If evaluations are noisy, finite differences are meaningless; switch to Nelder-Mead/CMA-ES or fix the noise.
-- **One local optimum = the answer, for multimodal problems.** Multistart is not optional for non-convex fits (mixture models, MLE with multiple modes, neural-net-free but non-convex objectives): 10–50 random restarts, keep the best, and *report* the spread — a wide spread is diagnostic information.
-- **Normalizing inputs is treated as preprocessing trivia; it's conditioning.** Unscaled features with ranges 1 vs 10⁶ produce κ ≥ 10¹² on a linear model. No optimizer setting rescues this; standardize (or whiten) and the "hard" optimization vanishes. First question for any slow convergence: what's the scale spread of inputs/parameters?
-- **Confusing "loss stopped improving" with convergence.** Check the gradient norm. Tiny gradient + mediocre loss = plateau/saddle (fix: momentum, LR bump, better init). Large oscillating gradient = LR too high or batch too small. Loss improving on train but not eval is not an optimization problem at all — stop tuning the optimizer.
-- **Early stopping on the *test* metric, tuning LR on test, etc.** — optimization decisions made on held-out data quietly become training. Keep a validation split for all optimizer/schedule choices.
-- **Duality misuse:** taking the dual and forgetting to check strong duality conditions (convex + Slater's condition: a strictly feasible point). For non-convex problems the dual gives a *bound*, not the answer — valuable (e.g., for branch-and-bound and Lagrangian relaxation), but don't report the dual optimum as the solution.
-- **Ignoring the incumbent/gap semantics of MIP solvers.** A MIP hitting its time limit returns the best feasible solution *plus a bound*. "Solver timed out" is not failure — report "within 2.3% of optimal, proven". Set `mip_rel_gap` deliberately rather than waiting hours for the last 0.1%.
+- **Gradient-descending a problem a solver eats for breakfast.** Assignment (`linear_sum_assignment`), LPs, small QPs, isotonic regression, nonneg least squares (`scipy.optimize.nnls`) have exact solvers. GD gives approximate answers with tuning pain for problems with certified fast solutions.
+- **Plain Adam + `weight_decay` believing it regularizes.** It mostly doesn't (coupled decay is normalized away). AdamW or explicit decoupled decay.
+- **Penalty weight 1e9 from the start.** Hessian gains eigenvalues of order the weight → κ explodes → GD stalls/oscillates, and you conclude "the constraint makes it hard". Ramp, or augmented Lagrangian.
+- **Convexity by eyeball or by wishful algebra.** Products, ratios, and differences of convex functions are generally *not* convex (x/y, x²−x⁴). Verify by DCP composition or a failing CVXPY build. Also don't miss *hidden* convexity: geometric programs (posynomials) become convex under log-log transform; some rational problems become LPs after Charnes–Cooper.
+- **Trusting `scipy.optimize.minimize` silently.** Default BFGS with finite-difference gradients on a noisy objective returns garbage without complaint. Always check `result.success`, `result.message`, and the gradient norm at the "solution". If evaluations are noisy, finite differences are meaningless — fix the noise or switch to Nelder-Mead/CMA-ES.
+- **One run = the answer, for multimodal problems.** Mixture models, MLE with multiple modes, and most nonconvex fits need multistart: 10–50 random inits, keep the best, *report the spread* — a wide spread is diagnostic information, not an inconvenience.
+- **Treating input scaling as preprocessing trivia.** Features spanning 1 vs 10⁶ produce κ ≥ 10¹² on a linear model; no optimizer setting rescues that. Standardize/whiten and the "hard optimization" evaporates. First question for slow convergence: what's the scale spread across inputs and parameters?
+- **Confusing "loss stopped improving" with convergence.** Check the gradient norm. Tiny gradient + mediocre loss = plateau/saddle → momentum, LR bump, better init. Large oscillating gradient = LR too high or batch too small. Improving train + flat eval = generalization, not optimization.
+- **Optimizer decisions made on the test set.** LR schedules, early stopping, architecture picks tuned on test data quietly become training. Keep a validation split for every optimizer choice.
+- **Duality misuse.** Strong duality needs convexity + a constraint qualification (Slater: a strictly feasible point). For nonconvex problems the dual gives a *bound* — valuable for branch-and-bound and Lagrangian relaxation — but reporting the dual optimum as the solution is wrong.
+- **Misreading MIP timeouts as failure.** A MIP at its time limit returns the best incumbent *plus a bound*: "within 2.3% of optimal, proven" is a strong result. Set `mip_rel_gap` deliberately instead of burning hours on the last 0.1%.
+- **Stopping-criterion sloppiness.** `ftol`-only stopping halts on plateaus that aren't optima; `gtol`-only stalls forever on flat valleys. Use both, plus a max-iteration budget, and report *which* criterion fired.
+- **Projected gradient with the wrong projection.** Projecting onto the simplex by "clip negatives, renormalize" is not the Euclidean projection and biases the solution; use the exact sorting-based projection or a softmax reparameterization.
+- **Comparing optimizers at one LR each.** Any A-vs-B optimizer claim requires tuning LR (at least a small grid) *per optimizer*; Adam-at-its-best vs SGD-at-default is the most common source of folklore.
 
 ## Worked micro-examples
 
 **1. Reformulation: L1 regression as an LP (no subgradient hacks).**
-min ‖Ax − b‖₁ becomes: introduce t ∈ ℝᵐ, minimize Σtᵢ s.t. −t ≤ Ax − b ≤ t.
+min ‖Ax − b‖₁ becomes: introduce t ∈ ℝᵐ, minimize Σtᵢ subject to −t ≤ Ax − b ≤ t.
 ```python
 import cvxpy as cp
 x = cp.Variable(n)
 prob = cp.Problem(cp.Minimize(cp.norm1(A @ x - b)))
-prob.solve()          # CVXPY does the LP reformulation internally — exact, fast
+prob.solve()          # CVXPY performs the LP reformulation internally — exact, fast
 ```
-The same slack trick converts minimax (min max_i fᵢ) and any |·| in objectives/constraints into linear form. Recognizing "this nonsmooth thing is secretly an LP" is worth more than any subgradient schedule.
+The same slack-variable trick converts minimax (min max_i fᵢ becomes min t s.t. fᵢ ≤ t) and any |·| into linear form. Recognizing "this nonsmooth thing is secretly an LP" is worth more than any subgradient schedule.
 
 **2. Condition number → concrete step-count arithmetic.**
-f(x) = ½(x₁² + 100x₂²): L = 100, μ = 1, κ = 100. Best fixed step η* = 2/(L+μ) ≈ 0.0198; contraction factor (κ−1)/(κ+1) ≈ 0.98 per step → ~115 steps per e-fold, ~1150 steps for 10⁻⁴ error. Heavy-ball momentum: factor (√κ−1)/(√κ+1) ≈ 0.82 → ~12 steps per e-fold, ~10× fewer. Rescale x₂' = 10·x₂ and κ = 1: one Newton-like step. Same problem, three costs — conditioning is the variable.
+f(x) = ½(x₁² + 100x₂²): L = 100, μ = 1, κ = 100. Best fixed step η* = 2/(L+μ) ≈ 0.0198; contraction (κ−1)/(κ+1) ≈ 0.98 per step → ~115 steps per e-fold, ~1150 steps for 10⁻⁴ error. Heavy-ball momentum: (√κ−1)/(√κ+1) ≈ 0.82 → ~12 steps per e-fold, ~10× fewer. Rescale x₂' = 10x₂ and κ = 1: converges in one well-stepped iteration. Same problem, three costs — conditioning is the variable, and "rescale" beat both algorithms.
 
 **3. KKT reading on a budget allocation.**
-max Σᵢ αᵢ log(xᵢ) s.t. Σxᵢ = B, xᵢ ≥ 0. Lagrangian stationarity: αᵢ/xᵢ = λ → xᵢ = αᵢ/λ; the budget gives λ = Σαⱼ/B, so xᵢ = B·αᵢ/Σαⱼ — proportional allocation, derived not guessed. The multiplier λ = Σαⱼ/B is the marginal utility of budget: doubling B halves λ, quantifying exactly how much another dollar of budget is worth. Log-utility + linear budget → proportional split is a pattern worth caching (it's also why softmax-style allocations keep reappearing).
+max Σᵢ αᵢ log xᵢ s.t. Σxᵢ = B, xᵢ ≥ 0. Stationarity: αᵢ/xᵢ = λ → xᵢ = αᵢ/λ; the budget constraint gives λ = Σαⱼ/B, so xᵢ = B·αᵢ/Σαⱼ — proportional allocation, derived rather than guessed. The multiplier λ = Σαⱼ/B is the marginal utility of budget: doubling B halves λ, quantifying exactly what another unit of budget buys. Log-utility + linear budget → proportional split is a pattern worth caching; it's why softmax-shaped allocations keep reappearing.
+
+**4. Submodular selection with a guarantee.**
+"Pick 10 monitoring locations covering the most incidents" — coverage is monotone submodular, so greedy (repeatedly add the location covering the most *uncovered* incidents) is guaranteed ≥ (1−1/e) ≈ 63% of the optimal coverage, and in practice lands within a few percent. The alternative — an exact search — is NP-hard set cover. Greedy here isn't a compromise; for this objective class it's provably near the best any polynomial algorithm can do. Recognize the diminishing-returns property, cite the guarantee, ship the greedy.
 
 ## Verification & self-check
 
-- **Check optimality certificates, not just objective values**: gradient norm ≈ 0 (unconstrained), KKT residuals + complementary slackness (constrained), duality gap (convex solvers report it), MIP gap (branch-and-bound).
-- **Perturb the "optimum"**: evaluate f at x* ± small random steps; if anything is lower, you weren't done. Cheap and catches premature-stop bugs.
-- **Verify the gradient itself** when using custom gradients: compare to central finite differences at a random point (`scipy.optimize.check_grad`); relative error should be ≲1e-6 in float64. Most "optimizer isn't working" reports are wrong gradients.
-- **Feasibility first**: for constrained answers, plug into every constraint with tolerances and report max violation; solvers' "optimal" can hide 1e-4 violations that matter downstream.
-- **Cross-check with a second method on a shrunk instance**: exact/brute-force on n=10 vs your heuristic; solver A vs solver B. Disagreement in the objective beyond tolerance means a modeling bug, usually a sign flip or missing constraint.
-- **Restart audit for non-convex claims**: if you're asserting "the optimum is X", show the multistart spread that supports the claim.
+- **Check certificates, not just objective values**: gradient norm ≈ 0 (unconstrained); KKT residuals + complementary slackness (constrained); duality gap (convex solvers report it); MIP gap (branch-and-bound reports it).
+- **Perturb the "optimum"**: evaluate f at x* ± small random steps; anything lower means you weren't done. Catches premature-stop and wrong-sign bugs cheaply.
+- **Verify custom gradients** against central finite differences at random points (`scipy.optimize.check_grad`); relative error ≲ 1e-6 in fp64. Most "the optimizer is broken" reports are wrong gradients.
+- **Feasibility first**: plug the answer into every constraint and report the max violation with its tolerance; solver "optimal" can hide 1e-4 violations that matter downstream.
+- **Cross-check with a second method on a shrunk instance**: brute force at n = 10 vs your method; solver A vs solver B. Objective disagreement beyond tolerance = modeling bug, usually a sign flip or a missing constraint.
+- **Multistart audit for nonconvex claims**: an asserted optimum should come with the restart spread that supports it.
+- **Sanity-check the multipliers**: shadow prices with impossible signs (negative price for a resource you'd pay for) indicate a modeling error even when the solver reports success.

@@ -133,6 +133,13 @@ Redesigned:
 
 Every change is mechanical application of the rules above: flatten, enumerate, describe, add null/other escape hatches, replace the numeric scale with anchored labels. Typical result of exactly this kind of rewrite: invalid/wrong-field rate drops from ~12% to ~1–2% with no model or prompt change — which is why schema redesign is the first move, not more prompt engineering.
 
+## Testing structured pipelines
+
+- Contract-test the provider: in CI, send your exact schema with a canned input to the pinned model version and assert the response validates. Providers change schema-subset support and defaults; this test converts "mysterious production 400s" into a red build.
+- Build a malformed-output corpus from production logs (every response that ever failed validation) and unit-test your extractor/repair path against all of it — your parser's regression suite, independent of any model.
+- Fuzz the semantic validator with schema-valid-but-wrong values (enum escape values everywhere, all-nulls, max-length strings, `0` vs `null` confusions) to confirm downstream code handles the full legal space, not just the happy path the model usually produces.
+- Track per-field error rates, not just per-response: one chronically-wrong field (fix its description) looks identical to diffuse randomness (fix the task decomposition) in a response-level metric, and the fixes are completely different.
+
 ## Verification checklist
 
 - [ ] Every field has a description; enums have an escape value; refusal/uncertainty path exists in the schema.
