@@ -62,6 +62,16 @@ Channels vs shared memory rule: channels when the design is *data flowing throug
 - Therefore: I/O-bound → threads are fine (or async at high fan-out); CPU-bound → processes (`ProcessPoolExecutor`; mind pickling cost of arguments and results — chunk work so IPC amortizes) or native/vectorized code.
 - **The GIL does not make your code thread-safe.** It makes individual bytecodes atomic-ish; `x += 1`, `d[k] = d.get(k, 0) + 1`, and every check-then-act sequence interleave and corrupt. You still need locks/queues for compound operations. Free-threaded (no-GIL) builds remove even the bytecode-level accident — never rely on it.
 
+### Memory-model quick facts by language
+| Language | What you must know |
+|---|---|
+| C/C++ | Any data race = undefined behavior, full stop — not "stale value" but license to miscompile. `std::atomic` default (`seq_cst`) is the safe choice; use `acquire`/`release` only with a proven need and a comment; `relaxed` is for counters you never branch on |
+| Java | Data races are defined but vicious: you can see stale values and impossible interleavings. `volatile` gives visibility + ordering (an acquire/release edge), *not* compound atomicity; `final` fields are safely published after the constructor — non-final fields of an unsafely published object are not |
+| Go | Data races are effectively fatal (may corrupt memory); `go test -race`/`go run -race` in CI is non-negotiable. Channels and `sync` primitives create the happens-before edges; "it's just an int" is not an excuse |
+| Rust | Safe Rust prevents data races at compile time (`Send`/`Sync`); it does *not* prevent race conditions or deadlocks — check-then-act across two `Mutex` acquisitions still races |
+| Python | GIL prevents torn reads of single objects but not compound-op races; C extensions can release the GIL anywhere. Multiprocessing sidesteps the memory model entirely — data is copied, and "shared" state silently isn't |
+| JS/TS | Single-threaded, so no data races — but every `await` is an interleaving point: state checked before an `await` may be invalid after it. Re-validate, or restructure so the check and use straddle no await |
+
 ### Lock-free: when and when not
 - Legitimate uses: hot counters and flags (`fetch_add`), publish-once pointer swaps (immutable snapshot pattern), and established library structures (`java.util.concurrent`, `crossbeam`, `folly`). Also when priority inversion or signal/interrupt context forbids locks.
 - **Never hand-roll linked lock-free structures.** ABA, safe memory reclamation (hazard pointers/epochs), and memory-ordering subtleties defeat almost everyone, and the failure reproduces only under production contention. Use a library or use a lock.
@@ -80,6 +90,11 @@ Channels vs shared memory rule: channels when the design is *data flowing throug
 - **Testing concurrency with sleeps.** `time.sleep(0.1)` "to let the other thread run" produces tests that pass on your laptop and flake in CI forever. Instead: force the interleaving with `threading.Event`/barriers/latches; stress-loop the race body thousands of times; run race detectors — `go test -race` (non-negotiable in Go), TSan for C/C++, `loom` for Rust lock-free logic, asyncio debug mode for Python.
 - **Cleanup after the await instead of in `finally`.** On timeout the caller cancels you mid-await; a connection/file/lock released on the line *after* the await leaks. Acquire with `async with`/`with` wherever the resource supports it; otherwise `try/finally` from the moment of acquisition.
 - **Assuming FIFO or exactly-once anywhere it isn't promised.** Thread wakeups aren't FIFO, queue consumers interleave, and most delivery systems are at-least-once. Handlers must be idempotent and order-tolerant unless the specific mechanism documents otherwise.
+- **Double-checked locking without a publication edge.** `if instance is None:` → lock → check again → construct → assign looks airtight, but without acquire/release semantics on the field, another thread can observe the assignment *before* the constructor's writes (in Java pre-`volatile`, C++ without atomics). Use the language's blessed form: `volatile` field in Java, `std::call_once`/static-local init in C++, module-level init or `functools.lru_cache` in Python.
+- **Mixing `fork()` with threads.** `fork` copies only the calling thread; any lock held by another thread at fork time is locked *forever* in the child — classic hang in the logging module or malloc. On Linux+Python this bites via multiprocessing's default `fork` start method in threaded apps (and is why `spawn` is the safer default): set `multiprocessing.set_start_method("spawn")` in any process that also uses threads.
+- **Await-point invalidation in single-threaded async.** "No threads, so no races" — false: `await` yields control, and the world changes underneath. `if user_id in active: ...await notify()...; active.remove(user_id)` can double-remove or act on gone state if two tasks interleave. Every fact established before an `await` must be re-validated after it, or the critical section must contain no awaits (or be guarded by an `asyncio.Lock`).
+- **Shutdown as an afterthought.** Clean shutdown is a concurrency protocol of its own: stop accepting new work, drain or persist queued work, cancel in-flight tasks in dependency order (consumers before the resources they use), join with timeouts, *then* close connections. Ad-hoc shutdown (process kill, daemon threads evaporating) is where "rare" data loss actually lives. Design it with the same care as the hot path, and test it.
+- **Starvation and fairness assumptions.** Writer-preferring RW locks can starve readers and vice versa; a busy-polling task can starve a cooperative scheduler; a priority queue with constant high-priority arrivals never serves the low tier. If any consumer *must* eventually run, that's a fairness requirement — verify the primitive documents it, or add aging/quotas yourself.
 
 ## Worked micro-examples
 
@@ -127,3 +142,5 @@ Fix: `await asyncio.to_thread(bcrypt.hashpw, pw, salt)` — bcrypt releases the 
 - Every queue bounded, with a stated full-behavior? Every blocking call timeboxed?
 - Pool sizes justified by the arithmetic (cores × (1 + wait/compute); Little's law), with bulkheads per external dependency?
 - Did it run under a race detector or debug mode (`-race`, TSan, loom, asyncio debug) and a stress loop with forced interleavings — not just once, green, on a warm laptop?
+- Is the shutdown path specified (drain order, cancellation order, join timeouts) and exercised by a test, not just the happy path?
+- In async code, list every fact carried across an `await` — is each one re-validated after the interleaving point, or protected so it can't change?

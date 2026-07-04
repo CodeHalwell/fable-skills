@@ -16,6 +16,17 @@ description: Loads when analyzing or predicting algorithm performance — derivi
 
 ## Decision frameworks
 
+### Which analysis answers the question being asked?
+| Question | Analysis to use | Why |
+|---|---|---|
+| "Will this scale to 100× the data?" | Worst/expected-case asymptotics in the dominant resource | Constants wash out at 100×; the exponent doesn't |
+| "Why is p99 latency bad?" | Worst-case per-operation + amortization spikes + GC/rehash events | Averages hide exactly what p99 measures |
+| "Is this fast enough for n = 500?" | Measured constants; asymptotics barely apply | Everything is fast at small n; profile, don't derive |
+| "Can an attacker DoS this endpoint?" | Adversarial worst case (hash flooding, regex backtracking, zip bombs) | Expected-case guarantees assume non-adversarial inputs |
+| "Which of two designs for a hot loop?" | Cache behavior + branch predictability at realistic n | Same-O implementations differ 10–100× on access pattern |
+| "Is an efficient algorithm even possible?" | Lower bounds and hardness reductions | Stops you from optimizing against Ω(...) or NP-hardness |
+Back-of-envelope throughput anchors for feasibility checks: ~10⁸–10⁹ simple operations/second/core; ~10⁷ if each touches random memory; ~10⁴–10⁵ if each is a syscall or lock handoff; ~10²–10³ if each is a network round trip. An O(n²) plan at n = 10⁵ is 10¹⁰ operations — minutes, not milliseconds; the same plan at n = 10³ is 10⁶ — free. Run this arithmetic before designing anything clever.
+
 ### Recurrences
 - **Master theorem** for T(n) = a·T(n/b) + f(n): compare f(n) against n^(log_b a). Leaf-dominated (f smaller by a polynomial factor) → Θ(n^(log_b a)); balanced → Θ(n^(log_b a) · log n); root-dominated (f larger + regularity condition) → Θ(f). Mechanically: mergesort a=2, b=2, f=n → n¹ = n¹ → Θ(n log n). Karatsuba a=3, b=2, f=n → n^1.585 dominates → Θ(n^1.585). Binary search a=1, b=2, f=1 → Θ(log n).
 - **Where the master theorem does NOT apply**:
@@ -39,6 +50,25 @@ Smells: "choose a subset maximizing X under interacting constraints" (knapsack v
 | Huge, time-boxed, no guarantee required | Local search / simulated annealing / LNS — validated against exact solves on shrunk instances |
 Escape hatches to check *before* declaring hardness: tree/DAG/interval structure (many NP-hard problems turn polynomial there), a constraint that's actually always slack, 2-SAT sufficing instead of 3-SAT (poly), the "TSP" living on a line (sort), k fixed and tiny (n^k enumeration may be fine).
 
+### Cost cheat sheet — the library operations people get wrong
+| Operation | Actual cost | Common wrong belief / right tool |
+|---|---|---|
+| `list.append` | O(1) amortized, O(n) spikes | fine; pre-size for latency-critical loops |
+| `list.insert(0, x)`, `pop(0)` | O(n) | believed O(1); use `collections.deque` |
+| `list.insert(i, x)`, `remove`, `del lst[i]` | O(n) | shifts the tail every time |
+| `x in list` / `list.index` | O(n) | believed cheap; use `set`/`dict` |
+| `x in set` / `dict[k]` | O(1) expected | O(n) adversarial; fine for internal data |
+| `dict`/`set` insert of n items | O(n) amortized, with rehash spikes | growth rehashes are why memory ratchets |
+| `str += piece` in a loop | O(total²) | `''.join(parts)` |
+| `sorted(x)` / `list.sort` | O(n log n), adaptive (Timsort: O(n) if nearly sorted) | re-sorting nearly-sorted data is cheap; sorting per loop iteration is not |
+| `heapq.heappush/heappop` | O(log n) | `nsmallest/nlargest(k)` is O(n log k), beats full sort for small k |
+| `min(x)`/`max(x)` per iteration | O(n) each | hoist out of loops; O(n²) creeps in via "just take the max" |
+| slice `lst[a:b]`, `arr.copy()` | O(b−a) time *and* memory | slicing in recursion turns log into linear; NumPy *basic* slicing is O(1) views — but fancy indexing copies |
+| `np.append`, `pd.concat` per iteration | O(n) each → O(n²) total | accumulate then concatenate once |
+| `pd.DataFrame.iterrows` | catastrophic constants (boxing every value) | vectorize or `itertuples` |
+| `bisect.insort` | O(log n) search + O(n) insert | believed O(log n); use `sortedcontainers.SortedList` for many inserts |
+| B-tree/db index lookup | O(log n) *IO-sized* hops | the log's base (branching factor) is what matters on disk |
+
 ### Crossover estimation (constants and cache)
 - If A costs c₁·n² (1 ns/op, contiguous) and B costs c₂·n log₂ n (20 ns/op, pointer-chasing), A wins while n < (c₂/c₁)·log₂ n ≈ 20 log₂ n → n ≲ 200. Measure c₁ and c₂ with a two-point microbenchmark; never guess them from the code's appearance.
 - Cache misses and branch mispredictions contribute 10–100× to constants — the entire gap between "same Big-O" implementations. When two options tie asymptotically, pick the one that scans memory forward.
@@ -54,14 +84,7 @@ Escape hatches to check *before* declaring hardness: tree/DAG/interval structure
 
 ## Failure modes & pitfalls
 
-- **Hidden quadratics in innocent library calls** — the highest-frequency real-world class:
-  - `s += chunk` on strings in a loop: immutable → copy per iteration → O(total²). Use `''.join(parts)`. (CPython sometimes optimizes in-place concat; it disappears across refcounts and implementations — never rely on it.)
-  - `list.insert(0, x)` / `list.pop(0)` in a loop: O(n) shift each → O(n²). Use `collections.deque` (O(1) at both ends).
-  - `x in some_list` inside a loop: O(n) each → O(n²). Build a set once (O(n)), then O(1) membership.
-  - `list.remove(v)`: O(n) search + O(n) shift — and mutating while iterating skips elements.
-  - `np.append` / `pd.concat` in a loop: full reallocation each call → O(n²) plus memory churn. Accumulate in a Python list; one `np.concatenate`/`pd.concat` at the end.
-  - Repeated `sorted(...)` to track top-k in a stream: use `heapq.nlargest` or maintain a bounded heap (O(n log k)).
-  - `dict`/`set` growth: inserting n items triggers ~log-many rehashes, each O(current size) — amortized fine, latency-spiky; pre-size when the size is known.
+- **Hidden quadratics from one O(n) call inside an O(n) loop** — the highest-frequency real-world class. The canonical five: `s += chunk` on strings (copy per iteration — CPython sometimes optimizes in-place concat, but it vanishes across refcount conditions and implementations, so never rely on it); `list.insert(0)/pop(0)`; `x in some_list` membership; `np.append`/`pd.concat` per iteration; `sorted(...)` per iteration to track a running top-k. Every one has a linear-total replacement in the cheat sheet above. Audit the loop body's calls before trusting any loop's complexity.
 - **Amortized ≠ smooth.** `list.append`'s occasional O(n) resize appears as rare big stalls that "O(1) amortized" hides from you but not from your p99. Pre-allocate (`[None]*n`) in latency-critical loops or accept spikes knowingly.
 - **Slices and copies inside recursion.** `binary_search(arr[mid:])` turns O(log n) into O(n) per level; `sum(lst[:i])` inside a loop is the same bug flat. Pass indices, not slices; keep running aggregates.
 - **Quoting O(1) hashing where the worst case is the contract** — untrusted keys can force collisions (hash flooding; Python randomizes string hashes for this reason) — and the reverse cargo-cult of avoiding dicts in offline analytics "because worst case".
@@ -73,6 +96,9 @@ Escape hatches to check *before* declaring hardness: tree/DAG/interval structure
 - **Ignoring output size.** "Enumerate all pairs/subsets matching X" is Ω(#answers); no algorithm beats its own output. If the answer set can be 10⁹ rows, change the question (count, sample, top-k, iterator), not the algorithm.
 - **Big-O across layers.** An O(n) algorithm issuing n ORM queries is O(n) *round-trips* — the dominant term is in the units, not the count. State complexity in the resource that dominates (comparisons, cache lines, network calls, tokens).
 - **Off-by-log sloppiness in interviews-turned-designs.** Sorting inside a loop over n items is O(n² log n), not O(n log n); binary search per element of an m-array over an n-array is O(m log n) and beaten by a hash or a merge when m ≈ n. Recompute the product every time the loop structure changes.
+- **Recursion depth as the real limit.** An O(n) recursive solution over a 10⁶-element structure dies at Python's default ~1000-frame recursion limit long before time matters. Deep linear recursions (linked-list walks, degenerate trees) must be converted to iteration or an explicit stack; raising `sys.setrecursionlimit` trades the exception for a possible interpreter crash.
+- **Memoization's hidden costs.** A memo dict over tuple keys pays hashing O(len(key)) per lookup — memoizing on a list-slice-as-tuple key can re-introduce the factor you were removing — and unbounded `lru_cache(maxsize=None)` on a long-running service is a memory leak with a decorator's face. State the key size and the state count, not just "we memoize".
+- **String/bytes complexity assumptions crossing languages.** Python string ops are O(n) copies; but `str.find` is effectively optimized two-way search, and regexes with nested quantifiers can backtrack exponentially (`(a+)+$` on "aaaaab" — a genuine DoS class). "It's just a regex" is not a complexity statement; use RE2-style engines (`google-re2`) for untrusted patterns/inputs.
 
 ## Worked micro-examples
 

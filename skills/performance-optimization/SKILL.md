@@ -35,6 +35,15 @@ description: Load when making code or systems faster — diagnosing slowness, pr
 
 - Profile the *representative* workload: production data shapes and sizes, realistic concurrency, cache state matching reality (warm or cold — pick and state it). Profiling toy data on a dev laptop finds toy bottlenecks.
 
+### System-level triage before code-level (the USE pass)
+When "it's slow" arrives with no profile, sweep each resource for Utilization, Saturation, Errors before opening any source file:
+1. **CPU:** utilization per core (`mpstat -P ALL` — one pegged core with 31 idle means a serial bottleneck or a single-threaded runtime); run-queue length (`vmstat`, load average) for saturation.
+2. **Memory:** free + swap activity (`vmstat` si/so ≠ 0 means swapping — nothing else matters until that stops); for GC runtimes, pause time and allocation rate from runtime metrics.
+3. **Disk:** `iostat -x` — high `%util`/`await` means I/O-bound; check whether the I/O is even necessary (missing cache, logging in a hot loop, unbatched writes).
+4. **Network:** retransmits, connection churn (no keep-alive/pooling = a TLS handshake per request, several RTTs each), DNS lookups per call.
+5. **The step before all of these:** confirm *where* the time goes at the trace level — client, network, or server. A "slow API" that's fast in server logs is a client or network problem; optimizing the server is a category error.
+Only after this sweep is "profile the code" the right next move — code-level profiling of a machine that's swapping measures the swapping.
+
 ### Is this optimization worth doing? (run before writing code)
 1. From the profile: p = the target's fraction of end-to-end cost. Compute the Amdahl ceiling 1/(1−p). Ceiling below goal → wrong target.
 2. Estimate s realistically: removing a network hop — use the RTT table; algorithmic — use n and the complexity delta; micro-tuning — 1.2–3× is typical, 10× is rare.
@@ -55,6 +64,28 @@ description: Load when making code or systems faster — diagnosing slowness, pr
 - **Environment control:** pin or report CPU frequency scaling; beware thermal throttling on laptops; isolate from noisy neighbors; interleave A/B runs rather than "all A, then all B" (drift and cache state contaminate); run enough iterations to report variance. A lone mean without spread is not a measurement. Compare distributions, not single runs.
 - **Clocks:** use monotonic clocks for durations (`time.perf_counter()` in Python) — `time.time()` can step backwards under NTP.
 
+### Order-of-magnitude costs of common operations (approximate, for sanity math)
+| Operation | Rough cost |
+|---|---|
+| Function call / predicted branch | ~1ns |
+| Branch mispredict | ~5–15ns |
+| Mutex lock/unlock, uncontended | ~20–50ns |
+| Main-memory reference (cache miss) | ~100ns |
+| Small malloc / GC allocation | ~50–200ns |
+| Syscall (getpid-class, post-mitigations) | ~100s of ns–1µs |
+| Thread context switch | ~1–10µs |
+| Hashing/compressing 1KB | ~1µs-ish |
+| Parsing 1MB of JSON | ~1–10ms |
+| TLS handshake (uncached) | multiple RTTs + ~ms of CPU |
+| Process fork/spawn | ~ms |
+Use these for back-of-envelope vetoes: a per-request `fork` caps you at hundreds of req/s/core; JSON as an internal hot-path format costs ms per MB no matter how good the parser; taking an uncontended lock in a loop is noise, taking a *contended* one is a different regime entirely (queueing, not the lock cost).
+
+### When not to optimize
+- The measured cost is below the noise floor of the system around it (shaving 2ms off a step in a 3-day batch pipeline).
+- The simple version isn't shipped yet — you're optimizing hypothetical load with real complexity. Ship, measure, then optimize what reality indicts.
+- The win requires breaking a correctness property (dropping a transaction, widening a race window, caching the uncacheable). Latency SLOs never outrank correctness invariants; get sign-off explicitly, don't trade silently.
+- The bottleneck is organizational (a nightly batch window, a rate limit set by another team, a contract). Negotiating the constraint beats engineering around it.
+
 ## Failure modes & pitfalls
 
 - **Optimizing without a baseline number.** No "before" measurement means the "after" claim is unfalsifiable and no regression test is possible. Record the exact command, dataset, environment, and numbers before the first change.
@@ -69,6 +100,9 @@ description: Load when making code or systems faster — diagnosing slowness, pr
 - **Calling a delta inside the noise floor a win.** If run-to-run spread is ±5%, a 3% improvement is a coin flip. Require the delta to clear the measured variance (pytest-benchmark and JMH report error bounds — use them) before claiming victory.
 - **Optimizing the wrong percentile.** Shaving p50 while p99 is the SLA breach; or "fixing" tail latency caused by GC/compaction pauses with code tweaks that don't touch the pause source. Match the fix to the percentile: p50 problems are usually hot-path cost; p99 problems are usually queueing, GC, locks, cold caches, or retries.
 - **Ignoring the cost of the measurement itself.** Tracing/instrumented profilers can distort hot loops by 10x+ and *reorder* the ranking (cheap functions called often inflate most). For ranking hot spots, prefer sampling profilers; use tracing for call counts and exact paths.
+- **Measuring a debug build.** Unoptimized C/C++/Rust (`-O0`, cargo without `--release`), Python with coverage instrumentation on, JVM with `-Xint` or a debugger attached — all produce numbers 2–50× off that don't rank the same hot spots. Confirm build flags before believing any number, especially one that contradicts the latency-hierarchy sanity check.
+- **Load-testing a miniature.** Staging with 1/100th the data misses everything superlinear: the O(n²) that's invisible at 10k rows, the index that fits in RAM at small scale but not at prod scale, the lock that only contends at real concurrency. Scale-dependent behavior must be tested at (or extrapolated carefully toward) production scale — state the scale next to every result.
+- **Fixing tail latency with mean-latency tools.** p99 spikes from GC pauses, LRU eviction storms, connection-pool exhaustion, or retry pile-ups won't move no matter how much you optimize the hot path. First determine *which requests* are slow (trace sampling on slow requests) — if the slow ones share a trigger (pause, cold cache, retry), optimize the trigger, not the code.
 
 ## Worked micro-examples
 
@@ -92,6 +126,12 @@ xs = np.random.rand(10_000_000)   # one contiguous 80MB float64 buffer
 s = xs.sum()                      # ~10ms: streams at memory bandwidth
 ```
 The ~100× gap is locality plus eliminating per-element interpreter work: one sequential 80MB scan versus 10M pointer-chased dicts. The transferable lesson: choose the data *layout* (columnar, arrays of primitives) before micro-tuning access to a bad layout — layout is a category-1 decision wearing category-3 clothes.
+
+### 4. Coordinated omission, with numbers
+A service normally responds in 1ms but freezes completely for 10 seconds during a 100-second test (a GC pause or deploy blip). Load is nominally 100 req/s.
+- **Closed-loop tester** (one outstanding request, next sent after the previous returns): during the freeze it sends 1 request, which takes 10s; the other ~9,000 requests it *would* have sent are simply never issued or measured. Result: ~90,000 samples at 1ms, one at 10s → reported p99.9 ≈ 1ms. Looks fine.
+- **Reality for open-loop arrivals** (users don't wait for each other): every request arriving during the freeze queues. Arrivals in the window experience 0–10s of extra latency, ~1,000 requests are affected → true p99 is measured in *seconds*.
+- The tester hid a 1000× tail error, in the optimistic direction, precisely because the system was slow. Rule: latency-under-load claims are only valid from fixed-arrival-rate (open-loop) generation — wrk2-style `--rate`, or harnesses that correct for omission (HdrHistogram's corrected recording). Ask "what does the generator do while the system stalls?" of every load-test result you're shown.
 
 ## Self-check before presenting performance conclusions
 

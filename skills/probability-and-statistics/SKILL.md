@@ -41,11 +41,25 @@ Example: π = 0.001, sens = 0.99, fpr = 0.05 → odds = (1/999)(0.99/0.05) ≈ 0
 - **Choosing n**: power analysis first, always. To detect effect d (in SDs) at α=0.05 with 80% power, n per group ≈ 16/d². d = 0.1 → ~1600/group. If the feasible n can't reach power ≥ 0.5, redesign (bigger effect via targeting, paired design, variance reduction via CUPED/regression adjustment) rather than run a doomed test.
 - **Bayesian vs frequentist is a tooling choice.** Go Bayesian when: genuine prior information, small n, hierarchical/partial-pooling structure (many small groups → shrink group estimates toward the grand mean), decisions needing utilities. Go frequentist when: you need calibrated error-rate guarantees over repeated use (pipelines, regulatory), or n is large enough that priors wash out. Refuse ideological framing; with flat priors and big n they numerically agree, and the choice should be driven by which machinery fits the structure.
 
+### Simulation patterns (the verification workhorse)
+- **Forward simulation**: encode the generative story, run it 10⁵ times, count. Settles arguments about conditional probabilities (Monty Hall, boy-girl paradoxes, birthday variants) in seconds. The discipline is simulating the *exact* conditioning: filter runs by what was actually observed, then measure frequency within the filtered set — most paradoxes are people simulating the wrong filter.
+- **Parametric bootstrap**: fit the model, simulate datasets from the fit, re-fit each — the spread of re-fits is your uncertainty *under the model*. Compare with the nonparametric bootstrap; big disagreement means the model's assumptions are doing heavy lifting.
+- **Null simulation**: simulate under H₀ with your full analysis pipeline (including any selection/peeking behavior) to get the *real* false-positive rate rather than the nominal one.
+- **Power simulation**: simulate under the effect size you'd care about; the fraction of significant results is your power. Ten lines, and it works for any design (clustered, sequential, non-normal) where formulas don't exist.
+- Costing: 10⁵ draws gives Monte Carlo SE of a probability estimate ≈ √(p(1−p)/10⁵) ≈ 0.0016 at p = 0.5 — quote probabilities from simulation to at most 2–3 digits and increase draws when tail probabilities (p < 0.01) are the target (you need ~100/p draws for a decent relative error).
+
 ### Estimator judgment
 - Unbiasedness is overrated; MSE = bias² + variance is what you eat. Shrinkage (James–Stein, ridge, partial pooling) deliberately buys bias to slash variance and wins whenever you estimate many related quantities. Prefer unbiasedness mainly when estimates get *summed downstream* (biases accumulate; variances average out).
 - MLE is asymptotically efficient but fragile at edges: p̂ = 0/“0 successes” breaks products and logs — smooth with Laplace/beta pseudo-counts before multiplying. Boundary MLEs (variance components at 0) need profile likelihood or Bayes.
 - Medians and trimmed means are not "weaker t-tests" — under heavy tails they have *lower* variance than the mean. Match the estimator to the tail, not to convention.
 - Report uncertainty of the estimator you'll actually use (e.g., the ratio of two means needs the delta method or bootstrap — not the SEs of numerator and denominator separately).
+
+### What to report: point, interval, or distribution
+- Repeatable, symmetric-loss, aggregated decision → point estimate with SE suffices.
+- One-shot decision or asymmetric loss (capacity planning, risk) → quantiles and exceedance probabilities; the mean is a distraction.
+- Estimate feeds a nonlinear downstream computation → propagate the whole distribution (simulate) — E[f(X)] ≠ f(E[X]) for nonlinear f (Jensen: the direction of the bias follows the curvature; log and ratios are the everyday offenders).
+- Ratio-of-estimates uncertainty → delta method (Var[g(θ̂)] ≈ g′(θ̂)²·Var[θ̂]) or bootstrap the ratio directly; never divide the point estimates and reuse the numerator's CI.
+- Many related small-sample estimates (per-segment rates, per-item scores) → hierarchical shrinkage or at least beta-binomial smoothing; raw per-group MLEs will be dominated by the smallest groups at both extremes of the leaderboard.
 
 ## Failure modes & pitfalls
 
@@ -64,6 +78,14 @@ Example: π = 0.001, sens = 0.99, fpr = 0.05 → odds = (1/999)(0.99/0.05) ≈ 0
 - **Bootstrap misuse:** bootstrapping the max/min, iid-resampling a time series, bootstrapping n = 8, or quoting a bootstrap SE for a bimodal statistic. And percentile intervals aren't automatically better for skewed statistics at small n — prefer BCa.
 - **CI misreading.** "95% CI [2,5]" is a statement about the *procedure's* long-run capture rate, not P(θ ∈ [2,5]) = 0.95 — the latter needs a prior and a credible interval. Numerically similar in easy problems; the distinction matters when decisions stack on the tail.
 - **Testing hypotheses on the data that suggested them.** Exploratory finding → confirmatory test on the *same* data is circular; the p-value has no meaning. Split the data, or collect fresh data for confirmation.
+- **Independence assumed because it's convenient.** Multiplying probabilities (failure rates of "independent" components sharing a power supply; "independent" fraud signals derived from the same field) understates joint tail risk by orders of magnitude. Before multiplying, name the mechanism that would make the events dependent; if you can name one, estimate the joint directly or bound it.
+- **Confusing likelihood with probability of the data model.** "The data are unlikely under H₀" says nothing by itself — data can be unlikely under *every* hypothesis (likelihoods are densities, not probabilities). Only likelihood *ratios* between live hypotheses carry evidential weight.
+- **Quoting expected value where a distributional statement is needed.** "Expected cost is $50k" is compatible with "5% chance of $1M". For decisions with asymmetric loss, report quantiles or exceedance probabilities; expectation alone is only sufficient when the decision-maker is risk-neutral *and* the bet repeats many times.
+- **Overfitting the prior to the answer you want.** A Bayesian analysis whose conclusion flips under any reasonable alternative prior is a prior report, not a data analysis. Sensitivity-check: rerun with a flat, a skeptical, and an enthusiastic prior; report the range.
+- **Conflating statistical and practical significance.** At n = 10⁷, a 0.01% difference clears any α; significance says "measurable", not "matters". Lead with the effect size and its CI; the p-value is a footnote at large n.
+- **Standard deviation vs standard error confusion in reporting.** SD describes the population spread (doesn't shrink with n); SE describes the estimate's precision (shrinks as 1/√n). Error bars must be labeled; readers systematically misread SD bars as uncertainty and SE bars as spread.
+- **Percentiles of aggregates vs aggregates of percentiles.** The p99 of per-server latencies averaged across servers is not the fleet p99; percentiles don't average, sum, or subtract. Recompute quantiles on the pooled distribution (or use mergeable sketches: t-digest, DDSketch).
+- **Zero-count cells breaking rate ratios.** 0 events in arm A → naive relative risk of 0 or ∞ with absurd CIs. Use exact/mid-p intervals or add continuity corrections deliberately — and say so — rather than letting a downstream division silently produce inf.
 
 ## Worked micro-examples
 
@@ -98,7 +120,10 @@ Works for medians, trimmed means, ratios — anything computable. The exchangeab
 **3. Beta-binomial ranking (the "sort by average rating" fix).**
 Item A: 9/10 positive. Item B: 90/100. Naive rates tie at 0.90. With a Beta(1,1) prior, posterior means: A = 10/12 ≈ 0.833, B = 91/102 ≈ 0.892 — B ranks higher, matching the intuition that 100 trials is stronger evidence. Risk-averse ranking uses a lower posterior quantile: `scipy.stats.beta.ppf(0.05, 1+k, 1+n-k)` gives A → 0.61, B → 0.84. This one move fixes most "5-review item tops the leaderboard" bugs, and the prior strength (pseudo-count total α+β) is the only knob.
 
-**4. Design effect arithmetic.**
+**4. Jensen bite in a routine metric.**
+Per-user conversion rates rᵢ are averaged, then someone reports "average time between conversions = 1/mean(r)". With r = [0.01, 0.1, 0.5] : 1/mean(r) = 1/0.2033 ≈ 4.9, but mean(1/r) = (100 + 10 + 2)/3 ≈ 37.3 — off by 7.6×. E[1/X] ≥ 1/E[X] (Jensen, convex 1/x), and the gap explodes with heterogeneity. Any pipeline that swaps the order of a nonlinear transform and an average needs a simulation check; harmonic-vs-arithmetic mean bugs in latency ("average rate") reporting are this exact error.
+
+**5. Design effect arithmetic.**
 An experiment logs 40,000 sessions from 2,000 users (m = 20 sessions/user), session-level metric with intra-user correlation ρ = 0.1. Design effect = 1 + 19×0.1 = 2.9 → effective n ≈ 40,000/2.9 ≈ 13,800, and the naive SE is √2.9 ≈ 1.7× too small — enough to turn p = 0.05 into p ≈ 0.24. Any session-level analysis of user-randomized data must widen SEs by this factor or cluster on user.
 
 ## Verification & self-check
@@ -110,3 +135,5 @@ An experiment logs 40,000 sessions from 2,000 users (m = 20 sessions/user), sess
 - **Tail audit before summarizing**: one log-CCDF or QQ plot before trusting any mean ± SD; it prevents the entire heavy-tail error class.
 - **Row-existence audit**: describe the process that put each row in the dataset; name the selection events you're conditioning on.
 - **Ask "what's the base rate?" out loud** whenever converting test/classifier characteristics into a probability about an individual case.
+- **Probabilities must obey the axioms**: check that reported probabilities over exhaustive outcomes sum to 1, that P(A and B) ≤ min(P(A), P(B)), and that no conditioning step increased a probability without a mechanism. Violations of these cheap identities catch a surprising fraction of multi-step probability derivations.
+- **Calibration over confidence**: for any probabilistic forecast pipeline, bin predictions by stated probability and compare against realized frequencies (reliability curve). A model that says "90%" and is right 70% of the time is miscalibrated regardless of its AUC.

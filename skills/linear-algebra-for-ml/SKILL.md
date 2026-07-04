@@ -29,6 +29,24 @@ description: Loads when working with matrix computations in ML contexts — debu
 | Determinant needed (e.g., Gaussian log-likelihood) | `np.linalg.slogdet`, or 2·Σ log(diag(L)) from Cholesky | `det` overflows/underflows beyond ~100 dims; log-det is what you actually need |
 | Sampling from N(μ, Σ) | Cholesky: x = μ + L z | One factorization; `multivariate_normal` re-derives it per call if misused in a loop |
 
+### Broadcasting rules, precisely (so you can predict instead of test)
+- Alignment is **right-to-left**: compare trailing dimensions; each pair must be equal or one of them 1 (which stretches). Missing leading dims are treated as 1. `(8, 1, 6) op (7, 6) -> (8, 7, 6)`; `(3,) op (3, 1) -> (3, 3)` — the second one is the classic accident.
+- `keepdims=True` on reductions exists to keep broadcasting aligned: `x / x.sum(axis=1)` breaks for 2-D x (shapes `(n,m)` vs `(n,)` align on the wrong axis); `x / x.sum(axis=1, keepdims=True)` is correct.
+- Insert axes explicitly with `None`/`np.newaxis` rather than relying on implicit alignment: `a[:, None] * b[None, :]` announces the outer product; `a * b` with lucky shapes hides it.
+- Broadcasting never copies memory (it's a stride trick), so it's free until an op materializes the result. `np.broadcast_to` + a reduction can often replace materializing a big intermediate; better yet, that pattern is usually an einsum.
+- Batched matmul broadcasting: `(B, n, k) @ (k, m) -> (B, n, m)` works; so does `(B, 1, n, k) @ (1, H, k, m) -> (B, H, n, m)`. Leading dims broadcast; the last two are the matrix.
+
+### Cost model (keep these in working memory)
+| Operation | Cost | Note |
+|---|---|---|
+| `A @ B`, (m,k)@(k,n) | O(mkn) | order of a chain matters: associativity is free performance |
+| `solve(A, b)`, dense n×n | ~n³/3 (Cholesky) to ~2n³/3 (LU) | one factorization, then n² per extra RHS |
+| Full SVD / eigh, n×n | O(n³), constant ~10× a matmul | the expensive hammer; `svds`/`eigsh` for top-k |
+| QR, m×n (m ≥ n) | O(mn²) | least squares without squaring κ |
+| `pinv`, `matrix_rank`, `cond` | full SVD inside | never in a loop |
+| Matrix–vector | O(n²) | keep matrices as operators (`LinearOperator`) when you only ever multiply |
+Memory: an n×n fp64 matrix is 8n² bytes — n = 50,000 is 20 GB. If a "kernel matrix" or "attention matrix" appears in your plan, compute its memory before its math.
+
 ### Which norm?
 - **L2 (vector)**: rotation-invariant; smooth; gradients linear. Default regularizer for shrinkage without sparsity.
 - **L1**: ball corners sit on axes → sparsity at the optimum. Non-smooth at 0 — use proximal methods/coordinate descent; plain GD hovers near zero without hitting it.
@@ -36,6 +54,12 @@ description: Loads when working with matrix computations in ML contexts — debu
 - **Spectral norm** (σ₁): operator amplification — "how much can this layer stretch a vector"; controls Lipschitz constants; the right norm for stability claims about maps.
 - **Frobenius**: the matrix flattened to a vector — right for "total energy" and approximation error, wrong for operator behavior. ‖A‖_F² = Σσᵢ².
 - Rule: quantity describes a *map* → spectral; describes *content* → Frobenius/L2. If a bound must hold for every input direction, it's spectral by definition.
+
+### Sparse vs dense vs implicit
+- Below ~95% zeros, sparse formats usually *lose* to dense BLAS — the indexing overhead swamps the flop savings. Measure before converting.
+- Choose the sparse format by access pattern: CSR for row slicing and matvecs, CSC for column ops, COO/LIL only for construction — and never grow a CSR incrementally (each insert is O(nnz)).
+- If you only ever *apply* the operator, don't materialize it at all: `scipy.sparse.linalg.LinearOperator(shape, matvec=f)` feeds directly into `eigsh`/`svds`/`cg`. Kernels, Hessians (via Hessian-vector products from autodiff), and graph Laplacians rarely need to exist as arrays.
+- Iterative solvers (`cg` for SPD, `gmres` general) beat direct factorization when the matrix is large+sparse and you can tolerate a residual tolerance; their iteration count scales with √κ (CG) — preconditioning is not optional for κ ≫ 10⁴.
 
 ### Condition number rules
 - κ(A) = σ₁/σₙ. Rough rule: a backward-stable solve loses about log₁₀(κ) decimal digits. κ = 10⁸ in float64 leaves ~8 digits (fine); in float32 leaves ~0 (garbage).
@@ -65,6 +89,9 @@ description: Loads when working with matrix computations in ML contexts — debu
 - **Solving with a matrix you built from differences.** Finite-difference or near-duplicate feature columns → near-singular A. The symptom is a huge-norm solution with a small residual. Detect via κ or tiny σₙ, then regularize or drop the redundant column — do not just switch solvers.
 - **Batched code that mixes batch and feature axes in a reshape.** `x.reshape(B, -1)` after a transpose that wasn't done (or was done twice) interleaves samples. After any reshape/transpose chain, verify with a tiny tensor whose entries encode their own coordinates (`np.arange(24).reshape(2,3,4)`) that element (b, i, j) lands where you think.
 
+- **Confusing "orthogonal projection" with "normalize then subtract".** Projection onto the span of non-orthonormal columns W is `W @ solve(W.T @ W, W.T @ y)` (or QR of W) — not `W @ (W.T @ y)`, which is only valid when WᵀW = I. Symptom: "removing" a direction leaves a residual correlated with it.
+- **Gram matrix vs covariance confusion in kernel/feature code.** `X @ X.T` is (n,n) sample-similarity; `X.T @ X` is (p,p) feature-covariance-ish. Both appear in PCA derivations (dual vs primal); picking the smaller one is a legitimate O(min(n,p)²·max) optimization, but mixing up which eigenvectors need the `X`-multiplication to convert (v = Xᵀu/σ) produces subtly wrong components.
+
 ## Worked micro-examples
 
 **1. Attention scores in einsum with shape discipline.**
@@ -88,7 +115,16 @@ Directions with s ≫ √λ pass untouched; directions with s ≪ √λ are supp
 **3. GD step-size limit from Hessian eigenvalues, with numbers.**
 Quadratic with H = diag(100, 1): λmax=100, λmin=1, κ=100. Stability needs η < 2/100 = 0.02. At η = 0.019: the fast direction contracts by |1 − 1.9| = 0.9 per step (ricocheting sign each step); the slow one by 1 − 0.019 = 0.981 → ~120 steps per e-fold. The LR is pinned by λmax while progress is set by λmin — that gap *is* κ. Newton (multiply the gradient by H⁻¹) makes both directions converge in one step: second-order and adaptive methods attack the ratio, not the scale.
 
-**4. Power iteration for the top eigenpair — and why it can stall.**
+**4. Woodbury in anger: rank-k update of a solved system.**
+You've factored A (n = 10⁴, Cholesky ~ n³/3 ≈ 3×10¹¹ flops) and now need (A + uuᵀ)⁻¹b for a rank-1 update u. Refactoring costs another n³/3. Woodbury:
+```python
+Ainv_b = cho_solve(cA, b)        # O(n²) with the existing factor
+Ainv_u = cho_solve(cA, u)        # O(n²)
+x = Ainv_b - Ainv_u * (u @ Ainv_b) / (1.0 + u @ Ainv_u)
+```
+O(n²) instead of O(n³) — a 10⁴× saving at this size, and the pattern behind Kalman filters, online ridge updates, and L-BFGS's implicit Hessian. Numerical caveat: repeated low-rank updates accumulate error; refactor from scratch every few hundred updates.
+
+**5. Power iteration for the top eigenpair — and why it can stall.**
 ```python
 v = rng.normal(size=n); v /= np.linalg.norm(v)
 for _ in range(iters):
@@ -107,3 +143,5 @@ Convergence rate is |λ₂/λ₁| per iteration — a spectral *gap* fact. λ₂
 - **Tiny-case oracle**: run the routine on a 3×3 diagonal or rank-1 matrix with a hand-computable answer before trusting real shapes.
 - **Invariance tests**: PCA must be invariant to row permutation; least-squares solutions must be invariant to duplicating a (row, target) pair with half weight; predictions must be invariant to feature reordering when weights are reordered too. A violated invariance localizes the bug to centering, weighting, or broadcasting.
 - **Spectrum eyeball**: before claiming rank/conditioning conclusions, print the singular values (log scale). A clean gap → trustworthy rank; a smooth decay → "rank" is a modeling choice, present it as such.
+- **Gradient check for anything hand-derived**: matrix-calculus derivations (∂/∂W of losses, backward passes) verified against central finite differences at a random point, rtol ≤ 1e-5 in fp64. The most common analytic errors are a dropped transpose and a factor of 2 from symmetric terms — both invisible until checked.
+- **Units/scale audit**: if κ looks catastrophic, check whether two features differ by a unit conversion factor (1e3, 1e6) before reaching for fancier decompositions; standardization fixes most "numerically hard" regressions outright.

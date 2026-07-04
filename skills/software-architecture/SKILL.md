@@ -66,6 +66,17 @@ description: Load when decomposing a system into modules or services, deciding m
   - **Parallel run with diffing** before cutover for anything correctness-critical: run old and new, compare outputs on real traffic, cut over on measured agreement.
 - Encode architectural rules as **fitness functions** — executable checks in CI: import-boundary linting (`import-linter` in Python, ArchUnit in Java, `dependency-cruiser` in JS), dependency-direction tests, "no module may import another's `internal/`." A rule not enforced by tooling erodes within months, and the erosion is silent until it's structural.
 
+### Sync vs async edges (once you have more than one deployable)
+| Edge property | Make it synchronous (call) | Make it asynchronous (queue/event) |
+|---|---|---|
+| Caller needs the result to respond | Yes — but budget the latency and set a timeout + fallback | No — async here forces polling or long-poll gymnastics |
+| Work can complete later (email, indexing, exports) | Wasteful — you're renting a thread to wait | Yes — and you get retry + burst absorption free |
+| Downstream availability must not gate upstream | No — sync chains multiply outage windows | Yes — the queue is the bulkhead |
+| Ordering/transactionality with the caller's write | Same DB transaction, or transactional outbox | Requires outbox/idempotency design — plan it, don't discover it |
+
+- Every async edge silently changes semantics: at-least-once delivery (consumers must be idempotent), reordering (consumers must tolerate it), and eventual consistency (readers may see the old state). Writing "we'll add a queue" without writing these three words down is how "decoupling" becomes a correctness bug.
+- The transactional outbox is the default answer to "write to my DB *and* publish an event atomically": write both to your own DB in one transaction, relay the event asynchronously. Dual-write (DB + broker in sequence) loses events on the crash between the two — it is a bug, not a simplification.
+
 ## Failure modes & pitfalls
 
 - **Layering by technology instead of by domain.** `controllers/`, `services/`, `models/` as the top-level structure means every feature change touches every directory and no feature can be deleted as a unit. Correction: package by feature (`billing/`, `catalog/`), layers inside each if useful. You should be able to `rm -rf` a feature.
@@ -78,6 +89,11 @@ description: Load when decomposing a system into modules or services, deciding m
 - **Skipping the "what gets worse" analysis.** Splitting a service worsens latency, debuggability, and local dev setup. Adding a cache worsens consistency and adds an invalidation bug class. Adding a queue worsens end-to-end latency visibility and adds redelivery semantics. A proposal listing only benefits has been advocated, not analyzed — produce the costs column yourself before agreeing.
 - **Confusing "we might need it" with "we will need it."** Plugin systems with one plugin, multi-tenancy scaffolding for one tenant, cloud-provider abstraction for a provider you'll never leave. Carrying cost is paid daily; payoff requires the future to cooperate. Correction: keep the seam cheap (cohesion, narrow interface) instead of building the mechanism now.
 - **Letting the ORM/framework own the architecture.** When domain objects are ORM classes and business logic lives in controllers, the framework's layering *is* your architecture and its upgrade cycle is your migration cycle. Keep the core domain plain objects; adapt at the edges. This is the difference between "we use Django" and "we are Django."
+- **The big-bang rewrite.** "The legacy system is unfixable; we'll rebuild it clean" fails on a repeatable mechanism: the rewrite chases a moving target (the old system keeps shipping), delivers zero value until ~100% parity, and parity includes a decade of undocumented behavior customers depend on. Correction: strangler fig — new system takes real traffic for one slice at a time, value lands monthly, and the old system's behavior is discovered incrementally instead of all at launch night.
+- **Anemic core, smart edges.** All logic in request handlers and jobs, domain objects as bags of getters — the "architecture" is whatever the handlers happen to do, and the same rule gets implemented three slightly different ways in three handlers. Correction: push rules into the domain module the data belongs to; handlers orchestrate, they don't decide.
+- **Cache as architectural glue.** Service A reads service B's data via a shared cache/replica "to avoid coupling." You've created an undocumented, unversioned API with no owner, whose schema is B's internals. When B refactors its storage, A breaks, and nobody knows why. Correction: data crosses ownership boundaries only through contracts (API, published events, replicated read models with a schema).
+- **Saga sprawl.** Once split along entity lines, every workflow needs a distributed transaction substitute; sagas with compensation logic metastasize until most engineering effort maintains the choreography. This is a symptom, not a fact of life: workflows that constantly span services mean the boundaries cut *through* the workflows. Correction: redraw so each workflow's happy path lives inside one service; reserve sagas for the few genuinely cross-domain flows (order + payment + shipping across real organizational boundaries).
+- **Flag debt as shadow architecture.** Long-lived feature flags accumulate until the deployed system is one of 2^N configurations, none of which is tested. Flags are scaffolding: every flag gets an owner and a removal date at creation, and "flag cleanup" appears in the definition of done for the launch it guarded.
 
 ## Worked micro-example: split or not?
 
@@ -89,6 +105,32 @@ Team: 6 engineers. Django monolith: e-commerce, p95 350ms, deploys 3×/week. Pai
 4. **ADR:** decision "extract image work to async workers, keep single codebase"; rejected option "image microservice" (new contract + repo + on-call surface for 6 people; no independent-team forcing function); consequences "worker deploys now separate; queue adds at-least-once semantics — thumbnailing must be idempotent"; revisit trigger "a second team owns media, or the work needs a runtime the monolith can't host (GPU)."
 5. Outcome shape: latency spikes gone via isolation; checkout refactorable in-place; zero new network contracts. The expert move was noticing that "microservices?" was the wrong question for *both* pains.
 
+## Worked micro-example: dependency direction in one diff
+
+A pricing module imports `stripe` directly to check the customer's paid plan. Now pricing tests need Stripe mocks, a Stripe outage breaks price *display*, and a billing-provider migration touches pricing code.
+
+```python
+# Before: volatile dependency imported by stable core
+# pricing/engine.py
+import stripe
+def price_for(customer, sku):
+    plan = stripe.Subscription.retrieve(customer.sub_id).plan.id  # I/O in core
+    return base_price(sku) * discount_for(plan)
+
+# After: core owns the interface; infrastructure implements it
+# pricing/engine.py — no I/O, no vendor import
+class PlanSource(Protocol):
+    def plan_of(self, customer) -> str: ...
+def price_for(customer, sku, plans: PlanSource):
+    return base_price(sku) * discount_for(plans.plan_of(customer))
+
+# billing/stripe_adapter.py — volatile side implements the stable side's interface
+class StripePlanSource:
+    def plan_of(self, customer) -> str:
+        return stripe.Subscription.retrieve(customer.sub_id).plan.id
+```
+The arrow flipped: `billing` now depends on `pricing`'s interface, not the reverse. Pricing tests pass a dict-backed fake; the provider migration is one new adapter; a cached adapter slots in without touching pricing. This is the *entire* payoff of dependency inversion — and note it was applied at a named volatile boundary (payment provider), not sprayed across the codebase.
+
 ## Self-check before presenting an architecture recommendation
 
 - Did I state the change-vector bet explicitly ("we expect X to change, not Y"), and does every boundary trace back to it? Any boundary existing "for cleanliness" gets cut.
@@ -98,3 +140,6 @@ Team: 6 engineers. Django monolith: e-commerce, p95 350ms, deploys 3×/week. Pai
 - Would this survive the team doubling *and* halving? Architectures requiring heroics (3 people running 12 services) or bottlenecking growth (one module all 12 engineers edit daily) both fail.
 - Is every stated rule enforceable by a CI check I can name (`import-linter`, ArchUnit, `dependency-cruiser`, schema-compat linter)? If not, either name the tool or expect the rule to silently erode.
 - Does the data-ownership map have exactly one writer per store? Any shared-write store is an undeclared merge of two "separate" components.
+- For every async edge: did I write down the three semantic changes it introduces (at-least-once → idempotent consumers, reordering tolerance, eventual consistency for readers), and does the design handle each?
+- Can a new engineer answer "where does the code for feature X live?" from the directory listing alone? If features are smeared across technical layers, the structure fails its primary daily use.
+- Did I check the proposal against the failure-mode list above (distributed monolith, entity services, shared common lib, event-default, big-bang rewrite)? Most bad architectures are one of these five wearing a new name.

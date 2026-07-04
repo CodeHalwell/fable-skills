@@ -15,11 +15,35 @@ description: Load when working in a large or unfamiliar codebase — locating wh
 
 ## Decision frameworks
 
+### First-hour orientation in a brand-new repo
+Do these in order; stop when your actual task's question takes over:
+1. **Make it run** (or make its tests run) before reading anything deep — `README`, `Makefile`/`justfile`, `docker-compose.yml`, CI config (`.github/workflows/`) are the executable truth about how the thing builds and what its real entry points are. CI config never rots the way READMEs do.
+2. **List the entry points:** route registrations, `main`/`manage.py`/`cmd/` dirs, cron schedules, queue consumer bindings, exported public API. This is the complete set of ways the system is caused to do anything.
+3. **Churn map:** `git log --format='' --name-only --since='6 months' | sort | uniq -c | sort -rn | head -30` — the 30 hottest files are the living heart of the codebase and where your change most likely belongs.
+4. **Read one vertical slice end to end** (one request from route to DB and back), not ten horizontal layers. One full slice teaches the house style — error handling, transaction boundaries, layering — which transfers to every other slice.
+5. Skim the test directory names before the source: test names are the closest thing legacy code has to a requirements doc.
+
 ### Entry-point-first reading order (for "where does behavior X live?")
 1. **Grep the most distinctive user-visible string:** error message, log line, button label, header name. Strip the variable parts first — for `"Failed to process order 8812"` grep `"Failed to process order"`. Not found? The string is built dynamically or lives in an i18n table: grep the i18n key, or grep distinctive *fragments* (`"Failed to process"`).
 2. **Walk up from the hit** (IDE call hierarchy, or `grep -rn "function_name"`) until you reach a recognizable entry point: route table, CLI arg parser, cron/queue consumer registration, event-handler map, `main`.
 3. **Walk down from that entry point** along only the branch your scenario takes. Note — don't read — everything else. Keep a written trace log: the question at top, files:lines visited, one-line finding each.
 4. **Confirm with runtime evidence before trusting the static trace:** one added log line, a breakpoint, or a deliberate `raise Exception("AM I HERE")` in a dev environment, then trigger the behavior. Legacy systems typically contain 2+ code paths that *look* like they handle your case; only one runs. Static reading alone routinely picks the dead one. Budget: runtime confirmation within the first 10 minutes.
+
+### Minimal-reading model building
+Cheapest-information-first order when you need "how does this subsystem work" rather than one behavior:
+- **Read the data model before the code.** Twenty table definitions (or the ORM models, or the protobuf schemas) tell you more than two hundred classes: entities, relationships, state machines (`status` columns and their values), and soft-delete/versioning conventions all live there.
+- **Read the config surface next:** env vars, flag definitions, settings files. Every conditional behavior worth knowing about usually has a knob, and the knob list is short.
+- **Read test *names* before test bodies, and bodies before implementation.** `test_refund_rejected_after_30_days` is a requirement statement; the suite's names are the closest thing to a spec that stays true.
+- **Read each module's public interface (exports, `__init__.py`, header) and skip the internals** until a specific question forces you in.
+- **Draw the state machine for the core entity** (order status, job lifecycle) from the enum + the writes to it. Most legacy business logic is guards on state transitions; the diagram makes 40 scattered `if status ==` checks legible.
+- Timebox: if 30 minutes of this hasn't produced a workable model, stop and go behavior-first (trace one real request) — some systems are only legible dynamically.
+
+### Runtime observation toolkit (when reading stalls, watch instead)
+- Debugger breakpoint or targeted log line at the suspected fork in the road — one run answers what an hour of reading guesses at.
+- HTTP edges: mitmproxy / `curl -v` replays; see the *actual* requests, not the ones the code appears to make.
+- DB truth: enable query logging (or `EXPLAIN`-log slow queries) and trigger the behavior — the SQL stream is the system's honest diary.
+- Syscall level: `strace -f -e trace=network,file` when you suspect the process touches something no code path admits to (config files, DNS, sockets).
+- Live process: `py-spy dump` (Python) / `jstack` (JVM) for "what is it doing *right now*" on a wedged or slow process, no restart needed.
 
 ### Version-control archaeology toolkit
 | Question | Command |
@@ -74,8 +98,23 @@ Delete in a dedicated commit whose message carries the evidence ("dead since 202
 - **Assuming the tests describe intended behavior.** Legacy suites contain tests that assert bugs (written from observed behavior), tests disabled with `@skip("flaky")` hiding real races, and mocks that drifted from the real collaborator years ago. A failing legacy test after your change means "behavior changed," not automatically "you're wrong" — decide which, using `git log -L` on the test itself.
 - **Modernizing the stack as a side quest.** Upgrading the framework "while you're in there" mixes an unbounded-risk change into your bounded one; when production breaks, you can't tell which change did it. Version upgrades in legacy systems are their own project with their own parallel-run plan.
 - **Believing the architecture diagram.** The wiki diagram is from 2020; three services have been added, one merged, and the "deprecated" queue carries 40% of traffic. Diagrams are hypotheses. Verify against deploy configs, live route tables, and traffic metrics before routing your change through the picture.
+- **Single-repo tunnel vision.** The behavior you're hunting doesn't exist in this repo at all — it's in a sidecar, an nginx rewrite rule, a database trigger, a feature-flag service, or the *other* consumer of the same queue. If a thorough grep finds no plausible source for an observed behavior, widen the system boundary before doubting the observation.
+- **Clone divergence.** You find the bug, fix it, and it persists — because the function was copy-pasted into four places years ago and you fixed the one that doesn't run (or only one of three that do). After locating any bug in legacy code, grep for a distinctive line of its *body*, not its name, to find the siblings.
+- **Environment drift.** It works locally and fails in prod because prod has different config, feature flags, data volume, or a proxy in front. When behavior differs by environment, diff the *configuration surface* first (env vars, flag states, infra config) — it's a smaller search space than the code and the culprit more often.
+- **Treating data as code's junior partner.** In old systems the database contains states the current code can no longer produce — orphaned rows, retired enum values, formats from three migrations ago. Code-only reasoning says "this branch is impossible"; the data says otherwise. Before removing a defensive branch or tightening a parser, query production for the "impossible" values: `SELECT status, COUNT(*) FROM orders GROUP BY 1` regularly ends arguments.
+- **Asking no one.** An hour of archaeology can be thirty seconds of asking the person `git blame` names — if they're still around, a short, specific question ("this 30s threshold in the replayer — peak-load thing?") with your evidence attached gets context no tool has: the constraint that was political, the migration that was abandoned halfway. Do the archaeology first so the question is sharp; then actually ask.
 
-## Worked micro-example: "orders sometimes get double-shipped — find why"
+## Worked micro-examples
+
+### 1. "Is this giant function safe to delete?" — dead-code walkthrough
+Candidate: `export_legacy_report()` in `reports/exports.py`, 300 lines, last meaningful edit 4 years ago per `git log -- reports/exports.py`.
+1. Import analysis: `grep -rn "export_legacy_report" --include='*.py'` → only the definition and one commented-out call. Weak evidence — keep going.
+2. String sweep across *all* file types: `grep -rn "export_legacy_report" .` → a hit in `crontab.tpl`: `0 2 1 * * run_task export_legacy_report`. It runs monthly at 2am, dispatched by name. The import-graph verdict was wrong.
+3. Is the output consumed? The function writes `s3://reports-bucket/legacy/`. Bucket access logs / object timestamps show objects written monthly and *read* by an IP belonging to the finance ETL. Not dead — load-bearing, invisible to every static tool.
+4. Counterfactual world where step 3 showed no reads: still don't delete yet — add a tombstone log, wait one full business cycle (month-end *and* quarter-end), then delete cron entry and function in one commit whose message carries the evidence.
+Lesson: each escalation (imports → strings → runtime/consumption evidence) overturned the previous verdict. Deletion decisions get made at the strongest evidence tier you can afford, never the weakest.
+
+### 2. "Orders sometimes get double-shipped — find why"
 
 1. **Entry via string.** `grep -rn "shipment created"` → one hit, a log line in `fulfillment/tasks.py:ship_order()`. Runtime ground truth: production logs show the message *twice* for order 88712, 40 seconds apart. So `ship_order` executes twice — fact, not theory.
 2. **Walk up: who invokes it?** Call hierarchy shows a Celery task registration and one enqueue site in `checkout/complete.py`. But a whole-repo grep for the *string* `"ship_order"` also finds `ops/replay_stuck_orders.py` — a cron that re-enqueues any order stuck in `PAID` for more than 30s. Second dispatcher found; the IDE alone would have missed it (task invoked by name).
@@ -99,4 +138,6 @@ The expert signature: string-grep found the second dispatcher, data-flow tracing
 - Did I grep the entire repo — all file types — for string-based references before claiming I've found all callers or that code is dead?
 - Is the change additive/seam-based, with characterization tests pinned around the site, and is the diff free of drive-by edits?
 - Can I state the blast radius (every caller, every consumer of changed data or output format) and the rollback story, each in two sentences? If not, the change isn't ready to ship.
+- Did I check production data for states my code-level reasoning declared impossible, before tightening any validation or deleting any defensive branch?
+- Does each conclusion distinguish what I *observed* (logs, runtime traces, data) from what I *inferred* (static reading)? Presenting inference as observation is how wrong mental models propagate to the next person.
 - Did I leave the map better than I found it — the trace note, the ADR-style comment, the commit message with the why — so the next person's hour one is shorter than mine?

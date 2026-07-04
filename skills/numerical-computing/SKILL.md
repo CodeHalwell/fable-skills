@@ -52,6 +52,37 @@ description: Loads when writing or debugging floating-point code — choosing fp
 - Never compute `log(softmax(z))` in two steps — small probabilities round to 0.0 and log yields −inf. Fused log-softmax is `z − logsumexp(z)`. This is why loss APIs take *logits* (`torch.nn.CrossEntropyLoss`, `F.binary_cross_entropy_with_logits`): the fused forms cancel exp/log analytically and are stable at extreme confidence.
 - Sigmoid at large |x|: `1/(1+exp(-x))` overflows for x ≪ 0; use the two-branch form or `scipy.special.expit`. log-sigmoid is `-np.logaddexp(0, -x)` — never `log(sigmoid(x))`.
 
+### Summation method selection
+| Scale | Method | Error growth |
+|---|---|---|
+| < ~10³ same-sign terms, fp64 | naive loop is fine | O(n·ε) but n is small |
+| Any n, NumPy available | `np.sum` (pairwise) | ~O(log n · ε) |
+| Exactness required (tests, money-adjacent, ill-conditioned series) | `math.fsum` | exactly rounded |
+| Custom kernel/accumulator, low-precision data | Kahan (or Neumaier variant, robust when terms exceed the running sum) | O(ε), independent of n |
+| Mixed signs with cancellation | sort by magnitude ascending, or fsum | ordering matters most when the true sum is small vs Σ|xᵢ| |
+| GPU/parallel reductions | tree reduction (library default) in fp32+ accumulator | deterministic only with deterministic flags |
+
+### Determinism playbook (when "same code, different answer" is filed)
+1. Same machine, same run, different results → real race or uninitialized memory: an actual bug, chase it.
+2. Same machine, run-to-run differences in last digits → nondeterministic reduction order (GPU atomics, thread scheduling), dropout/seed, or hash-order-dependent iteration. Decide whether you need bitwise determinism; if yes: seed everything, `torch.use_deterministic_algorithms(True)`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, fixed dataloader order/workers, and accept ~10–30% slowdown; some ops simply have no deterministic implementation and must be avoided.
+3. CPU vs GPU, or different GPU models, or different BLAS/MKL versions → expected tolerance-level divergence; assert with rtol scaled to dtype, never bitwise.
+4. Same binary, different results across OS/compilers at the last ULP → x87/FMA/vectorization differences; treat like case 3.
+Never "fix" case 3/4 divergence by loosening tolerances until everything passes — compute the legitimate budget (ops × ε × κ) and investigate anything beyond it.
+
+### NaN/Inf autopsy workflow (run it in this order)
+1. **Identify the species.** Inf comes from overflow (`exp`, products, division by tiny) — it still obeys ordering. NaN comes from undefined ops: inf − inf, 0·inf, inf/inf, 0/0, sqrt/log of negative, and *any* op touching an existing NaN. A NaN at step k usually means an Inf or a domain violation at step k−j.
+2. **Bisect to the first non-finite tensor/array**, not the first NaN loss: checkpoint `np.isfinite(x).all()` (or forward hooks in torch) between stages; the first failing stage owns the bug.
+3. **Classify the origin**: exp/softmax overflow (missing max-subtraction) · log/sqrt of a value that underflowed to 0 or went −1e-9 negative (missing clamp/jitter) · division by a variance/norm that collapsed to 0 (missing ε in the denominator — note ε goes *inside* the sqrt for rsqrt-style normalizers: `x/sqrt(v+ε)`, not `x/(sqrt(v)+ε)` — both appear in the wild and behave differently at v≈0) · fp16 range overflow (loss scaling / bf16) · bad input data (NaNs in the raw features; always check first).
+4. **Fix at the origin, not the symptom.** `torch.nan_to_num` or `np.nan_to_num` at the surface point hides the bug and silently corrupts gradients/statistics; it is a last-resort output sanitizer, never a fix.
+5. Remember NaN's comparison semantics while debugging: `NaN != NaN` is true, `sorted()` with NaNs is undefined-order garbage, `np.nanmax` exists for a reason, and `x == x` is the cheap NaN test.
+
+### Condition numbers of elementary steps (where digits actually die)
+- Subtraction of near-equals: κ = |x|/|x−y| → unbounded; the *only* elementary op that's arbitrarily ill-conditioned. All the classic rewrites exist to dodge it.
+- `exp(x)`: relative error in output ≈ |x| × (relative error in x) — at x = 700, six input digits become zero output digits. Large-argument exponentials are information amplifiers; keep computations in log space until the last step.
+- `log(x)` near 1: κ = 1/|log x| → large; this is precisely why `log1p` exists (compute log(1+δ) from δ directly).
+- Polynomial roots, matrix eigenvalues with defective/clustered spectra: tiny coefficient changes move answers a lot — report sensitivity, don't chase digits.
+- sin/cos at huge arguments: argument reduction mod 2π needs the *absolute* precision your float no longer has at 1e10 — `sin(1e10)` in fp64 carries only ~6 meaningful digits. Rephrase the phase to stay small.
+
 ## Failure modes & pitfalls
 
 - **"Fix precision problems by switching to fp64."** Buys ~9 extra digits exactly once; a cancellation that loses digits proportionally still loses them. Reformulate first; raise precision only when κ·ε genuinely explains the error and the problem cannot be restated.

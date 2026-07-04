@@ -81,6 +81,8 @@ Rule of thumb: if you're arguing about whether something "is a resource," it isn
   - Optional `details` array for field-level validation errors; a correlation `request_id` for support.
   - Never leak stack traces, SQL, or internal hostnames.
 - **Concurrency control:** for mutable resources, return `ETag` and honor `If-Match` on writes — otherwise two clients doing read-modify-write silently clobber each other and you'll retrofit it after a data-loss ticket.
+- **Rate limiting as contract, not afterthought:** document the limits, return 429 with `Retry-After`, and expose remaining-quota headers (`X-RateLimit-Remaining` or the standard `RateLimit-*` set). An undocumented limit is a mystery outage from the client's perspective; a documented one is a design parameter they build around. Never rate-limit by returning 500 — clients retry 5xx, amplifying the overload you're shedding.
+- **Deletion semantics:** `DELETE` must be idempotent — a second DELETE of the same resource returns 404 or 204, never an error the client must special-case. Decide and document soft- vs hard-delete: if soft, does the ID still 404 on GET? Can it be re-created? Ambiguity here surfaces as client-side data-model corruption.
 
 ## Failure modes & pitfalls
 
@@ -97,6 +99,8 @@ Rule of thumb: if you're arguing about whether something "is a resource," it isn
 - **Designing v1 without writing a v1 client.** Write the client code for your top 3 use cases *before* freezing the schema. If a common task takes 3 calls plus client-side joins, the resource boundaries are wrong. This one exercise catches more design flaws than any review checklist.
 - **GraphQL without cost control.** Shipping a public GraphQL endpoint without depth limits, query cost analysis, and (for known clients) persisted queries hands out a DoS endpoint: `{ users { friends { friends { friends {...}}}}}`. This is part of initial design, not later hardening.
 - **Webhooks without signing, ordering, and replay rules.** Consumers need: an HMAC signature header to verify sender, an event `id` for dedup (you *will* deliver duplicates), a timestamp, and a documented statement that ordering is not guaranteed. Omit any of these and every consumer builds a different wrong workaround.
+- **Treating defaults as free to change.** Flipping a default (`page_size` 20→100, timeout 30s→10s, `match=sensitive→insensitive`) changes behavior for every caller who didn't pass the parameter — which is most of them, which is why it was a default. Default changes are breaking changes with extra stealth; version them or announce them like removals.
+- **Nullable everything.** Marking every response field nullable "to be safe" pushes a null-check tax into every consumer forever and hides real optionality signals. Decide per field: required-always (document it, never null), optional-with-meaning (document what absence means), or don't ship the field yet.
 
 ## Worked micro-examples
 

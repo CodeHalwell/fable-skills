@@ -43,6 +43,18 @@ description: Loads when solving or debugging optimization problems — choosing 
 - Diagnosis table: loss diverges immediately → LR above 2/L for the sharpest direction, cut 10×. Loss plateaus early and high → usually too *low* an LR or bad conditioning/scaling, not a local minimum. Loss oscillates with period ~2 steps → at the stability edge, cut 2–3×. Train improves, eval doesn't → not an optimization problem; stop tuning the optimizer.
 - Batch size: larger batches cut gradient variance, allowing ~proportionally larger LR up to a critical batch size; beyond it you spend compute for no optimization speedup. Small batches add implicit regularization noise. When you scale batch ×k, start by scaling LR ×k (linear scaling) and re-check stability.
 
+### Convergence diagnostics playbook (symptom → likely cause → first fix)
+| Symptom | Likely cause | First fix |
+|---|---|---|
+| Loss → NaN/inf within a few steps | LR ≫ 2/L, or numerical overflow in the loss | Cut LR 10×; check for exp/log instability separately |
+| Loss oscillates with ~2-step period | Sitting at the stability edge of the sharpest direction | Cut LR 2–3×, or add momentum dampening |
+| Loss falls then spikes irregularly | Rare large gradients (outlier batches, unclipped) | Global-norm clipping ~1.0; inspect the offending batches |
+| Rapid early progress, long flat plateau, gradient ≈ 0 | Saddle/plateau or vanishing signal through a saturating nonlinearity | Better init, LR warm restart, architecture check — not "local minimum" |
+| Slow steady progress, gradient norm steady | Ill-conditioning (κ) | Standardize inputs, precondition, adaptive optimizer |
+| Train loss falls, validation doesn't | Not an optimization problem | Regularization/data work; stop tuning the optimizer |
+| Deterministic solver "converged" instantly | ftol fired on a flat spot, or wrong-scale gtol | Check `result.message`; rescale problem; tighten tolerances |
+| Solution violates constraints slightly | Solver tolerance vs your tolerance mismatch | Tighten solver feastol or post-project; never hand-round |
+
 ### Constrained problems — the ladder
 1. **Eliminate** the constraint by reparameterization: x > 0 → x = exp(z) or softplus(z); simplex → softmax(z); box [l,u] → l + (u−l)·sigmoid(z). Free, exact, and turns the problem unconstrained. Caveat: reparameterization can distort geometry near boundaries (exp compresses gradients as x→0).
 2. Simple projectable set (box, ball, simplex) → **projected gradient**; simplex projection is O(n log n) and standard.
@@ -50,6 +62,16 @@ description: Loads when solving or debugging optimization problems — choosing 
 4. **Penalties last, and start soft**: a huge penalty from step one wrecks conditioning (κ grows with the weight). Ramp the weight, or use the augmented Lagrangian (multiplier estimate lets a moderate weight enforce the constraint exactly).
 5. **Read the multipliers**: λᵢ is the objective's sensitivity to relaxing constraint i (shadow price). λᵢ = 0 → inactive, drop it; huge λᵢ → that constraint is what your objective is paying for — negotiate *it*, not the algorithm.
 - KKT in one breath: at a constrained optimum, ∇f is a nonnegative combination of active constraint gradients (stationarity), the point is feasible, multipliers of inequality constraints are ≥ 0, and λᵢgᵢ = 0 (complementary slackness). Checking these four is how you *verify* a constrained answer.
+
+### Reformulation catalog (try these before switching algorithms)
+- **Log transform**: products → sums (likelihoods, geometric means); positive variables → unconstrained (x = e^z); posynomials → convex (geometric programming).
+- **Slack/epigraph variables**: |·|, max, piecewise-linear → linear constraints; min max f_i → min t with f_i ≤ t.
+- **Change of variables to kill κ**: standardize features; optimize log-scale parameters when they span decades (learning rates, regularization weights, chemical concentrations); whiten with a cheap preconditioner.
+- **Relax then round**: integrality → LP/convex relaxation (L0 → L1 is the canonical instance); keep the relaxation optimum as a bound on how much rounding cost you.
+- **Dualize**: many constraints + few variables → dual has few constraints; decomposable couplings → Lagrangian relaxation splits the problem into independent cheap subproblems coordinated by prices.
+- **Eliminate equality constraints by substitution**: Ax = b with A wide → parameterize x = x₀ + Nz (N = null-space basis) and optimize free z.
+- **Homogenize/normalize away scale invariance**: if f(cx) = f(x), fix ‖x‖ = 1 rather than letting the optimizer wander along rays (eigenvector-like problems).
+- **Decompose by structure**: separable objective + coupling constraint → ADMM/dual decomposition; per-block convexity → alternating minimization (with the caveat that alternating on non-convex couplings can cycle or stall at non-critical points).
 
 ### NP-hard recognition reflex
 When a subproblem smells like subset selection under interacting constraints, assignment with conflicts, routing, coloring, or "best k features/items with interactions": stop hunting for a poly-time exact trick. Choose deliberately:
@@ -75,6 +97,9 @@ Claiming "here's an efficient exact algorithm" for an NP-hard structure is a cri
 - **Stopping-criterion sloppiness.** `ftol`-only stopping halts on plateaus that aren't optima; `gtol`-only stalls forever on flat valleys. Use both, plus a max-iteration budget, and report *which* criterion fired.
 - **Projected gradient with the wrong projection.** Projecting onto the simplex by "clip negatives, renormalize" is not the Euclidean projection and biases the solution; use the exact sorting-based projection or a softmax reparameterization.
 - **Comparing optimizers at one LR each.** Any A-vs-B optimizer claim requires tuning LR (at least a small grid) *per optimizer*; Adam-at-its-best vs SGD-at-default is the most common source of folklore.
+- **Alternating minimization treated as guaranteed.** Coordinate/alternating schemes monotonically decrease the objective but can converge to points that are not even stationary for the joint problem when blocks couple non-smoothly. Verify the *joint* gradient/KKT conditions at the end, not just per-block optimality.
+- **Ignoring integrality until the end, then rounding a fractional LP solution by hand.** Naive rounding can be infeasible or arbitrarily bad for covering/packing structures. Either use the MIP directly (branch-and-bound does principled rounding) or use a rounding scheme with a guarantee (randomized rounding, iterative rounding) and check feasibility explicitly.
+- **Stochastic gradient estimates with unacknowledged bias.** Minibatching is unbiased for sums; it is *not* unbiased through nonlinearities (log of a minibatch mean, ratios of minibatch sums, clipped losses). Biased gradients converge to the wrong point while all diagnostics look healthy — check whether your estimator sits inside or outside the nonlinearity.
 
 ## Worked micro-examples
 
