@@ -115,6 +115,14 @@ PPO starting points that work across most continuous-control and small discrete 
 - Cherry-picked video demos are the field's oldest sin; require aggregate metrics over ≥100 eval episodes.
 - For RLHF: win-rate against a fixed baseline judged by a fixed judge, plus KL from SFT, plus capability regression suite (RL for helpfulness can silently degrade reasoning/safety behaviors — always run the pre-RL benchmark battery after).
 
+## Environment design (the half of the problem people skip)
+
+- Observation design: include everything the *optimal* policy needs and nothing else; every extraneous input is exploration surface. Markov check: could you act optimally from a single observation? If velocity/history matters and you give only positions, frame-stack or add it — partial observability presents as an unstable plateau, and no PPO tuning fixes a non-Markov state.
+- Action-space design: prefer the smallest space that spans needed behavior; continuous actions should be normalized to [−1, 1] with the env doing the scaling (policies with raw actions in [0, 500] break standard init assumptions). Discretizing a low-dimensional continuous space is a legitimate simplification, not a hack.
+- Randomize what deployment will vary (start states, dynamics parameters, opponent behavior) *during training*, or the policy will overfit the fixed instance — domain randomization is regularization for policies.
+- Episode length: shorter episodes with denser decision-relevant reward learn orders of magnitude faster; if you can decompose a 10k-step episode into meaningful 200-step segments with local rewards, do it before scaling compute.
+- Simulator speed budget: RL needs 1e6–1e9 steps; a 10 ms/step simulator caps you at ~8.6M steps/day/process. If the simulator can't be vectorized or accelerated, that constraint should drive the method choice (offline RL, model-based, or not-RL) before any algorithm discussion.
+
 ## Worked micro-example: diagnosing a "working" PPO run
 
 Symptom: CartPole-like custom env, reward rises to near-max, deployed policy jitters and fails. Checklist an expert runs, in order: (1) `done` vs truncation — time-limit steps marked terminal? (found: yes → values near horizon corrupted; fix: bootstrap value on truncation). (2) Eval mode — was "success" the stochastic policy's training return? Evaluate deterministic mean action separately. (3) Observation normalization stats frozen at deployment? A running-mean filter still updating at eval time shifts inputs. (4) Reward instrumented vs true objective — the reward included a small alive-bonus; policy learned to survive while ignoring the balance-quality term. Each of these produces the same curve and a broken policy; the curve alone distinguishes none of them.

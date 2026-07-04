@@ -122,6 +122,14 @@ Cost/latency rule: if a task runs > ~100k times/day with fixed structure, the LL
 
 Report: "the model fails at adding 4-digit numbers but its bigger sibling succeeds." Expert diagnosis path: (1) tokenize the failing inputs — `tokenizer.tokenize("3487+2915=")` reveals whether digits are split as `["348","7","+","29","15","="]` (misaligned place values) or per-digit; (2) reformat the prompt to force per-digit tokens: `"3 4 8 7 + 2 9 1 5 ="` and re-test — if accuracy jumps, the deficit is tokenization, not arithmetic capability, and the fix is formatting or tool use, not a bigger model; (3) if unchanged, sweep decoding — greedy vs sampled at T=0.7 (sampling injects digit errors; arithmetic should always be evaluated greedy); (4) only after (1)–(3) conclude anything about the model. The same path applies to spelling, rhyming, and string-reversal complaints. Recommendation hierarchy for production arithmetic: tool call (calculator/code) > digit-formatted prompting > model scaling.
 
+## Text preprocessing rules that still matter in the LLM era
+
+- Do less than you think: lowercasing, stopword removal, stemming, and punctuation stripping — classical IR reflexes — *hurt* subword models, which encode case and punctuation as signal. Preprocess for modern models = Unicode normalization (NFC), consistent whitespace, and removing genuinely corrupt content (mojibake, HTML entities, boilerplate). Nothing else by default.
+- Detect and handle encoding damage early: `ftfy.fix_text` repairs most mojibake; a corpus with 2% mojibake measurably degrades a finetune and poisons embedding clusters.
+- Deduplication is the highest-impact corpus operation for training/finetuning: near-duplicate documents (MinHash/LSH at ~0.8 Jaccard on shingles) inflate memorization, leak across train/val, and skew evaluation. Dedupe before splitting, always.
+- Language ID before multilingual processing (`fasttext` lid.176 remains the workhorse); routing Spanish through an English-only pipeline fails silently, not loudly.
+- Keep raw text immutable and preprocess at load time with versioned code — irreversibly preprocessed corpora are the technical debt you cannot pay back when the next model needs different conventions.
+
 ## Verification / self-check
 
 1. Any string/number/multilingual failure diagnosis: show the actual token split (`tokenizer.tokenize`) supporting it.
