@@ -99,6 +99,13 @@ PPO starting points that work across most continuous-control and small discrete 
 - **In RLHF: masking bugs where prompt tokens receive policy gradients** or the KL is computed over prompt+response instead of response-only — both silently shift the objective; verify per-token loss masks on a printed example.
 - **Vectorized env auto-reset off-by-one**: most vec-env wrappers return the *new* episode's first observation with the *old* episode's final reward/done; storing `(obs, action, reward, next_obs)` naively pairs the last action with the wrong next state. Use the wrapper's documented `final_observation` field.
 
+## Offline RL and learning from logged data
+
+- Offline RL's core failure is **extrapolation error**: Q-learning on logged data queries Q(s,a) for actions the dataset never contains; those values are unconstrained fantasy, the max operator seeks them out, and the learned policy chases imaginary returns. Any offline method must suppress out-of-distribution actions (conservatism/pessimism à la CQL, or advantage-weighted in-distribution methods à la IQL/AWR).
+- Ladder for "we only have logs": (1) behavior cloning on the top-decile trajectories (filtered BC) — embarrassingly strong; (2) advantage-weighted regression-style methods; (3) full offline RL only if logs contain meaningfully diverse suboptimal behavior to stitch. If logs come from one near-deterministic policy, offline RL has nothing to learn beyond cloning it — say so instead of proposing CQL.
+- Off-policy evaluation (estimating a new policy's value from logs) is statistically brutal: importance-sampling estimators have variance exponential in horizon. Treat OPE point estimates for long-horizon policies as directional at best; insist on a small online A/B before shipping decisions on them.
+- Coverage question to ask first: does the logged behavior policy ever take actions similar to what the new policy would? If propensities of proposed actions are ~0 in the logs, no estimator rescues you.
+
 ## Evaluation pitfalls
 
 - **Seed variance dominates most claimed improvements.** Run ≥5 seeds (10+ for publication-grade), report mean ± std or IQM with bootstrapped CIs, and compare distributions, not best-seed curves. A method beating another by 15% on 3 seeds is indistinguishable from noise in many benchmarks.

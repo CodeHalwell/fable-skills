@@ -114,6 +114,13 @@ Deterministic, sub-pixel, zero training data. If corners are the hard part, lear
 - Hybrid pattern that wins in industry: classical pipeline for localization/rectification (fast, reliable) → small CNN for the genuinely semantic decision on the rectified crop.
 - Choose classical when: variability is geometric/photometric and modelable, tolerances are measurable in pixels, data collection is expensive, or certification demands explainability. Choose learned when variability is semantic (breed, defect *type*, occlusion, clutter).
 
+## Video and multi-frame notes
+
+- Most "video" tasks are per-frame image tasks + temporal smoothing: detector per frame → tracker (IoU/Kalman association, ByteTrack-style) beats end-to-end video models for object tracking in most applied settings, and lets you reuse image-domain pretraining and labels.
+- Temporal flicker in per-frame predictions is expected; fix with tracking/EMA over predictions, not by demanding a video architecture.
+- Sample frames for training with temporal stratification (per video, per scene) — consecutive frames are near-duplicates and both waste label budget and cause the train/val leakage noted above.
+- True video architectures (3D convs, temporal transformers) earn their cost only when *motion itself is the label* (action recognition, gesture) — a single frame genuinely can't answer.
+
 ## Data-centric debugging order
 
 When a vision model underperforms, spend effort in this order (empirically where the fixes live):

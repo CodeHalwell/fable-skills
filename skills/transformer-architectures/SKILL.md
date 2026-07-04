@@ -133,6 +133,12 @@ Question: serve a 70B-class model (80 layers, d=8192, 64 heads, GQA with 8 KV he
 - **Sizing speculative decoding by draft model quality alone.** The win is acceptance rate × verification cost; a "better" 1B draft that's 3× slower than a 0.5B draft can lose. Compute expected tokens/pass (formula above) with measured α before choosing.
 - **Assuming tensor parallelism halves latency.** TP splits matmuls but adds two all-reduces per layer; at small batch the collectives dominate and 2-way TP can be barely faster than 1 GPU with a quantized model. TP is a memory-capacity tool first, a latency tool second.
 
+## Attention-variant quick reference
+
+- **Sliding-window attention**: each token attends to the last w tokens; information still propagates ~w×L positions through depth (receptive field stacks), which is why windowed models aren't as crippled as the window size suggests — but exact retrieval beyond w in a single hop is gone. Hybrid layouts (some full, some windowed layers) are the usual compromise.
+- **Cross-attention**: queries from one stream, K/V from another (decoder→encoder, or text→image tokens in multimodal). Its KV cost scales with the *other* sequence's length and is computed once per source.
+- **Multi-head latent / compressed-KV schemes**: compress KV to a low-rank latent to shrink cache below even GQA — evaluate as "GQA with extra steps" on the same cache-bytes axis; the cache-bytes-per-token number is the comparable quantity across all these designs. Always reduce attention variants to (cache bytes/token, FLOPs/token, exact-retrieval range) before comparing.
+
 ## Verification / self-check
 
 Before presenting an answer in this domain:

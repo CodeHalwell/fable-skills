@@ -85,6 +85,13 @@ A model service can be 200-OK, low-latency, and completely broken. Monitor in fo
 - Slice all of it by segment (country, platform, cohort): aggregate output distributions can look stable while one segment is fully broken.
 - Alert design: page on output-distribution shifts and freshness breaches; ticket (don't page) on individual-feature drift — feature-level alerts are too noisy to page on and cause alarm fatigue.
 
+## Off-policy evaluation: judging a candidate without deploying it
+
+- When the incumbent's decisions determine which labels exist (ranking, fraud, pricing), a naive backtest of the candidate on logged data is biased: you can only verify the candidate where the incumbent already explored. The candidate's most interesting behavior — decisions the incumbent never made — is exactly where you have no labels.
+- Minimum honest offline comparison: restrict to the randomized/exploration slice (where actions were taken with known probabilities) and use inverse-propensity scoring — weight each logged outcome by 1/P(action taken). High variance when propensities are small; clip weights and report the effective sample size (`(Σw)²/Σw²`), not the raw count.
+- If you have no logged propensities, say so explicitly: the offline comparison is then directional at best, and the canary is doing the real measurement. Don't dress up a biased backtest with three decimal places.
+- This is another argument for the permanent exploration/holdback slice: it's not just training data hygiene, it's the only substrate on which future candidates can be evaluated offline at all.
+
 ## Retraining cadence economics
 
 - Cadence is a cost-benefit decision, not hygiene. Measure **decay rate**: backtest a model trained at time T on data from T+1w, T+1m, T+3m. If performance decays 0.1% per month, quarterly retraining is fine; if 2% per week (ads, fraud, news), you need weekly-or-faster and the pipeline automation to match.

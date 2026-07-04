@@ -43,6 +43,14 @@ description: Load when designing, reviewing, or debugging evaluations of LLM sys
 7. **Pin judge temperature to 0 and pin the judge model version.** A judge that changes under you invalidates all longitudinal comparisons — a "regression" after a judge-model update is the most common false alarm in eval dashboards.
 8. Re-run the judge on a fixed calibration set whenever anything about the judge changes; alert if agreement with stored human labels drops.
 
+## Evaluating multi-step/agentic systems
+
+- End-state-only evaluation ("did the agent complete the task?") is necessary but hides *why* failures happen and rewards lucky trajectories. Add trajectory-level checks: did it call the right tool at each decision point, did it recover from tool errors, how many steps/tokens did it spend (efficiency is a quality dimension — a correct answer after 40 redundant tool calls fails in production on cost and latency).
+- Score sub-steps with programmatic assertions where possible: tool-call arguments are structured, so "first call is `search` with a query containing the user's entity" is a cheap exact check — far more reliable than judging the whole transcript.
+- Environment determinism is the hard part: an agent eval against live APIs is flaky by construction. Record/replay tool results (fixture the environment) for regression testing; reserve live-environment runs for periodic end-to-end validation.
+- Failure attribution: for each failed trajectory, label the *first* wrong step (wrong tool, wrong arguments, misread result, gave up early, hallucinated a result instead of calling). The histogram of first-failure types is the roadmap; the aggregate success rate is not.
+- Pass^k vs pass@k: for agents, "succeeds at least once in k tries" (pass@k) flatters unreliable systems; production users experience per-attempt reliability. Report per-attempt success and, when reliability matters, the probability all k attempts succeed on repeated runs of the same task.
+
 ## Statistical significance with small eval sets
 
 - Default tool: **paired bootstrap** on the per-item score differences. Same items evaluated by both systems means paired analysis — never compare two independent confidence intervals (that throws away the pairing and hugely overstates uncertainty).

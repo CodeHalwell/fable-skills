@@ -89,6 +89,12 @@ Use the table as an ordered checklist, not inspiration: check the top suspect wi
 
 Rule: these are not interchangeable knobs. Augmentation adds information; the others only restrict capacity. Reach for augmentation/data first, weight decay second, dropout last for large models (modern LLMs train with dropout 0).
 
+## Scaling heuristics worth knowing cold
+
+- Compute-optimal training allocates parameters and data together — tokens ≈ 20× params is the canonical compute-optimal ratio, but *deployment-optimal* models train far past it (small model, many more tokens) because inference cost scales with params, not training tokens. When asked "should we train bigger or longer," the answer hinges on whether training or serving dominates lifetime cost; ask that first.
+- Loss improvements from scale are power-law smooth; capability jumps at thresholds are often metric artifacts (exact-match metrics quantize smooth log-likelihood gains). Before claiming "emergence," check whether a smooth metric (per-token loss on the task) also jumps.
+- Transfer of hyperparameters across scale: LR does *not* transfer naively with width (bigger models want smaller LR, roughly ∝ 1/width under standard parameterization); batch size and wd interact with LR as noted above. Never lift hyperparameters from a 100M-param recipe to a 3B run unchanged.
+
 ## Failure modes & pitfalls
 
 - **Shape errors presented confidently**: dL/dW = gᵀx (transposed result), missing `.sum(0)` on bias grads, Hadamard-vs-matmul confusion for activations. Always re-derive with explicit shapes.
