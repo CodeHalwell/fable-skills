@@ -87,6 +87,16 @@ Cost/latency rule: if a task runs > ~100k times/day with fixed structure, the LL
 - Label-projection tasks (NER across languages) fail on word-alignment errors more than modeling; entity boundaries shift across translations.
 - Beware evaluation contamination in "amazing zero-shot" claims: multilingual benchmarks are frequently machine-translated from English, so the model is being tested on translationese that matches translate-train pipelines.
 
+## Generation-quality diagnostics (symptom → decoding/root cause)
+
+- **Verbatim repetition loops** ("...and the and the and the"): greedy/low-temperature decoding on an open-ended task, or a base (non-instruct) model being used as a chat model. Fix: nucleus sampling; check the model actually is instruction-tuned before blaming decoding.
+- **Output starts by rephrasing/continuing the prompt**: missing `add_generation_prompt`, or base model + no few-shot structure.
+- **Truncated mid-sentence**: `max_new_tokens` hit (inspect `finish_reason`/token counts — don't guess), or a stop sequence matching inside legitimate content.
+- **Fluent but off-task drift in long outputs**: temperature too high for the task, or context overflow silently truncating the instructions (check total token count against the window).
+- **Same output every time despite temperature > 0**: `do_sample=False` default in `generate()` overriding your temperature — temperature without `do_sample=True` is silently ignored in `transformers`.
+- **Quality cliff between the playground and your API code**: system prompt/template differences, default sampling parameter differences, or a different model snapshot — diff the *exact* request payloads before any deeper theory.
+- **Non-English output degrading faster with temperature**: thinner token distributions for underrepresented languages make tail sampling riskier; lower temperature/top-p for non-English generation.
+
 ## Long-sequence handling
 
 - Decision order for input longer than the effective window: (1) does the task actually need the whole document, or is it retrieval in disguise? → chunk + retrieve (RAG) handles most QA/extraction; (2) map-reduce (per-chunk process, then combine) for summarization-like tasks — mind that hierarchical summarization compounds omissions; (3) true long-context model only when cross-chunk reasoning is genuinely global (long-range dependencies, whole-codebase reasoning).
