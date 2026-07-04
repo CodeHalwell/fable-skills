@@ -106,6 +106,9 @@ Never "fix" case 3/4 divergence by loosening tolerances until everything passes 
 - **ULP blindness at scale.** Spacing between adjacent fp64 values is ~2.2e-16 near 1.0 but ~2.0 near 1e16: an absolute tolerance of 1e-9 is 10⁷ ULPs near 1.0 (way too loose) and 0 ULPs near 1e16 (impossible to satisfy). This is exactly why tolerances must be relative, and why `atol` is only for the neighborhood of zero.
 - **Catastrophic parentheses.** `x*x - y*y` loses to cancellation when x≈y; `(x-y)*(x+y)` is stable. `(a+b)+c ≠ a+(b+c)` matters when a ≈ −b: add the small terms first. Sorting by increasing magnitude before summing reduces error for same-sign series.
 - **Denormal/subnormal slowdowns.** Values below ~1.2e-38 (fp32) enter the subnormal range; on many CPUs each op on them is 10–100× slower — a "performance bug" that is actually numerical (fading signals, decaying filters). Flush to zero deliberately if the tail doesn't matter.
+- **Accumulating in the loop what should be computed once outside.** Repeatedly applying `x = rotate(x, θ/n)` n times drifts off the manifold (‖x‖ wanders, rotations stop being orthogonal); compute `rotate(x₀, θ·k)` from the *original* state, or renormalize periodically. Same principle for repeatedly incremented timestamps (`t += dt` accumulates ε per step; `t = t0 + i*dt` doesn't) — the physics-sim and audio-clock bug.
+- **Clamping that hides real signal.** `np.clip(p, 1e-12, 1)` before a log is legitimate protection; clipping to 1e-3 "to be safe" destroys genuinely small probabilities and biases every downstream likelihood. Set floors at the underflow boundary of the *computation*, not at a comfortable-looking round number.
+- **Float keys and float set-membership.** `0.1+0.2 in {0.3}` is False; grouping/joining on computed float keys fragments groups nondeterministically. Quantize explicitly (`round(x, 9)`, integer microunits) before using floats as identity.
 
 ## Worked micro-examples
 
