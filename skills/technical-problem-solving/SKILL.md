@@ -21,6 +21,18 @@ description: Use for general expert problem-solving heuristics — restating a p
 - **Sanity checks to run on any answer:** dimensions consistent? limiting cases correct (zero, infinity, symmetry point)? monotonic in the right direction? sign right? order of magnitude plausible? special case matches a known result?
 - **When to trust vs re-derive:** if two independent methods agree, trust it. If an answer only comes from one fragile chain of algebra, re-derive it a different way before relying on it.
 
+## The master moves, expanded
+
+- **Decompose** when the problem has separable structure: independent subproblems, a sum you can split, stages you can chain, cases that partition the space. The art is finding a decomposition where the pieces are genuinely easier and recombine cleanly (divide-and-conquer, superposition, casework on a well-chosen variable).
+- **Analogize** when the structure matches a solved problem in another domain: a flow network, a Markov chain, a resistor network, a recurrence, a known combinatorial identity. Port the machinery. Danger: check the analogy's assumptions actually hold before trusting the ported result.
+- **Transform** when a change of representation trivializes the operation: logarithms turn products into sums; Fourier/Laplace turn convolution and differentiation into multiplication; generating functions turn recurrences into algebra; duality swaps a hard max for an easy min; a coordinate change aligns with the symmetry. The transformed problem, solved, is mapped back.
+
+## Estimation discipline
+
+- **Fermi decomposition:** never guess a large or unfamiliar quantity directly. Factor it into pieces each known to within an order of magnitude, estimate each, multiply, and carry units the whole way. Errors in independent factors partly cancel, so the product is usually within a factor of a few.
+- **Anchor with knowns:** tie estimates to numbers you're sure of (population ~8B, seconds/year ~3×10⁷, Avogadro ~6×10²³, a person ~70 kg). 
+- **Bracket:** compute a clearly-too-low and clearly-too-high bound; the truth is between and often near the geometric mean. This catches wild errors even when a point estimate is hard.
+
 ## Failure modes and pitfalls
 
 - **Committing to the first representation.** Grinding algebra on something that's one picture away from obvious, or brute-forcing a case analysis a symmetry would collapse. Symptom: the work is getting *more* complicated, not less. Cure: stop and re-represent.
@@ -35,6 +47,12 @@ description: Use for general expert problem-solving heuristics — restating a p
 - **Estimation without decomposition.** Guessing a big number directly instead of factoring it into estimable pieces. Fermi decomposition turns an impossible guess into a product of defensible ones.
 - **Timeboxing failure — sunk-cost persistence.** Pouring more time into a stuck approach because you've already invested. Set a limit; when it passes with no traction, deliberately switch representation or invert the question.
 - **Losing track of what's known vs assumed.** In long derivations, quietly assuming what you're trying to prove (circularity) or carrying an unjustified step. Keep the ledger of established vs goal explicit.
+- **Generalizing from too few cases.** Seeing a pattern hold for n=1,2,3 and asserting it for all n without proof. Small cases *suggest* conjectures; they don't establish them. Look for the mechanism (induction step, bijection) that would force the pattern, and test one case designed to break it.
+- **Anchoring on a remembered formula that doesn't apply.** Pattern-matching to a familiar result whose assumptions your problem violates (applying a closed-form that assumes independence, linearity, or a boundary condition you don't have). Verify the preconditions before plugging in.
+- **Precision theater.** Reporting an estimate to 4 significant figures when the inputs are order-of-magnitude guesses. Match the precision of the answer to the precision of the inputs; false precision hides the real uncertainty.
+- **Over-decomposing.** Splitting into so many pieces that bookkeeping errors and lost interactions between pieces cost more than the decomposition saved. Decompose along the natural seams, not arbitrarily.
+- **Solving a harder problem than asked.** Missing that the question wants existence, not construction; a bound, not the exact value; or one example, not all of them. Re-read the actual ask before committing effort.
+- **Not noticing the problem is under- or over-determined.** Too few constraints → many solutions (the "answer" isn't unique); too many → possibly none (check consistency). Count degrees of freedom vs constraints early.
 
 ## Worked micro-examples
 
@@ -45,6 +63,10 @@ description: Use for general expert problem-solving heuristics — restating a p
 **3. Fermi estimate with a check.** Piano tuners in Chicago: ~3M people ÷ ~3 per household ≈ 1M households; ~1 in 20 owns a piano → 50,000 pianos; tuned ~once/year; a tuner does ~4/day × ~250 days ≈ 1000/year → ~50 tuners. Sanity check: order of magnitude tens-to-hundreds, not thousands — plausible for a service profession. The decomposition, not the final guess, is the skill.
 
 **4. Invariant kills a "reachability" question.** "A 8×8 board with two opposite corners removed — can 31 dominoes tile it?" Color like a checkerboard: each domino covers one black + one white. Opposite corners share a color, so 30 of one color and 32 of the other remain — the invariant (equal counts) is violated. No tiling exists, proven in one line by choosing the right representation (coloring/invariant) instead of enumerating placements.
+
+**5. Work backward on a construction.** "Make 24 from 3, 3, 8, 8 using +−×÷." Forward search is huge. Backward: 24 = 8 × 3, or 24 = 8 ÷ (something small). Try 8/(3 − 8/3): 8/3 = 2.667, 3 − 2.667 = 0.333, 8/0.333 = 24. Goal-directed factoring (what pairs multiply/divide to 24?) prunes the search to almost nothing.
+
+**6. Limiting case catches an error.** You derive that the resistance of two resistors in parallel is R₁ + R₂. Test the limit R₂ → 0 (a short): physically the combination should → 0, but the formula gives R₁. Contradiction — the formula is wrong. The correct R₁R₂/(R₁+R₂) → 0 as R₂ → 0. The limiting case exposed the mistake in seconds without re-checking the algebra.
 
 ## Verification and self-check
 

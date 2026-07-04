@@ -114,6 +114,16 @@ Deterministic, sub-pixel, zero training data. If corners are the hard part, lear
 - Hybrid pattern that wins in industry: classical pipeline for localization/rectification (fast, reliable) → small CNN for the genuinely semantic decision on the rectified crop.
 - Choose classical when: variability is geometric/photometric and modelable, tolerances are measurable in pixels, data collection is expensive, or certification demands explainability. Choose learned when variability is semantic (breed, defect *type*, occlusion, clutter).
 
+## Data-centric debugging order
+
+When a vision model underperforms, spend effort in this order (empirically where the fixes live):
+1. **Look at the errors.** Sort val images by loss; view the top 50. This finds mislabeled data, systematic label-convention mismatches (is a truck a "car"?), and preprocessing corruption faster than any tool. Do this before touching the model, every time.
+2. **Label quality audit**: relabel a random 100-sample slice yourself; if your agreement with the labels is < ~95% for classification (lower for boxes/masks), the label noise floor may already explain the metric gap — model changes can't beat annotator disagreement.
+3. **Distribution audit**: compare train vs deployment on cheap statistics — resolution, brightness histograms, class frequencies, camera/device mix. A model trained on daylight images failing at night is not a modeling problem.
+4. **Augmentation and preprocessing review** (see invariance audit above).
+5. **Capacity/architecture** — genuinely last. Swapping backbones on dirty data reorders noise.
+Hard-example mining beats uniform data collection: add data *from the observed failure clusters* (specific classes, conditions, object sizes), not "more data" generically; 500 targeted images often outperform 10k random ones.
+
 ## Verification / self-check
 
 1. Augmentation review: for each transform, name the invariance it assumes and confirm the label survives for this task; confirm masks/boxes are co-transformed in the same call.

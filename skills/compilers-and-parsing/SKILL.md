@@ -90,6 +90,51 @@ Optimize on an IR (three-address code, SSA, or even a simplified AST), not on so
 - Parser error recovery so users get more than one error per run: on failure, report, then skip tokens to a synchronization point (statement start keywords, `;`, `}`) and resume. Without recovery, a missing brace on line 3 makes lines 4–500 unparseable and users fix errors one compile at a time.
 - The quality bar for messages: point at the span, say what was expected AND what was found, and when the cause is remote, show it ("unclosed '(' opened at 4:12"). "Syntax error" alone is a bug report generator.
 
+## Failure modes & pitfalls (the recurring ones)
+
+- **Left recursion in recursive descent.** Grammar rule `E → E '+' T` transcribed literally into `parse_E` calling `parse_E` first = infinite recursion on the first token. Correction: iteration (`parse_T`, then a while-loop over `'+' T`) or precedence climbing. This is THE classic recursive-descent bug; any grammar taken from a spec (specs favor left recursion for left associativity) must be transformed before hand-implementation.
+- **Regex lexer alternation order.** `TOKEN_RE = '|'.join([...])` with `>` listed before `>=` lexes `>=` as two tokens; with `if` before identifier, `ifx` becomes `if`, `x`. Order: longest-fixed-strings first, keywords via post-check on the identifier rule, and end the master regex with a catch-all error rule so illegal characters produce a positioned error instead of silently vanishing (unmatched input with `re.finditer` just gets skipped — the silent-skip is the bug).
+- **Consuming vs peeking confusion.** Every parser bug cluster traces to a function that sometimes consumes the lookahead and sometimes doesn't. Fix the contract globally: every `parse_X` consumes exactly the tokens of X, nothing more; `expect(tok)` consumes-or-errors; `peek()` never consumes. Enforce in code review of your own output.
+- **Evaluating during parsing.** Folding `2+3` inside `parse_expr` works until short-circuit semantics, variables, or error spans are needed. Parse to AST; evaluate/fold in separate passes — the two-hour "shortcut" costs the whole architecture.
+- **Environments shared by reference in interpreters.** Implementing function calls as `eval(body, env)` with the *caller's* env gives dynamic scoping (usually wrong); with the *definition-time* env unclosed, closures break. Correct: `Env(parent=fn.defining_env)` per call, parameters bound in the new frame.
+- **`ast.NodeTransformer` returning `None`** silently deletes the node; forgetting to return the node from `visit_X` after modifying it does the same. Always `return node` (or the replacement).
+- **String offsets vs unicode.** Mixing byte offsets (from a bytes-oriented lexer) with str indexing produces garbled spans on non-ASCII source. Pick one unit (Python: str code-point offsets) end-to-end.
+- **Precedence table drift.** Adding an operator to the lexer but not the precedence table makes it parse as an atom boundary — expression silently truncates. Keep one table that drives both lexer symbol list and parser precedence.
+- **Grammar tested only on positives.** A parser that accepts everything passes every positive test. Half the test suite must be *rejection* tests asserting both the refusal and the error position.
+
+## Worked micro-example: 30-line lexer with spans and error handling
+
+```python
+import re
+TOKEN_SPEC = [                      # order matters: longest / most specific first
+    ('NUM',   r'\d+(\.\d+)?'),
+    ('ID',    r'[A-Za-z_]\w*'),
+    ('OP',    r'\*\*|[+\-*/()]'),   # '**' before '*'
+    ('SKIP',  r'[ \t]+'),
+    ('NL',    r'\n'),
+    ('ERR',   r'.'),                # catch-all: never silently drop input
+]
+MASTER = re.compile('|'.join(f'(?P<{n}>{p})' for n, p in TOKEN_SPEC))
+KEYWORDS = {'if', 'else', 'while'}
+
+def lex(src):
+    line_starts = [0]
+    for m in MASTER.finditer(src):
+        kind, text, start = m.lastgroup, m.group(), m.start()
+        if kind == 'NL':
+            line_starts.append(m.end())
+        elif kind == 'SKIP':
+            continue
+        elif kind == 'ERR':
+            raise SyntaxError(f'illegal character {text!r} at offset {start}')
+        else:
+            if kind == 'ID' and text in KEYWORDS:
+                kind = text.upper()          # keyword post-check, not regex alternatives
+            yield (kind, text, start, m.end())
+    yield ('EOF', '', len(src), len(src))    # explicit EOF token simplifies every parser
+```
+Three deliberate choices to copy: the ERR catch-all (positioned errors, no silent skips), keyword post-check, and the explicit EOF token — parsers without an EOF token special-case "end of input" in every function and one of those cases is always wrong.
+
 ## DSLs: when embedded beats external
 
 - **Embedded DSL** (a Python API/fluent builder/operator overloading — like SQLAlchemy, pytest fixtures, Keras): free lexer/parser/editor-support/debugger, host escape hatch for anything unanticipated. Choose when users are programmers and the host language is available in their context.

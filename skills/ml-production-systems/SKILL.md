@@ -13,6 +13,16 @@ description: Load for ML-in-production questions — deploying/monitoring models
 - **Every deployed model changes the world it observes.** A recommender only gets feedback on items it showed; a fraud model only gets labels on transactions it let through. Naive retraining on this feedback data poisons the next model. Design the feedback loop before designing the retraining job.
 - **You will roll back.** Version everything needed to reproduce and to revert — model artifact, training data snapshot, feature definitions, code — and rehearse the rollback path before you need it.
 
+## Decision framework: serving architecture
+
+| Situation | Choose | Reasoning |
+|---|---|---|
+| Predictions consumed on a schedule (daily emails, nightly risk scores), entity set enumerable | Batch precompute → key-value store lookup at request time | Simplest reliable architecture; skew surface shrinks (one offline pipeline); latency is a lookup. Choose this whenever freshness allows — teams over-build online serving for tasks batch would serve better. |
+| Prediction depends on request-time context (search query, current session, fresh transaction) | Online inference with a feature store for precomputed features + request-time features | Only the request-time features need an online path; precompute everything precomputable. |
+| Both fresh signals and heavy features | Hybrid: batch features (daily aggregates) + streaming features (last-hour counters) + request features, joined at serve time | Each feature gets the cheapest freshness tier it actually needs — audit "does this feature need to be fresher than daily?" per feature; most don't. |
+| Strict latency budget (<10ms) with a big model | Distill/quantize the model, or precompute; don't try to make the big model fast with caching heroics | Cache hit rates on high-cardinality inputs disappoint; distillation is the honest fix. |
+| Model outputs feed another model | Version the interface like an API contract; consumer pins producer's model version | Upgrading the upstream model silently shifts the downstream model's input distribution — a self-inflicted drift incident. |
+
 ## Training-serving skew: causes and defenses
 
 Three canonical causes:
@@ -88,6 +98,15 @@ Before trusting offline metrics to drive decisions:
 - Collect history: for each past model change, record (offline delta on your metric, online delta from its A/B test). Plot them. If the sign agrees < ~80% of the time, your offline eval cannot rank candidates and improving it is the highest-ROI project on the team.
 - Common causes of decorrelation: offline eval set from a different distribution than current traffic (stale, or filtered differently), label leakage inflating offline numbers, offline metric mismatch (AUC vs. top-k behavior actually shown to users), feedback-loop-biased eval data.
 - Never conclude from an online-flat result that offline gains are "noise" without checking power: small canaries are underpowered for small effects; compute the minimum detectable effect before deciding.
+
+## Incident response for model degradation
+
+When the metric dips, check in this order (cheapest and most probable first):
+1. Did anything deploy? Model version, serving code, feature pipeline code, upstream schema — correlate the dip's start time against every changelog you can find. Most "model degradation" is a deploy.
+2. Is a feature feed stale or failing? Check freshness lag and imputation-rate dashboards per feature.
+3. Did the input mix shift? Traffic composition (new campaign, new market, bot wave) changes aggregate metrics without any model change — slice the metric before concluding anything.
+4. Only then consider genuine drift, and confirm it by scoring the current model on the freshest labeled window.
+Mitigation hierarchy: rollback (if a deploy correlates) → failover to the previous model version → degrade gracefully (rule-based fallback) → hotfix retrain (last resort under time pressure; hasty retrains on incident-window data encode the incident).
 
 ## Failure modes & pitfalls
 

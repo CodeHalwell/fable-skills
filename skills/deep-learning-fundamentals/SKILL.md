@@ -62,6 +62,21 @@ Diagnostic rule: log per-layer grad norms. Vanishing shows as a monotone decay t
   - Label noise amplifies the peak. Clean your labels before concluding "the model is too big."
   - Never invoke "more params than data points → will overfit" as an argument. It's empirically false for modern nets; say instead "check the train-test gap and where you sit relative to interpolation."
 
+## Symptom → cause table (training diagnosis)
+
+| Symptom | First suspects, in order |
+|---|---|
+| Loss flat from step 0 at exactly ln(num_classes) | logits never change: LR=0/optimizer not stepping, frozen params, detached graph (a `.detach()`/`torch.no_grad()` in the forward path), labels shuffled independently of inputs |
+| Loss decreases, val accuracy at chance | metric bug (argmax over wrong axis), label mapping mismatch train-vs-val, eval on wrong split |
+| Loss spikes then recovers repeatedly | LR too high for late training (add decay), fp16 overflow, rare bad batches (inspect the batch at the spike step) |
+| Loss suddenly NaN mid-training | fp16 overflow, log/sqrt of ≤0 in a custom op, exploding norms (check grad-norm trend the 100 steps prior — spike = data, ramp = dynamics) |
+| Train loss ↓, val loss ↓, val *metric* flat | loss-metric mismatch (CE improving on confident correct examples while decision boundary static); threshold/calibration issue for the metric |
+| Great val, bad test/production | leakage in the split (group/temporal), preprocessing mismatch, distribution shift |
+| First epoch great, then degrades | LR too high after warmup ends, data ordering artifact (shuffle off), BN stats poisoning |
+| Slow convergence, everything "correct" | double softmax, unnormalized inputs, LR 10–100× too low, batch too small for BN |
+
+Use the table as an ordered checklist, not inspiration: check the top suspect with a 5-minute experiment before theorizing.
+
 ## Regularizers: what each one actually does
 
 | Method | Actual mechanism | When it's the right tool | Trap |

@@ -47,6 +47,8 @@ description: Architecting agentic LLM systems — tool design, context managemen
 - Escalate: agent uncertain, repeated failures, or action outside granted scope.
 Two failure directions, both fatal: gate everything → humans rubber-stamp without reading (alarm fatigue defeats the gate); gate nothing → one bad loop mass-deletes. Also enforce scope *below* the agent (API-token permissions, sandbox, allowlists) — the agent asking permission is UX; the credential not having permission is security.
 
+**Model tier for agents:** agent steps compound — a 5% per-step error rate is ~40% over 10 dependent steps — so use the strongest model you can afford for the *decision-making* loop, and route bulk sub-work (summarize this file, classify these 50 items) to cheap models via tools/subagents. This is the opposite of the single-call intuition where cheap-first is right; in agents, a smarter planner reduces total steps and often net cost. Also give the loop model room to think before acting (reasoning field/thinking mode) on non-trivial decisions — the expensive failure isn't a slow step, it's a wrong action that costs ten steps to undo.
+
 **Stopping criteria — implement all four, in the harness (not the prompt):**
 1. Hard step/budget/time caps (in code; the model can't be trusted to count its own steps).
 2. Progress detection: same tool + same/equivalent args N times, or no state change in K steps → interrupt with "you appear stuck; state what you learned and change approach or stop."

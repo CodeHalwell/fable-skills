@@ -89,6 +89,15 @@ On a DAG, "DP" and "graph traversal" merge: any recurrence over nodes evaluated 
 - Implicit `neighbors(state)` function: state-space searches; add a `dist`/`visited` dict keyed by state (make states hashable: tuples, frozensets, or serialize grids as `tuple(map(tuple, grid))` or a bytes string).
 - Python performance notes: for V ~ 10⁶ use lists indexed by int ids, not dicts of tuples (5–10× and huge memory difference); intern states to ids at the boundary. Recursion-based DFS dies around depth 10³–10⁴ — convert to an explicit stack for anything path-like (a line graph is the adversarial input that finds this bug).
 
+## High-value patterns most solutions miss
+
+- **Multi-source BFS:** "distance to the nearest X for every cell/node" — seed the queue with ALL sources at distance 0 and run one BFS. The per-source-BFS version is O(V·sources) and a common TLE; the multi-source version is one line different and O(V+E).
+- **Binary search + graph check hybrid:** "maximize the minimum edge weight on a path" (or minimize the maximum) — binary search the threshold, check connectivity using only qualifying edges (BFS or union-find per check). Alternative single-shot: sort edges and union-find until s and t connect (that edge's weight is the answer) — this is Kruskal reasoning reused.
+- **Bridges and articulation points** (Tarjan low-link, one DFS): triggers are "critical connection", "single point of failure", "removing which edge/node disconnects". Low-link rule: tree edge (u, v) is a bridge iff `low[v] > disc[u]`. Don't approximate with "remove each edge and re-check connectivity" (O(E·(V+E))) unless E is tiny.
+- **Eulerian path** (use every EDGE exactly once — do not confuse with Hamiltonian, every node, which is NP-hard): exists in a connected undirected graph iff 0 or 2 odd-degree vertices; directed iff in-degree = out-degree everywhere except one +1/−1 pair. Construct with Hierholzer's algorithm. Triggers: "use each domino/word-overlap/road exactly once", itinerary reconstruction.
+- **Reverse-graph trick:** "distance from every node TO a fixed target" = one traversal from the target on the reversed graph, not V traversals. Similarly "which nodes can reach S" = reachability from S in the reverse graph.
+- **Meet conditions on layered/product graphs:** constraints like "traffic light parity", "must alternate edge colors", "at most k tolls" multiply the state: node → (node, phase) or (node, budget_used). Dijkstra/BFS run unchanged on the product graph; k·V states is the price and it's usually affordable.
+
 ## Failure modes & pitfalls (cross-cutting)
 
 - Running Dijkstra with negative edges — silently wrong, not an exception. Grep the weights before choosing.

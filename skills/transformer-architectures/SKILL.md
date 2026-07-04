@@ -76,6 +76,19 @@ Speculative decoding acceptance math: with draft acceptance rate α and k draft 
 - Engineering consequences, not just wins: all experts must be resident in memory (VRAM cost tracks *total* params), routing needs load-balancing auxiliary losses or you get expert collapse (a few experts hog all tokens), and batch-level all-to-all communication makes small-batch latency worse than a dense model of equal active size.
 - Rule: MoE buys quality-per-FLOP, costs memory and serving complexity. Prefer dense for memory-constrained single-GPU serving; prefer MoE when you serve at scale with expert parallelism and are FLOPs-bound.
 
+## Reading a config.json: the checklist
+
+Before any analysis of an unfamiliar model, extract and cross-check these fields — each one changes downstream arithmetic or advice:
+- `hidden_size` (d), `num_hidden_layers` (L), `intermediate_size` (d_ff), `vocab_size` (V) → parameter estimate.
+- `num_attention_heads` vs `num_key_value_heads` → MHA/GQA/MQA; drives all KV-cache math.
+- `tie_word_embeddings` → whether to count V·d once or twice.
+- `rope_theta` and any `rope_scaling` block → native vs extended context; a large θ (≥500k) or a scaling dict means the advertised `max_position_embeddings` is an extension, and quality at the far end should be verified, not assumed.
+- `hidden_act` → SwiGLU-family (`silu` with gate) means 3 MLP matrices, not 2.
+- `sliding_window` (if present) → attention is windowed in some/all layers; long-range retrieval claims need checking layer by layer.
+- `num_local_experts` / `num_experts_per_tok` → MoE; total vs active params diverge.
+- `torch_dtype` → default load precision; memory math changes 2× between fp16 and fp32 assumptions.
+If a question's answer would change based on any unexamined field above, read the config first — never answer from the model's marketing name.
+
 ## Encoder-only vs decoder-only vs encoder-decoder
 
 | Shape | Attention pattern | Choose for | Why |

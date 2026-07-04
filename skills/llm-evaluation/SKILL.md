@@ -94,6 +94,9 @@ description: Load when designing, reviewing, or debugging evaluations of LLM sys
 - **Reporting only the mean.** Correction: always report n, CI, and the 2–3 worst slices. A results table without n is an anecdote.
 - **Testing at a different temperature/config than production.** Eval at temp 0, serve at temp 1 → eval measures a different system. Match serving config exactly, including system prompt and max_tokens (truncation causes real failures).
 - **Cluster-blind sampling.** 500 eval items where 400 are near-duplicates of one input pattern is effectively n≈100 with a misleading label. Deduplicate/stratify before trusting n.
+- **Goodharting a judge metric.** Once a judge score becomes the optimization target, prompts evolve to please the judge (longer, more confident, rubric-keyword-stuffed) rather than users. Correction: rotate in fresh human calibration samples; watch for score-up-but-user-signals-flat divergence; keep at least one metric the prompt author cannot see.
+- **Averaging incomparable difficulties across versions.** If v2's eval run happened to hit a harder traffic week (for production-sampled sets), its lower score is mix shift, not regression. Correction: fixed eval sets for comparisons; production samples for monitoring; never conflate the two roles in one number.
+- **Letting the system under test see eval instrumentation.** Judge rubrics or expected answers leaking into the system prompt (shared config files, copy-paste) produces perfect scores and zero information. Keep eval configs physically separate from serving configs.
 
 ## Worked micro-example: is prompt B actually better?
 

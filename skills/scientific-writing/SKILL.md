@@ -50,6 +50,17 @@ description: Use for writing papers and technical reports — structuring by inf
 - **Inconsistent terminology.** Calling the same thing three names ("the model / our approach / the system"). Pick one term per concept and use it everywhere; consistency aids comprehension more than variety.
 - **Discussion that restates results instead of interpreting them.** The discussion should say what the results *mean*, their limitations, and what they don't show — not replay the numbers.
 - **Ignoring the limitations section, or making it perfunctory.** Honest limitations preempt reviewer objections and build credibility. State the real ones and their scope.
+- **"Significant" used ambiguously.** In a paper "significant" reads as *statistically* significant. Don't use it to mean "large" or "important" — say "substantial" or "meaningful" and give the number. Report effect sizes and intervals, not just p-values.
+- **Undefined notation and acronyms.** Every symbol defined at first use; acronyms spelled out once. A reader hitting an undefined term stops trusting the paper's care.
+- **Figures and text disagreeing.** The number in the abstract differs from the table; the caption says "5 seeds" but methods say 3. These inconsistencies are what reviewers pounce on. Do a numbers-reconciliation pass.
+- **Over-long, unfocused abstract.** Trying to summarize every result. The abstract sells one contribution and one headline number; details belong in the body.
+- **Weak verbs and throat-clearing.** "It is important to note that", "In order to", "Due to the fact that" — cut them. Every sentence should advance the argument.
+
+## Responding to reviews
+
+- **Answer every point, in order, quoting the reviewer.** A point-by-point response letter that restates each comment then gives the change (with the exact new location/result) is far more persuasive than prose.
+- **Concede fair points and fix them; push back only with evidence.** "The reviewer is wrong" loses; "We initially thought so too, but experiment X (new Fig. 5) shows Y" wins. Disagree respectfully and with data.
+- **Distinguish changes made from changes declined,** and justify declines by scope or evidence, not by dismissing the reviewer. Reviewers are also readers — if one misread something, others will too, so clarify the text rather than just defending it.
 
 ## Worked micro-examples
 
