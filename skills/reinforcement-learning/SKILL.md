@@ -63,6 +63,17 @@ Diagnostics: watch approx-KL per update (spikes → LR too high or too many epoc
 - Sparse-reward escalation path, in order of cheapness: (1) reward shaping via potential Φ, (2) curriculum (start states near the goal, expand outward), (3) demonstrations mixed into the buffer or BC-pretrained policy, (4) goal relabeling (HER) when goal-conditioned, (5) intrinsic motivation (count-based novelty, RND-style prediction error). Intrinsic bonuses are last because they add their own hacking surface — the noisy-TV problem: an agent staring at stochastic noise is maximally "novel" forever.
 - Entropy regularization (PPO bonus, SAC's temperature) is exploration in the policy-space sense — it keeps options alive but doesn't seek out unvisited states; don't confuse the two roles.
 
+## Debugging workflow and starting hyperparameters
+
+Establish the ladder of sanity checks before believing any result, ascending only when the rung below passes:
+1. **Random policy baseline**: run 100 episodes with random actions; record mean return. Every future number is reported relative to this. Surprisingly many "learning" curves never beat it.
+2. **Cheat policy**: if a hand-coded heuristic gets near-max reward, the env is easy and RL failing means implementation bugs, not hard exploration.
+3. **Overfit one configuration**: fixed seed, single initial state — the agent must solve it near-perfectly. Failure here is always a bug (reward wiring, done handling, action scaling), never "needs more samples."
+4. **Known-good env cross-check**: run your agent code on CartPole/Pendulum with reference hyperparameters. If it fails there, stop blaming your env.
+5. Only now: full env, multiple seeds.
+
+PPO starting points that work across most continuous-control and small discrete problems (deviate deliberately, not by copy-paste accretion): lr 3e-4 (anneal to 0), γ 0.99 (recompute from horizon: γ ≈ 1 − 1/expected_steps_to_reward), GAE λ 0.95, clip ε 0.2, epochs/batch 4–10, minibatches 4–32, entropy coef 0.01 (0.0 for near-deterministic tasks), value coef 0.5, grad-norm clip 0.5, parallel envs 8–64. For RLHF-PPO: much smaller lr (~1e-6 to 1e-5 on the policy), 1 epoch per batch, and KL coefficient tuned to hold KL-per-token in roughly the low single digits of nats per response — but treat KL target as the primary knob, not lr.
+
 ## RLHF/RLAIF for language models
 
 - Pipeline: SFT → reward model (RM) trained on preference pairs (Bradley-Terry loss on chosen vs rejected) → PPO on the policy with per-token reward = RM score at sequence end minus **β·KL(π‖π_SFT)**.

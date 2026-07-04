@@ -76,6 +76,13 @@ description: Load when writing or debugging neural network training runs — los
 - Padding leaking into loss: mean over all tokens including pads dilutes the loss and gradient — mask pads (`ignore_index=-100` in `F.cross_entropy`) and verify the *count* of non-ignored targets per batch is what you expect.
 - Class targets with wrong dtype/shape: `F.cross_entropy` wants class *indices* `(N,)` int64 — one-hot floats of shape `(N, C)` are interpreted as class probabilities and train, just wrong; and MSE on class indices trains too. Both are silent.
 
+## Regularization and generalization knobs (after the pipeline is correct)
+
+- Order of resort when val lags train: more data / better augmentation > early stopping on val metric > weight decay (AdamW 0.01–0.1) > dropout > architectural shrinking. Reaching for dropout while the LR schedule is wrong is treating symptoms.
+- Augmentation must respect label semantics: horizontal flips break digit/text/chirality tasks; aggressive crops can cut out the labeled object entirely (audit augmented samples against labels, same eyeball ritual as data loading).
+- Label smoothing (0.1) is a cheap, usually-safe win for classification — but it changes the loss floor: with smoothing ε over C classes the minimum achievable loss is no longer 0, so don't chase "loss won't reach zero" as a bug after enabling it, and the one-batch overfit check must be run with smoothing off.
+- Early stopping needs patience measured in *validations*, not epochs, and the val metric that matters — val loss and val accuracy frequently disagree late in training (loss rises from growing confidence on errors while accuracy still improves); stop on the deployment metric.
+
 ## Checkpointing and reproducibility
 
 - A resumable checkpoint = model weights + **optimizer state** + LR-scheduler state + step/epoch counters + RNG states (torch, CUDA, NumPy, Python) + the AMP scaler state. Resuming Adam without its moment estimates causes a loss bump and a subtly different trajectory; resuming without scheduler state restarts warmup at the current step.
