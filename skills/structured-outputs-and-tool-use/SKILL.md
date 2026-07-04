@@ -78,6 +78,20 @@ def structured_call(prompt: str, model_cls: type[BaseModel], max_repairs: int = 
 - Don't act on any value until its closing delimiter has arrived: a streamed `"amount": 1200` might still become `12000`. Commit field-by-field only when the parser confirms the field is complete.
 - Tool-call arguments stream as string deltas that must be accumulated per call `id` (parallel calls interleave); dispatch only on the stop/finalization event, never on a "looks complete" heuristic.
 
+## Decomposition: when one call should be several
+
+- Split when: the schema exceeds ~15–20 leaf fields, mixes unrelated concerns (extract entities AND classify AND summarize), or requires reasoning quality on one field while others are mechanical. Accuracy per field degrades as schema size grows; two focused calls routinely beat one omnibus call on both quality and debuggability, at modest extra cost.
+- Keep together when: fields are strongly interdependent (a classification that determines which other fields make sense) — splitting forces you to thread state between calls and re-send context.
+- For long-document extraction, chunk the document and extract per chunk into a *list* schema, then merge/dedupe in code. Asking for one giant object over a 100-page input maximizes both truncation risk and missed items.
+- Conditional structure: instead of one schema with many mutually-exclusive optional blocks, use a discriminated union pattern — first field is `"kind"` (enum), description states which fields apply per kind, validator enforces the correlation. Models handle "fill only the fields for your chosen kind" poorly without this explicit structure.
+
+## Agent-loop robustness (tool use over many turns)
+
+- Cap iterations (typical: 10–25 depending on task) and make the cap's behavior explicit: on hitting it, the model gets one final no-tools turn to summarize partial progress, rather than the loop dying mid-thought.
+- Detect repetition: same tool + semantically-same arguments twice in a row is a stuck loop; intervene by injecting a user-role note ("that call already failed with X; try a different approach") rather than letting it burn the budget.
+- Truncate/summarize old tool results as the transcript grows — but never truncate the *current* turn's results or the system prompt. Giant accumulated tool outputs are the top cause of context-limit failures and degraded late-turn reasoning in agent loops.
+- Idempotency: assume any tool call can be issued twice (retries, regenerations). Side-effecting tools need idempotency keys or precondition checks in the tool implementation — do not rely on the model not to repeat itself.
+
 ## Failure modes & pitfalls
 
 - **Hallucinated enum values:** model returns `"priority": "urgent"` when the enum is `["low","medium","high"]` — synonyms and plausible siblings, especially in prompt-and-parse mode. Fix: enum list verbatim in the field description (not only the schema), add `"other"`, validate with exact membership, repair-with-error. Never "fix" by fuzzy-matching to the nearest enum silently — that's a misclassification laundering machine.
@@ -89,6 +103,35 @@ def structured_call(prompt: str, model_cls: type[BaseModel], max_repairs: int = 
 - **Constrained mode silently downgrading:** some providers fall back or error on unsupported schema features (deep recursion, `anyOf` unions, `patternProperties`); test the exact schema against the exact provider, and pin behavior with a contract test in CI.
 - **Trusting `finish_reason == "tool_calls"` implies valid args:** argument strings can still be malformed or violate your semantics; validate tool arguments with the same rigor as final outputs before executing side effects.
 - **Executing side-effecting parallel calls concurrently** (two `transfer_funds` calls the model duplicated): dedupe identical calls in one turn and gate irreversible actions behind sequential confirmation.
+
+## Worked micro-example: redesigning a schema that "the model keeps getting wrong"
+
+Failing schema (extraction from support emails, ~12% invalid or wrong-field rate):
+
+```json
+{"customer": {"contact": {"email": "string", "phone": "string"}},
+ "issue": {"details": {"category": "string", "product_line": "string",
+                       "meta": "string  // JSON string with extra fields"}},
+ "sentiment": "number 1-10"}
+```
+
+Expert diagnosis: 3-level nesting (structural errors + attention dilution), free-text `category` (unbounded values downstream can't branch on), a field *described as* a JSON string (guarantees stringified-JSON output), an unanchored numeric scale (scores cluster 6–8, meaningless), and no way to say "not present in the email."
+
+Redesigned:
+
+```json
+{
+  "customer_email": "string or null — null if no email address appears in the message",
+  "customer_phone": "string or null — digits and '+' only, null if absent",
+  "category": "one of: billing | shipping | product_defect | account_access | other — use other when no listed value clearly applies",
+  "category_other_note": "string or null — only when category is other: one sentence on why",
+  "product_line": "one of: <your 8 SKU families> | unknown",
+  "is_refund_requested": "boolean — true only if the customer explicitly asks for money back",
+  "sentiment": "one of: angry | frustrated | neutral | satisfied"
+}
+```
+
+Every change is mechanical application of the rules above: flatten, enumerate, describe, add null/other escape hatches, replace the numeric scale with anchored labels. Typical result of exactly this kind of rewrite: invalid/wrong-field rate drops from ~12% to ~1–2% with no model or prompt change — which is why schema redesign is the first move, not more prompt engineering.
 
 ## Verification checklist
 

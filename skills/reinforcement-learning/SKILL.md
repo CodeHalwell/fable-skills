@@ -73,6 +73,21 @@ Diagnostics: watch approx-KL per update (spikes → LR too high or too many epoc
 - RLAIF: replace human labels with an AI judge — inherits every judge bias at scale (verbosity preference, position bias in pairwise comparisons — randomize order, self-preference for its own style). Calibrate the judge against a human-labeled slice before trusting it.
 - Verifiable rewards (unit tests, exact-match answers) change the picture: hacking surface shrinks dramatically, KL constraint can loosen — but format hacks (printing the expected answer without computing it, tests gamed via hardcoding) still occur; sandbox and audit samples.
 
+## Failure modes & pitfalls (implementation level)
+
+- **Time-limit truncation marked as terminal** (`done=True` at `TimeLimit`) — corrupts bootstrapping; with Gymnasium, distinguish `terminated` from `truncated` and bootstrap V(s') when truncated. The single most common serious bug in custom training loops.
+- **Forgetting to stop gradients through the target** in TD losses: `loss = (Q(s,a) - (r + γ * Q_target(s', a').detach()))**2` — omitting `.detach()`/target network makes the loss minimize by moving the target, which "converges" to garbage smoothly.
+- **Computing GAE with stale values or across episode boundaries**: advantages must reset at `done`; a vectorized implementation that carries the recursion across env resets blends unrelated episodes.
+- **Sampling actions without storing the log-prob used at sample time**: PPO ratios must use π_old evaluated *at collection*; recomputing "old" log-probs after the first gradient step makes every ratio 1 and PPO degenerates to vanilla PG with extra steps.
+- **Tanh-squashed Gaussian without the log-prob correction** (SAC-style): `log_prob -= sum(log(1 - tanh(u)^2))`; omitting it biases entropy and breaks temperature tuning.
+- **Observation normalization statistics updating during evaluation** or not checkpointed with the policy — the deployed policy sees differently-scaled inputs than it trained on.
+- **Replay buffer storing post-normalization observations** while the normalizer keeps adapting — old transitions become inconsistent with current normalization.
+- **Q-value overestimation ignored in DQN variants**: max operator + noise → systematic positive bias; symptoms are Q-values climbing far above any achievable return. Double DQN is the cheap fix; if Q ≫ max possible return, it's this.
+- **Epsilon/entropy decayed to zero too fast**: policy commits to the first decent strategy found; learning curves plateau early and identically across seeds. Check the exploration schedule against the time the reward was first found.
+- **Reward normalization leaking across the true objective**: normalizing by running return std changes the effective discounting of rare large rewards; log raw returns for interpretation even if training on normalized ones.
+- **In RLHF: masking bugs where prompt tokens receive policy gradients** or the KL is computed over prompt+response instead of response-only — both silently shift the objective; verify per-token loss masks on a printed example.
+- **Vectorized env auto-reset off-by-one**: most vec-env wrappers return the *new* episode's first observation with the *old* episode's final reward/done; storing `(obs, action, reward, next_obs)` naively pairs the last action with the wrong next state. Use the wrapper's documented `final_observation` field.
+
 ## Evaluation pitfalls
 
 - **Seed variance dominates most claimed improvements.** Run ≥5 seeds (10+ for publication-grade), report mean ± std or IQM with bootstrapped CIs, and compare distributions, not best-seed curves. A method beating another by 15% on 3 seeds is indistinguishable from noise in many benchmarks.

@@ -98,6 +98,29 @@ Both optimizations together give α(n) amortized (effectively constant). Path co
 - **Bitset DP acceleration:** subset-sum reachability in O(n·maxsum/64): `reach |= reach << coin`. This one trick turns 10⁸ operations into 10⁶ — remember it exists.
 - **Bitmask as dict key for subset DP:** `dp[mask]` over 2^n subsets; iterate submasks with `sub = mask; while sub: ...; sub = (sub - 1) & mask` — total O(3^n) over all masks, a fact worth knowing when budgeting.
 
+## Worked micro-examples
+
+**1. Streaming median — two heaps with the safe insertion order.**
+```python
+import heapq
+class StreamingMedian:
+    def __init__(self):
+        self.lo = []                     # max-heap via negation: lower half
+        self.hi = []                     # min-heap: upper half
+    def add(self, x):
+        heapq.heappush(self.lo, -x)      # 1. always enter through lo
+        heapq.heappush(self.hi, -heapq.heappop(self.lo))   # 2. lo's max -> hi (fixes ordering)
+        if len(self.hi) > len(self.lo):                    # 3. rebalance sizes
+            heapq.heappush(self.lo, -heapq.heappop(self.hi))
+    def median(self):
+        if len(self.lo) > len(self.hi):
+            return -self.lo[0]
+        return (-self.lo[0] + self.hi[0]) / 2
+```
+The push-then-transfer sequence makes it impossible for an element to land on the wrong side — the direct "compare x to the median and pick a side" version has three edge cases and most implementations get one wrong.
+
+**2. Selection reasoning end-to-end.** Task: 5×10⁷ lookups against 3×10⁶ known 64-bit ids, build once, read-only, latency-sensitive. Profile: membership only, no inserts after build, no order. Candidates: `set` (fits: ~3×10⁶ × ~100B ≈ 300MB in Python object overhead — heavy), sorted numpy array + `np.searchsorted` (24MB, cache-friendly, ~O(log n) with tiny constant, vectorizable over query batches), bitset (id range too large), Bloom filter (only if 300MB→24MB still too big AND 1% FP acceptable). Choice: sorted numpy array; batch the queries with one vectorized `searchsorted` call and it beats the hash set by an order of magnitude in Python. The generalist answer ("use a set, it's O(1)") loses on memory AND speed — constants and layout decided this, not Big-O.
+
 ## Failure modes & pitfalls (cross-cutting)
 
 - Using `list.insert(0, x)` / `pop(0)` as a queue — O(n) each; that "mysteriously slow BFS" is usually this. Use `deque`.
@@ -106,6 +129,11 @@ Both optimizations together give α(n) amortized (effectively constant). Path co
 - Storing parallel data in 4 dicts keyed the same way instead of one dict → dataclass values; four hash lookups where one suffices, and update-consistency bugs.
 - Ignoring that `heapq` is a *min*-heap: for max behavior negate keys, and negate again on read — sign errors here produce plausible-looking wrong answers, so test with a 3-element example.
 - Benchmarking with wall-clock on n = 100 and extrapolating: rehash spikes, GC, and cache effects don't extrapolate. Measure at target n.
+- Using a `set`/`dict` of tuples for 2-D grid visited state at scale: `visited[r][c]` on a boolean list-of-lists is 3–5× faster and predictable — the tuple hash + allocation per check is pure overhead when coordinates are dense.
+- Deleting from a list while index-iterating it (`for i in range(len(a)): del a[i]`) — skips elements and eventually IndexErrors. Build a new list with a comprehension, or iterate a copy.
+- `collections.Counter` left un-reached-for: `most_common(k)` is the top-k pattern, `Counter(a) & Counter(b)` is multiset intersection. Hand-rolling these invites off-by-ones.
+- Priority queue with mutable priorities updated in place — the heap silently loses its invariant (heapq never re-checks). Correction: lazy deletion with a fresh push, or `dict` + full re-heapify if updates are rare and bulk.
+- Choosing `frozenset` keys when order matters ("path visited so far" where revisit rules depend on sequence) — the collapsed key merges distinct states; the DP/search then returns wrong answers only on inputs where order mattered. Key design = state design.
 
 ## Verification / self-check
 

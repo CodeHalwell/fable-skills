@@ -46,6 +46,13 @@ Diagnostic rule: log per-layer grad norms. Vanishing shows as a monotone decay t
 - Warmup exists because early training has poorly conditioned curvature and Adam's second-moment estimates are noisy; loss spikes in the first ~1k steps → lengthen warmup before touching anything else.
 - Learning-rate decay matters more than LR peak for final loss; "constant LR then sudden drop" and cosine end at similar places — but *evaluating mid-training at high LR underestimates* final quality. Don't compare checkpoints across different points of their decay schedules.
 
+## Mixed precision and numerics (where math meets hardware)
+
+- bf16 has fp32's exponent range but ~3 decimal digits of mantissa; fp16 has more mantissa but overflows at 65504. Consequences: fp16 needs loss scaling (gradients underflow) and overflows on large logits/attention scores; bf16 needs neither but its coarse mantissa makes *accumulation* the danger — always accumulate reductions (softmax denominators, norms, losses) in fp32. Default: bf16 autocast with fp32 master weights.
+- Ops that must stay fp32 even under autocast: softmax/log-softmax, layernorm statistics, loss computation, large sums. PyTorch autocast handles the standard ones; custom kernels/losses must do it manually — a custom contrastive loss accumulating in bf16 gives silently wrong gradients at batch ≥ ~1k.
+- Non-determinism ≠ bug: atomics in backward kernels (e.g., `scatter_add`, some attention backwards) make bitwise-identical reruns impossible on GPU without `torch.use_deterministic_algorithms(True)` (slower). Never chase a 0.1% metric difference between "identical" runs without first checking determinism settings and seed coverage (Python, NumPy, torch, CUDA, dataloader workers).
+- Catastrophic cancellation: computing variance as E[x²]−E[x]² in low precision explodes for large-mean activations; Welford or subtract-mean-first. This exact issue is why naive custom layernorms diverge where `nn.LayerNorm` doesn't.
+
 ## Bias-variance in the overparameterized regime (double descent)
 
 - Classical U-curve holds *below* the interpolation threshold (model can't fit train data). At the threshold, test error peaks — the model contorts to fit every point including noise. *Past* it, among the many interpolating solutions, SGD finds minimum-norm-like ones that get smoother, and test error descends again.
@@ -78,6 +85,29 @@ Rule: these are not interchangeable knobs. Augmentation adds information; the ot
 - **Freezing BatchNorm incorrectly during finetuning**: `requires_grad=False` stops the affine params but running stats still update in train mode. You must also call `.eval()` on BN modules (or `track_running_stats` handling). Symptom: good finetune metrics, degraded performance on the original domain, non-reproducible eval.
 - **Trusting a smooth loss curve while the model is broken**: dead ReLUs (fraction of zero activations per layer > ~50%), collapsed embeddings, or one layer's grad norm at machine epsilon coexist with decreasing loss. Log activation/grad stats.
 - **Gradient accumulation ≠ larger batch under BatchNorm or with per-batch normalization losses** (e.g., contrastive losses computed within-batch): statistics/negatives are computed per microbatch. Equivalence holds only for purely per-sample losses.
+- **Averaging loss wrongly under accumulation/DDP with variable-length batches**: `reduction='mean'` averages per token/sample within each microbatch, so microbatches with fewer valid tokens get overweighted after summing. For masked losses, sum losses and divide by the *global* valid-token count.
+- **Chasing metric ghosts across "identical" runs** without seeding dataloader workers (`worker_init_fn`, `generator=`) and CUDA — augmentation randomness alone produces run-to-run gaps larger than many claimed improvements.
+- **Misreading "train loss < val loss" as overfitting evidence when regularization differs between modes**: dropout and augmentation are active only in training, so train loss is measured on a harder problem; it can legitimately sit *above* val loss, and a small gap says nothing by itself. Compare val metrics over time, not the raw gap.
+- **Interpreting a lower final loss from a larger batch run as "better"** without noting the LR schedule and total tokens/samples seen were held fixed — batch changes step count for the same epochs; compare at equal data seen and tuned LR.
+
+## Worked micro-example: numerical gradient check (the tool, not the idea)
+
+```python
+import torch
+
+def gradcheck_scalar(f, w, i, eps=1e-6):
+    """Check df/dw[i] for scalar loss f(w). Use float64 or eps noise dominates."""
+    w = w.double().requires_grad_(True)
+    loss = f(w); loss.backward()
+    analytic = w.grad.flatten()[i].item()
+    with torch.no_grad():
+        wp = w.detach().clone(); wp.flatten()[i] += eps
+        wm = w.detach().clone(); wm.flatten()[i] -= eps
+        numeric = (f(wp) - f(wm)).item() / (2 * eps)
+    rel_err = abs(analytic - numeric) / max(abs(analytic), abs(numeric), 1e-12)
+    return analytic, numeric, rel_err   # rel_err < 1e-6 in float64 = pass
+```
+Expert usage notes: check in float64 (float32 gives rel_err ~1e-3 even for correct gradients — do not "fix" a correct implementation to chase that); check a handful of random indices, not all; check at a *generic* point (ReLU kinks and max ops make finite differences wrong exactly at non-differentiable points — perturb inputs slightly if rel_err fails only sporadically); for a full module use `torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-4)` with double-precision inputs.
 
 ## Worked micro-example: predicting a vanishing-gradient failure
 

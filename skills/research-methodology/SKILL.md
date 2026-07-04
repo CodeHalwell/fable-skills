@@ -21,6 +21,20 @@ description: Use for conducting rigorous research — formulating answerable que
 - **Correlation-mining vs hypothesis test:** if the analysis chose which variables/comparisons to report after seeing the data, treat conclusions as tentative and demand out-of-sample confirmation. If the hypothesis, primary outcome, and analysis were fixed in advance (ideally pre-registered), the test is confirmatory.
 - **Confirmation-bias guard:** adopt a pre-registration mindset even informally — before looking, write down what you predict, what would change your mind, and how you'll analyze. Seek the strongest disconfirming evidence, not more confirming examples.
 
+## Literature review as a systematic process
+
+- **Build a coverage map, not a pile.** Organize sources by the question they answer and the method they use, so gaps become visible. If every source uses the same method, the literature may be method-bound and the phenomenon under-tested.
+- **Read in a triage order:** title → abstract → figures/tables → methods → full text. Most papers you touch stop at the figures (enough to decide relevance and extract the headline result). Reserve full reads for the few you'll build on or cite substantively.
+- **Track provenance as you go.** For each claim you'll use, record the primary source, the exact result (number, n, interval), and how strong the design is. This prevents citation laundering later and makes the writeup's related-work section fall out for free.
+- **Recency and supersession.** A foundational paper may be canonical but partly superseded; a forward-citation search surfaces the correction or improvement. Always check whether the "known result" still stands.
+
+## Reproducibility and research-debt hygiene
+
+- **Decision log.** Keep a running record of choices (which dataset, which exclusion rule, which parameter and why). Six months on, "why did we drop those samples?" must be answerable. Undocumented decisions are debt that compounds.
+- **Runnable pipeline.** Prefer a script/notebook that regenerates every figure from raw data over hand-edited artifacts. If a reviewer or future-you can't rerun it end to end, the result is fragile.
+- **Version and seed capture.** Record software versions, random seeds, and data snapshots/hashes. "It worked last month" without these is not reproducible.
+- **Lab-notebook discipline** (wet or dry): timestamped, append-only, enough that someone else could continue your work. Retrofitting a notebook after the fact loses exactly the details that mattered.
+
 ## Failure modes and pitfalls
 
 - **Citing the abstract's claim, not the finding.** Abstracts routinely say "X improves Y" when the table shows a nonsignificant trend, a subgroup-only effect, or a different endpoint. Always locate the specific number and its uncertainty.
@@ -35,6 +49,11 @@ description: Use for conducting rigorous research — formulating answerable que
 - **Conflating statistical significance with importance,** and both with truth. Significance depends on n; importance depends on effect size and context; truth depends on design and replication.
 - **Treating "no evidence of effect" as "evidence of no effect."** A null result in an underpowered study establishes nothing. Check the confidence interval — does it exclude effects you'd care about?
 - **Novelty inflation.** Framing an incremental result as a paradigm shift, or missing that the "novel" idea was published years earlier under different terminology. Search synonyms and adjacent fields.
+- **Base-rate neglect in interpreting findings.** In a field where most hypotheses are false, even a well-powered significant result has a substantial chance of being a false positive. The prior plausibility of the hypothesis matters as much as the p-value. Extraordinary claims need extraordinary (and replicated) evidence.
+- **Cherry-picking a favorable subset of the literature.** Citing the three studies that agree with you and ignoring the five that don't. A fair review weighs the full body of evidence, including inconvenient results, and explains discrepancies rather than hiding them.
+- **Conflating a preprint or press release with a peer-reviewed, replicated finding.** Different evidentiary weight. Note the stage of vetting when relying on a source.
+- **Ecological / level-of-analysis fallacy.** Inferring individual-level relationships from group-level (aggregate) correlations, or vice versa. The relationship at one level need not hold at another.
+- **Assuming a method is valid because it's standard.** Widely used ≠ appropriate for your question. Check that the method's assumptions actually hold in your setting.
 
 ## Worked micro-examples
 
@@ -43,6 +62,10 @@ description: Use for conducting rigorous research — formulating answerable que
 **2. Citation chasing in practice.** You need the state of the art on method M. Step 1: find a 2023 review of M's field → extract the 5 foundational primary papers and the current leading methods. Step 2 (backward): read the foundational papers to understand assumptions. Step 3 (forward): in a citation index, list recent papers citing the leading method → find the critique or successor the review predates. Result: you know both the canonical result and what has since challenged it — impossible from keyword search alone.
 
 **3. Detecting HARKing/p-hacking in a paper.** A study reports a significant effect in "women over 50 with high baseline X" — a specific subgroup not mentioned in the aims. No pre-registration. No correction for the many subgroups implicitly tested. Verdict: exploratory at best; treat as a hypothesis to test elsewhere, not a finding.
+
+**4. Weighing conflicting studies.** Study A (n=40, single site, not pre-registered, in a high-prestige venue) finds a large effect; Study B (n=2,000, pre-registered, multi-site, modest venue) finds a null. The naive move is to trust the prestigious A. The disciplined move: B's design is far stronger (power, pre-registration, replication across sites), so weight B and treat A as likely a false positive or overestimate driven by small-sample variance and publication incentives. The open question becomes whether a moderator explains A's context.
+
+**5. Is it answered or open?** "Does vitamin D supplementation prevent respiratory infections?" A search reveals dozens of RCTs and several meta-analyses with heterogeneous results and a small, dose- and baseline-status-dependent effect. Conclusion: not a clean open question and not fully settled — the productive framing is the *moderator* question (in whom, at what dose, at what baseline level), not the blanket yes/no.
 
 ## Verification and self-check
 

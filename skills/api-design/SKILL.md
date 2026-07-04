@@ -7,77 +7,136 @@ description: Load when designing or reviewing any API surface — REST/HTTP endp
 
 ## Core mental model
 
-- **An API is a promise you can't take back.** Every observable behavior — not just the documented one — will be depended on (Hyrum's Law). Design as if removal is impossible, because in practice it is: budget one design hour per expected consumer-year, not per implementation hour.
-- **The best API is the one that can't be misused.** Prefer making invalid states unrepresentable over documenting valid usage. A parameter that must be one of three strings should be an enum; two booleans that can't both be true should be one mode field; a function that must be called after `init()` should not exist — fold init into it or return a handle from init.
-- **Minimal surface area wins by default.** Every public name is a liability with compounding interest. Ship the 3 methods people need, not the 12 they might want. You can always add; you can never remove. When in doubt, leave it out — the cost of adding later is one release; the cost of removing is a deprecation cycle plus broken users.
-- **Naming is the contract.** `get_user()` must not do network retries with 30s timeouts; `delete()` must not soft-delete unless the name says so; a function called `parse` must not also validate business rules. If you can't name it honestly, the design is wrong, not the name.
-- **Design for the reader of the call site, not the implementer.** Judge every signature by what the calling code looks like in a code review with no docs open. `retry(op, RetryPolicy(max_attempts=3, backoff=Exponential(base_ms=100)))` reads; `retry(op, 3, 100, 2.0, True)` doesn't.
+- **An API is a promise you can't take back.** Every observable behavior — not just the documented one — will be depended on (Hyrum's Law). Design as if removal is impossible, because in practice it is. Budget design effort per expected consumer-year, not per implementation hour.
+- **The best API is the one that can't be misused.** Prefer making invalid states unrepresentable over documenting valid usage:
+  - A parameter that must be one of three strings should be an enum type.
+  - Two booleans that can't both be true should be one mode field.
+  - A function that must be called after `init()` should not exist — fold init into it, or have `init()` return the handle that exposes the method.
+  - A pair of arguments that must be the same length should be one list of pairs.
+- **Minimal surface area wins by default.** Every public name is a liability with compounding interest. Ship the 3 methods people need, not the 12 they might want. Adding later costs one release; removing costs a deprecation cycle plus broken users. When in doubt, leave it out.
+- **Naming is the contract.** `get_user()` must not do network retries with 30s timeouts; `delete()` must not soft-delete unless the name says so; a function called `parse` must not also validate business rules or write to disk. If you can't name it honestly, the design is wrong, not the name.
+- **Design for the reader of the call site, not the implementer.** Judge every signature by what calling code looks like in review with no docs open. `retry(op, RetryPolicy(max_attempts=3, backoff=Exponential(base_ms=100)))` reads; `retry(op, 3, 100, 2.0, True)` doesn't.
+- **Consistency beats local optimality.** A slightly worse pattern used everywhere is a better API than the perfect pattern used once — consumers amortize learning across the whole surface. Match the platform's conventions (HTTP semantics, the language's stdlib idioms) before inventing.
 
 ## Decision frameworks
 
 ### REST vs RPC vs GraphQL
 | Situation | Choose | Because |
 |---|---|---|
-| Public API, resource-shaped domain (things with IDs, CRUD-ish lifecycle) | REST | Uniform interface = clients guess correctly; HTTP caching, status codes, and tooling come free |
-| Internal service-to-service, action-shaped domain (`reserveInventory`, `recomputeScore`) | RPC (gRPC/Connect) | Don't contort verbs into fake resources (`POST /inventory-reservations` for a transient action); typed stubs and streaming beat hand-rolled REST clients |
+| Public API, resource-shaped domain (things with IDs, CRUD-ish lifecycle) | REST | Uniform interface means clients guess correctly; HTTP caching, status codes, and tooling come free |
+| Internal service-to-service, action-shaped domain (`reserveInventory`, `recomputeScore`) | RPC (gRPC/Connect) | Don't contort verbs into fake resources; typed stubs, streaming, and codegen beat hand-rolled REST clients |
 | Many heterogeneous frontends with divergent data needs over a shared graph | GraphQL | Solves N over/under-fetch problems once; but you inherit N+1 resolvers, query cost limiting, and cache complexity — don't pick it for one frontend |
-| Long-running operations | Any + operation resource | Return `202` + operation ID immediately; never hold a request open past ~30s |
-| Server→client notification | Webhooks + polling fallback | Always pair: webhooks get dropped; consumers need a `GET` to reconcile |
+| Long-running operations (>~10s) | Any + operation resource | Return `202 Accepted` + operation ID immediately; client polls `GET /operations/{id}`. Never hold a request open past ~30s |
+| Server→client notification | Webhooks + polling fallback | Always pair them: webhooks get dropped, endpoints go down; consumers need a `GET` to reconcile missed events |
+| Bulk operations | Explicit batch endpoint with per-item results | Looping unary calls hits rate limits and N×RTT; batch responses must report per-item success/failure, not all-or-nothing |
 
-Rule of thumb: if you're arguing about whether something "is a resource," it isn't — use RPC semantics (`POST /things/{id}:archive` custom-method style is fine within REST).
+Rule of thumb: if you're arguing about whether something "is a resource," it isn't — use RPC semantics. Custom-method style within REST (`POST /things/{id}:archive`) is a legitimate escape hatch; a fake resource (`POST /thing-archival-requests`) is not clearer.
 
 ### Evolution rules (network APIs)
-- **Additive-only, forever.** Safe: new optional request field, new response field, new endpoint, new enum value *in requests you accept*. Breaking: removing/renaming anything, changing a type, tightening validation, making optional required, changing default behavior, changing error codes clients branch on, reordering/renumbering protobuf fields.
-- **Enum widening is a one-way trap.** Adding a value to an enum you *return* breaks every client with exhaustive matching. Either document "unknown values must be handled" from v1 day one and ship an `UNKNOWN` sentinel, or never widen returned enums. In protobuf, always keep field 0 as `_UNSPECIFIED`.
-- **optional→required is always breaking; required→optional is breaking too** (clients depending on the server rejecting bad input, and on the field being present in responses). Start optional-with-default; you can enforce later only at a major version.
-- **Deprecation mechanics:** mark in schema (`deprecated: true`, `@deprecated`, `[[deprecated]]`), emit telemetry counting callers per consumer, warn in responses (`Deprecation` + `Sunset` headers), set a date ≥ one client release cycle out, then *brownout* (deliberate temporary failures) before removal — silent removal after a doc note strands the long tail every time.
-- **Version in the URL or media type for REST (`/v2/`), package name for protobuf (`myapi.v2`).** Only bump major for actual breaks. A v2 is a migration project for every client — batch years of breaks into one, or better, never need it.
+- **Additive-only, forever.** Safe changes:
+  - New optional request field (with a default that preserves old behavior).
+  - New response field (if clients were told from day one to ignore unknown fields).
+  - New endpoint/method; new enum value in requests you *accept*.
+- **Breaking changes** (regardless of how they're labeled):
+  - Removing or renaming any field, endpoint, or enum value.
+  - Changing a field's type, format, or units; changing default behavior.
+  - Tightening validation; making an optional field required.
+  - Changing error codes or status codes clients branch on.
+  - Reordering/renumbering protobuf fields; reusing a deleted field number.
+- **Enum widening is a one-way trap.** Adding a value to an enum you *return* breaks every client with exhaustive matching. Either document "unknown values must be handled" from v1 day one and ship an `UNKNOWN` sentinel, or never widen returned enums. In protobuf, always reserve field 0 as `_UNSPECIFIED`.
+- **optional→required is always breaking. required→optional is breaking too** — clients depend on the server rejecting bad input, and on the field always being present in responses. Start optional-with-default; enforce later only at a major version.
+- **Deprecation mechanics, in order:**
+  1. Mark in schema (`deprecated: true` in OpenAPI, `[deprecated = true]` in proto, `@deprecated` in GraphQL).
+  2. Add telemetry counting calls per consumer — you cannot remove what you cannot measure.
+  3. Signal in responses: `Deprecation` and `Sunset` headers (REST), warnings in payload metadata.
+  4. Announce a removal date at least one client release cycle out; contact the top consumers directly.
+  5. Brownout before removal: deliberate short failure windows surface the stragglers that ignored every email.
+- **Version placement:** URL path for REST (`/v2/`), package for protobuf (`myapi.v2`). Bump major only for actual breaks. A v2 is a migration project for every client — batch years of breaks into one, or better, design so you never need it.
 
 ### Library API vs network API — different physics
 | Concern | Library | Network |
 |---|---|---|
 | Compat unit | Compile/link: signatures, types, exceptions, *and* behavior | Wire: field names, types, status codes |
 | Errors | Typed exceptions / result types; caller catches specific types | Error payload schema; caller branches on machine-readable `code` string |
-| Versioning | Semver; breaking = major, users pin | You run every version simultaneously; old clients never upgrade |
+| Versioning | Semver; breaking = major; users pin and upgrade deliberately | You run every version simultaneously; old clients never upgrade |
+| Deprecation lever | Compiler warnings at build time | Headers + telemetry + brownouts at run time |
 | Killer mistake | Exposing internal types (accepting a `requests.Session`, returning an ORM model) — now their API is your API | Leaking DB schema as response schema — now you can't refactor storage |
-| Performance contract | Big-O and blocking behavior are part of the API (a `get()` that lazily makes a network call violates the name) | Latency/timeout expectations; document idempotency so clients can retry |
+| Performance contract | Big-O and blocking behavior are part of the API (a `get()` that lazily makes a network call violates its name) | Latency/timeout expectations; documented idempotency so clients can retry |
+| Extra rule | Exceptions thrown are part of the signature — swapping `ValueError` for a custom error is breaking | Field *presence* is part of the contract — `null` vs absent must be defined |
 
 ### Standard REST patterns (don't reinvent)
-- **Pagination:** cursor-based (`?page_token=...&page_size=50` → `{items, next_page_token}`). Offset pagination breaks under concurrent writes (rows shift → skipped/duplicated items) and is O(offset) in most DBs. Make cursors opaque (base64 of `(sort_key, id)`), never raw offsets — clients will forge them. Absent `next_page_token` = last page.
-- **Filtering/sorting:** explicit whitelisted params (`?status=active&order_by=created_at desc`). Reject unknown filter params with 400 — silently ignoring a typo'd filter (`?staus=active`) returns *everything* and the client acts on it (the classic mass-mailing incident shape).
-- **Idempotency keys:** any non-idempotent mutation (`POST /payments`) accepts `Idempotency-Key`. Server stores `key → (request_hash, response)` with TTL ≥ 24h; replay with same key+body returns the stored response; same key+different body returns `409`/`422`. Without this, clients that retry on timeout double-charge — a timeout does *not* mean the operation failed.
-- **Error payload:** one machine-readable stable `code` (SCREAMING_SNAKE string, not just HTTP status — 400 alone can't distinguish "bad email" from "quota exceeded"), human `message` explicitly marked unstable, optional `details` array for field-level errors, and a correlation `request_id`. RFC 9457 (`application/problem+json`) is the standard shape. Never leak stack traces, SQL, or internal hostnames.
+- **Pagination:** cursor-based. `?page_token=...&page_size=50` → `{"items": [...], "next_page_token": "..."}`.
+  - Offset pagination breaks under concurrent writes (rows shift → items skipped or duplicated) and is O(offset) in most databases.
+  - Make cursors opaque (base64 of `(sort_key, id)`), never raw offsets — clients will forge them if they can read them.
+  - Absent/empty `next_page_token` = last page. Enforce a max `page_size` server-side.
+- **Filtering/sorting:** explicit whitelisted params (`?status=active&order_by=created_at desc`). Reject unknown filter params with 400 — silently ignoring a typo'd filter (`?staus=active`) returns *everything*, and the client acts on it (the classic mass-mailing incident shape).
+- **Idempotency keys:** any non-idempotent mutation (`POST /payments`) accepts an `Idempotency-Key` header.
+  - Server stores `key → (request_hash, response)` with TTL ≥ 24h.
+  - Replay with same key + same body: return the stored response, don't re-execute.
+  - Same key + different body: return 409/422 — this is a client bug, never a re-execute.
+  - Without this, clients that retry on timeout double-charge. A timeout does *not* mean the operation failed; it means the client doesn't know.
+- **Error payload:** RFC 9457 (`application/problem+json`) shape or equivalent:
+  - One machine-readable, stable `code` per failure kind (SCREAMING_SNAKE string). HTTP status alone can't distinguish "bad email" from "quota exceeded" — both are 4xx.
+  - Human `message` explicitly documented as unstable (clients that parse it break on wording changes).
+  - Optional `details` array for field-level validation errors; a correlation `request_id` for support.
+  - Never leak stack traces, SQL, or internal hostnames.
+- **Concurrency control:** for mutable resources, return `ETag` and honor `If-Match` on writes — otherwise two clients doing read-modify-write silently clobber each other and you'll retrofit it after a data-loss ticket.
 
 ## Failure modes & pitfalls
 
-- **Boolean parameters metastasize.** `create_user(name, True, False, True)` — nobody can read the call site, and the next flag doubles the config space. Correction: keyword-only args in Python (`def create_user(name, *, verified=False)`), enums for modes, or a config object past ~3 options.
-- **Returning naked collections.** `GET /users → [ ... ]` leaves nowhere to put `next_page_token` or `total_count` later — adding an envelope is a breaking change. Always return an object: `{"users": [...]}`. Same for RPC responses: never return a bare list or scalar.
-- **`PUT` with partial semantics.** Implementing PUT as merge-patch means a client sending the full object can't clear a field. PUT = full replace; partial update = `PATCH`. For PATCH, decide explicitly how "clear this field" is expressed (JSON `null` vs field mask) — JSON merge-patch can't distinguish "absent" from "set to null" in every language's deserializer, which is why protobuf APIs use explicit `update_mask`.
-- **200 with an error in the body.** Breaks every retry policy, monitor, and cache between you and the client. Status codes are part of the contract: 4xx = caller's fault, don't retry unchanged; 5xx = yours, retry with backoff; 429 = include `Retry-After`. Corollary: don't return 500 for validation failures — clients will retry a request that can never succeed.
-- **Tightening validation as a "bugfix."** You start rejecting emails without TLDs; clients who stored such data can now never update those records (fetch → modify one field → save fails on the old email). Validation tightening is breaking. Grandfather existing data or validate only changed fields.
-- **Timestamps and money as local conventions.** Epoch seconds vs millis, naive datetimes, floats for currency. Fix by fiat: RFC 3339 UTC strings for timestamps (`2026-07-04T12:00:00Z`), integer minor units + currency code for money (`{"amount": 1999, "currency": "USD"}`). Floats for money is an instant expert-credibility fail.
-- **IDs that leak and get parsed.** Sequential integer IDs leak volume and invite enumeration; clients *will* parse structured IDs (`user_12` → split on `_`) and break when the format changes. Use prefixed opaque strings (`usr_9f3k2m`), document "opaque, ≤ N chars," and never reuse.
-- **The god endpoint / god function.** `?include=orders,orders.items,profile` or `process(data, mode, options)` — one name whose behavior forks internally on parameters. Each mode has different perf, permissions, and failure modes; you can never change one without auditing all. Split by use case.
-- **Async fire-and-forget defaults in libraries.** A client library whose `send()` buffers internally and can drop data on process exit must make that visible: name it `enqueue()`, provide `flush()`/`close()`, and document delivery semantics. Silent at-most-once behind a name like `send` misleads everyone.
-- **Designing v1 without a v1 client.** Write the client code for your top 3 use cases *before* freezing the schema. If a common task takes 3 calls plus client-side joins, the resource boundaries are wrong. This one exercise catches more design flaws than any review.
-- **GraphQL without cost control.** Shipping a public GraphQL API without depth limits, query cost analysis, and persisted queries hands out a DoS endpoint (`{ users { friends { friends { friends ... }}}}`). Not optional hardening — part of the initial design.
+- **Boolean parameters metastasize.** `create_user(name, True, False, True)` — nobody can read the call site, and each new flag doubles the config space. Correction: keyword-only arguments in Python (`def create_user(name, *, verified=False)`), enums for modes, a config object past ~3 options.
+- **Returning naked collections.** `GET /users → [...]` leaves nowhere to put `next_page_token` or `total_count` later — adding an envelope then is a breaking change. Always return an object: `{"users": [...]}`. Same in RPC: never return a bare list or scalar; wrap in a response message.
+- **`PUT` with partial semantics.** Implementing PUT as merge means a client sending the full object can't clear a field. PUT = full replace; partial update = PATCH. For PATCH, decide explicitly how "clear this field" is expressed — JSON merge-patch can't distinguish "absent" from "set to null" in every language's deserializer, which is why protobuf APIs use an explicit `update_mask`.
+- **200 with an error in the body.** Breaks every retry policy, monitor, and cache between you and the client. Status codes are contract: 4xx = caller's fault, don't retry unchanged; 5xx = yours, retry with backoff; 429 = include `Retry-After`. Corollary: don't return 500 for validation failures — clients will retry a request that can never succeed.
+- **Tightening validation as a "bugfix."** You start rejecting emails without TLDs; clients who stored such data can now never update those records (fetch → modify one unrelated field → save fails on the old email). Validation tightening is breaking. Grandfather existing data, or validate only fields being changed.
+- **Timestamps and money as local conventions.** Epoch seconds vs millis confusion, naive datetimes, floats for currency. Fix by fiat: RFC 3339 UTC strings (`2026-07-04T12:00:00Z`) for timestamps; integer minor units plus currency code (`{"amount": 1999, "currency": "USD"}`) for money. Floats for money is an instant credibility fail.
+- **IDs that leak and get parsed.** Sequential integers leak business volume and invite enumeration attacks; clients *will* parse structured IDs (`user_12` → split on `_`) and break when the format changes. Use prefixed opaque strings (`usr_9f3k2m`), document them as opaque with a max length, never reuse them.
+- **The god endpoint / god function.** `?include=orders,orders.items,profile` or `process(data, mode, options)` — one name whose behavior forks internally on parameters. Each mode has different performance, permissions, and failure semantics; you can never change one without auditing all. Split by use case.
+- **Async fire-and-forget behind a synchronous name.** A client library whose `send()` buffers internally and can drop data on process exit must make that visible: name it `enqueue()`, provide `flush()`/`close()`, document delivery semantics. Silent at-most-once behind a name like `send` misleads everyone downstream.
+- **Exposing your dependency's types in your signatures.** Accepting/returning `pandas.DataFrame`, an ORM model, or a `boto3` client in a public library API welds your major version to theirs and blocks callers who don't use that dependency. Accept protocols/plain data at the boundary; convert internally.
+- **Designing v1 without writing a v1 client.** Write the client code for your top 3 use cases *before* freezing the schema. If a common task takes 3 calls plus client-side joins, the resource boundaries are wrong. This one exercise catches more design flaws than any review checklist.
+- **GraphQL without cost control.** Shipping a public GraphQL endpoint without depth limits, query cost analysis, and (for known clients) persisted queries hands out a DoS endpoint: `{ users { friends { friends { friends {...}}}}}`. This is part of initial design, not later hardening.
+- **Webhooks without signing, ordering, and replay rules.** Consumers need: an HMAC signature header to verify sender, an event `id` for dedup (you *will* deliver duplicates), a timestamp, and a documented statement that ordering is not guaranteed. Omit any of these and every consumer builds a different wrong workaround.
 
-## Worked micro-example: evolving a search endpoint without breaking anyone
+## Worked micro-examples
 
+### 1. Evolving a search endpoint without breaking anyone
 v1 ships: `GET /v1/products?q=term` → `{"products": [...], "next_page_token": "..."}`.
+Requirement: add category filtering and relevance scores; also `q` matching was accidentally case-sensitive and users want it case-insensitive.
 
-Requirement: add category filtering and relevance scores; also, `q` matching was accidentally case-sensitive and users want it case-insensitive.
+1. **Add `?category=` as optional.** Absent = old behavior. Reject `?catagory=` (unknown param) with 400 + `code: "UNKNOWN_PARAMETER"` — you'll be grateful the first time someone typos a filter that would otherwise silently match everything.
+2. **Add `relevance_score` to each product.** New response fields are safe *if* v1 docs said "ignore unknown fields." If they didn't, canary the rollout and watch client error telemetry — some strict deserializer (a client with `DisallowUnknownFields` on) will break, and that's your problem now regardless of fault.
+3. **The case-sensitivity fix is behavior-breaking even though it's "a bug."** Someone depends on the current behavior (Hyrum). Loosening match rules changes result sets under existing queries. Ship behind `?match=insensitive`, announce the default flip with a `Deprecation` header and dated changelog, flip after the window, keep `?match=sensitive` as an escape hatch. Cost: one parameter. Cost of "just fix it": unexplained result-set changes in every dependent system, discovered in production.
+4. **What you don't do:** bump to `/v2` (this is all additive); overload `q` with a mini-language (`q=category:tools term` — an unversionable, unparseable contract); return scores only when a flag is set (forked response shapes double every client's test matrix).
 
-Expert moves:
-1. **Add `?category=` as optional.** Absent = old behavior. Reject `?catagory=` (unknown param) with 400 + `code: "UNKNOWN_PARAMETER"` — you're grateful for this the first time someone typos a filter that would otherwise silently match everything.
-2. **Add `relevance_score` to each product object.** New response fields are safe *if* v1 docs said "clients must ignore unknown fields." If v1 never said that, canary the change and watch client error telemetry before full rollout — some strict deserializer (e.g., a client using `DisallowUnknownFields`) will break, and that's now your problem regardless of fault.
-3. **Case-sensitivity fix is behavior-breaking even though it's "a bug."** Someone depends on it (Hyrum). Loosening match rules changes result sets under existing queries. Ship behind `?match=insensitive`, announce default flip with a `Deprecation` header and a dated changelog entry, flip after a deprecation window, keep `?match=sensitive` as escape hatch. Cost: one extra param. Cost of the "just fix it" route: unexplained result-set changes in every dependent system, discovered in production.
-4. **What you don't do:** bump to `/v2` (this is all additive), overload `q` with a mini-language (`q=category:tools term` — unversionable, unparseable contract), or return scores only when a flag is set (forked response shapes double client test matrix).
+### 2. Library signature review, before/after
+```python
+# Before: misusable
+def export(data, path, fmt="csv", compress=False, overwrite=False,
+           header=True, sep=","):  # sep meaningless unless fmt="csv"
+    ...
+# After: invalid states unrepresentable, call sites readable
+@dataclass(frozen=True)
+class Csv:  sep: str = ","; header: bool = True
+@dataclass(frozen=True)
+class Parquet: pass
+
+def export(data, path: Path, format: Csv | Parquet = Csv(), *,
+           compress: bool = False,
+           if_exists: Literal["error", "overwrite"] = "error") -> ExportReport:
+    ...
+```
+The moves: format-specific options live *on* the format (can't pass `sep` with Parquet); booleans become keyword-only; `overwrite=False` becomes a named policy that can grow (`"append"`) without a new flag; a structured return replaces `None` so success is inspectable. Each move removes a documented rule by making it a type rule.
 
 ## Self-check before presenting an API design
 
 - Write the client code for the 3 most common tasks. Any task needing >2 calls, client-side joins, or a comment to explain a parameter → redesign that part.
 - For each field/param/method, ask "what breaks when I remove this?" — if you can't defend keeping it against that future cost, cut it now.
-- Diff against previous version mechanically: any removed/renamed/retyped field, tightened validation, changed default, changed status code, or widened *response* enum → it's a breaking change no matter how it's labeled. Run a schema-compat linter (e.g., `buf breaking` for protobuf, `oasdiff` for OpenAPI) rather than eyeballing.
-- Simulate the failure paths: client times out mid-`POST` and retries (duplicate created? → need idempotency key), page of results mutates mid-pagination (items skipped? → need cursor), server returns a `code` the client has never seen (crash? → need documented unknown-handling).
+- Diff against the previous version mechanically: any removed/renamed/retyped field, tightened validation, changed default, changed status code, or widened *response* enum is a breaking change no matter how it's labeled. Use a schema-compat linter (`buf breaking` for protobuf, `oasdiff` for OpenAPI) rather than eyeballing.
+- Simulate the failure paths end to end:
+  - Client times out mid-POST and retries → duplicate created? Needs idempotency key.
+  - Data mutates mid-pagination → items skipped/duplicated? Needs cursors.
+  - Server returns a `code` or enum value the client has never seen → client crash? Needs documented unknown-handling.
+  - Two clients read-modify-write the same resource → silent clobber? Needs ETag/If-Match.
 - Check every name against its behavior: side effects, blocking, mutation, and cost must all be implied by the name or signature. One dishonest name fails the review.
+- Confirm error responses carry a stable machine-readable `code`, and that nothing in any payload leaks internals (stack traces, SQL, hostnames, sequential IDs).

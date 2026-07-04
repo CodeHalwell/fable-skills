@@ -21,6 +21,12 @@ description: Use for thermodynamic and kinetic reasoning — spontaneity vs rate
 - **Le Chatelier, quantified:** compute Q after the disturbance and compare to K. Adding inert gas at constant V changes nothing (partial pressures unchanged). Adding inert gas at constant P shifts toward more moles of gas. Raising T: shifts endothermic direction and *changes K itself* (van't Hoff); pressure/concentration changes shift position but leave K fixed.
 - **Cell spontaneity:** E°_cell > 0 ⟺ ΔG° < 0 ⟺ K > 1, via ΔG° = −nFE°. Compute E°_cell = E°_cathode − E°_anode (both as reduction potentials — do NOT flip the sign of the anode's tabulated reduction potential; the subtraction handles it).
 
+## More on kinetics vs thermodynamics
+
+- **Thermodynamic vs kinetic product.** A reaction can yield different major products depending on whether it runs under kinetic control (fast, low-Ea path, low T, irreversible — the *fastest-formed* product dominates) or thermodynamic control (reversible, high T, long time — the *most stable* product dominates). 1,2- vs 1,4-addition to dienes is the classic case. When a question specifies temperature or reversibility, decide which regime governs before naming the product.
+- **Catalysis is purely kinetic.** A catalyst provides a lower-Ea path and accelerates forward and reverse equally, so it reaches the *same* equilibrium faster. It never changes ΔG, K, or equilibrium yield. Anyone claiming a catalyst "shifts equilibrium" or "increases yield at equilibrium" is wrong (it can improve yield only by reaching equilibrium within available time, or by selecting one product kinetically).
+- **Enzyme/transition-state logic.** Rate depends on ΔG‡ (activation free energy), the gap from reactants to the transition state; equilibrium depends on ΔG, the gap between reactants and products. They are independent — a huge driving force can sit behind a huge barrier.
+
 ## Failure modes and pitfalls
 
 - **kJ/J mismatch in ΔG = ΔH − TΔS.** ΔH is usually kJ/mol, ΔS is J/(mol·K). You *must* convert ΔS to kJ or ΔH to J before subtracting. Forgetting this gives answers off by 1000. Always write units on every term.
@@ -35,6 +41,11 @@ description: Use for thermodynamic and kinetic reasoning — spontaneity vs rate
 - **Colligative properties depend on particle count, not identity.** Use the van't Hoff factor i: NaCl gives i ≈ 2, CaCl₂ i ≈ 3 (less at real concentrations due to ion pairing). ΔT_f = i·K_f·m uses *molality*, not molarity.
 - **Entropy of the surroundings forgotten.** The second law is about the *universe*: ΔS_univ = ΔS_sys + ΔS_surr ≥ 0, with ΔS_surr = −ΔH_sys/T. An endothermic reaction can be spontaneous because ΔS_sys is large enough — that's exactly what ΔG < 0 encodes.
 - **Le Chatelier misapplied to inert gas or catalyst.** Neither shifts equilibrium at constant V; a catalyst never changes K.
+- **Ideal-gas assumptions applied to real conditions.** PV = nRT and ΔS of mixing assume ideality; at high P or low T, fugacity/activity corrections matter. Flag when a problem pushes into non-ideal territory rather than reporting spurious precision.
+- **Confusing q_p and q_v with enthalpy.** ΔH = q_p (heat at constant pressure); ΔU = q_v (heat at constant volume). ΔH = ΔU + Δ(PV) ≈ ΔU + Δn_gas·RT for reactions. Bomb calorimetry measures ΔU; converting to ΔH requires the Δn_gas·RT term — dropping it is a common error.
+- **Temperature in K, always.** Every thermodynamic and kinetic formula (ΔG = ΔH − TΔS, Arrhenius, Nernst, van't Hoff, PV = nRT) uses absolute temperature. Plugging °C is a silent, severe error.
+- **Standard-state pressure ambiguity.** Modern convention is 1 bar (older tables use 1 atm); the ~1% difference rarely matters but the *reference* matters for ΔG° consistency. Keep p° explicit in ln(p/p°) so K stays dimensionless.
+- **Entropy sign of dissolving.** Dissolving a solid usually raises S (more disorder), but dissolving a gas *lowers* S (gas → constrained in solution), and highly charged ions can order water (negative hydration entropy). Don't assume "dissolving increases entropy" universally.
 
 ## Worked micro-examples
 
@@ -53,6 +64,12 @@ Rate = k₂[B] = k₁k₂[A]/(k₋₁ + k₂). If k₂ ≪ k₋₁ (pre-equilibr
 **4. Nernst.** Daniell cell Zn|Zn²⁺(0.10 M)||Cu²⁺(1.0 M)|Cu. E° = 0.34 − (−0.76) = 1.10 V, n = 2.
 Q = [Zn²⁺]/[Cu²⁺] = 0.10/1.0 = 0.10.
 E = 1.10 − (0.0592/2) log(0.10) = 1.10 − (0.0296)(−1) = 1.13 V. Lower [Zn²⁺] (less product) raises E — consistent.
+
+**5. ΔG° ↔ K.** A reaction has K = 1×10⁴ at 298 K. ΔG° = −RT ln K = −(8.314)(298) ln(10⁴) = −(8.314)(298)(9.21) = −22,800 J/mol = −22.8 kJ/mol. Rule of thumb check: ΔG° ≈ −5.7 kJ/mol per factor of 10 in K, and 4 decades × −5.7 = −22.8 kJ/mol. Match. Note the answer emerges in J/mol from R in J — divide by 1000 to report kJ.
+
+**6. van't Hoff extrapolation.** An exothermic reaction (ΔH° = −50 kJ/mol) has K = 100 at 298 K. Estimate K at 350 K.
+ln(K₂/100) = −(ΔH°/R)(1/350 − 1/298) = −(−50000/8.314)(0.002857 − 0.003356) = −(−6014)(−4.99×10⁻⁴) = −3.00.
+K₂ = 100·e^(−3.00) = 100·0.0498 = 5.0. K falls with T for an exothermic reaction — Le Chatelier confirms (heating an exothermic reaction shifts it back), and the sign came out right.
 
 ## Verification and self-check
 

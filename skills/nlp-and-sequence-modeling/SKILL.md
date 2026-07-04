@@ -82,6 +82,24 @@ Pitfall: very long beams (>10) on open-ended tasks *degrade* output (generic, re
 - Chunking for labeling long docs with encoders: sliding windows with overlap ≥ max entity length; dedupe entities in the overlap region by offset.
 - Cost sanity: attention prefill grows ~quadratically; a 100k-token prompt per query in a high-QPS service is an architecture smell — cache shared prefixes (system prompt / document) if the stack supports prefix caching, or restructure to retrieval.
 
+## Failure modes & pitfalls
+
+- **Hand-building chat prompts instead of `tokenizer.apply_chat_template(messages, add_generation_prompt=True)`** — a missing `add_generation_prompt` leaves the model completing the user turn instead of answering; symptom: outputs that start by continuing your question.
+- **Comparing logprobs across models with different tokenizers** (e.g., for ensembling or reranking) — per-token logprobs are not on a common scale; sum to sequence level and normalize by bytes, or don't compare.
+- **`max_length` vs `max_new_tokens` confusion** in `generate()`: `max_length` includes the prompt, so long prompts silently truncate generation to near zero. Always use `max_new_tokens`.
+- **Truncating from the wrong end**: default `truncation=True` cuts the tail; for tasks where the answer/instructions sit at the end (chat, QA with question-last), that deletes the question. Set truncation side deliberately; better, fail loudly on overflow.
+- **Padding-side bugs for decoder-only models**: batched generation requires *left* padding (`tokenizer.padding_side = "left"`); right padding puts pad tokens between prompt and generation, garbling outputs for all but the longest sequence in the batch.
+- **Reporting "similarity 0.83" as if it were a probability** — see anisotropy; without an in-domain random-pair baseline the number is uninterpretable.
+- **Few-shot format leakage**: examples separated by a delimiter that also appears inside examples (newlines in multi-line answers) — the model can't tell where examples end; use rare, structured delimiters and keep formatting byte-identical across shots.
+- **Casing/accent mismatch with the tokenizer's training**: an uncased model fed cased text, or NFC vs NFD Unicode normalization differences (especially Vietnamese, Korean, accented European text) fragmenting tokens — normalize (`unicodedata.normalize("NFC", s)`) at ingestion.
+- **Assuming `skip_special_tokens=True` is safe** when the output format uses tokens the tokenizer considers special — structured outputs lose delimiters silently.
+- **Evaluating generation with BLEU/ROUGE where semantics matter**: n-gram overlap punishes valid paraphrases and rewards degenerate copying; for anything abstractive, use model-based/judge eval plus targeted string checks, and report ROUGE only as a secondary legacy number.
+- **Stop-sequence off-by-one**: stopping on `"\n"` for a model whose tokenizer merges `".\n"` into one token means the stop never matches the streamed text; match stops on detokenized text, not token IDs, or use the API's native stop parameter.
+
+## Worked micro-example: diagnosing a "the model can't do X" report
+
+Report: "the model fails at adding 4-digit numbers but its bigger sibling succeeds." Expert diagnosis path: (1) tokenize the failing inputs — `tokenizer.tokenize("3487+2915=")` reveals whether digits are split as `["348","7","+","29","15","="]` (misaligned place values) or per-digit; (2) reformat the prompt to force per-digit tokens: `"3 4 8 7 + 2 9 1 5 ="` and re-test — if accuracy jumps, the deficit is tokenization, not arithmetic capability, and the fix is formatting or tool use, not a bigger model; (3) if unchanged, sweep decoding — greedy vs sampled at T=0.7 (sampling injects digit errors; arithmetic should always be evaluated greedy); (4) only after (1)–(3) conclude anything about the model. The same path applies to spelling, rhyming, and string-reversal complaints. Recommendation hierarchy for production arithmetic: tool call (calculator/code) > digit-formatted prompting > model scaling.
+
 ## Verification / self-check
 
 1. Any string/number/multilingual failure diagnosis: show the actual token split (`tokenizer.tokenize`) supporting it.

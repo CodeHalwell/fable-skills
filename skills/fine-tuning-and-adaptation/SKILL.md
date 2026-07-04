@@ -77,6 +77,26 @@ Priority order: **data quality ≫ LR > epochs > everything else.** Batch size, 
 - System prompt consistency: if training examples have no system prompt but serving does (or a different one), you've created train/serve skew. Bake the serving system prompt into training data, or vary it deliberately across examples to teach robustness.
 - Invisible characters: mixed `\r\n` vs `\n`, non-breaking spaces, or a stray leading space before completions each tokenize differently and the model learns them. Diff a fully-rendered training string against a fully-rendered serving prompt **at the token-ID level** before any run.
 
+## How much data do you actually need?
+
+- Format/style/schema adaptation: 500–2,000 examples is usually enough; beyond ~5k you get diminishing returns unless task diversity is genuinely high.
+- Narrow task distillation (small model imitating a large one): 5k–50k *filtered-correct* teacher outputs; the filter (verify against ground truth, run the code, judge with the teacher) matters more than the count — unfiltered teacher outputs distill the teacher's errors at full fidelity.
+- Broad behavioral change (new language, domain register): 50k+ and you should question whether fine-tuning is the right layer at all.
+- If you have 200 examples: don't SFT yet. Use them as few-shot pool + eval set; collect more from production before tuning. A tune on 200 examples overfits before it generalizes for most tasks.
+- Diversity beats volume at fixed budget: 1,000 examples covering 1,000 distinct input patterns outperform 10,000 examples covering 500 patterns.
+
+## Failure modes & pitfalls
+
+- **Tuning to teach facts.** The model answers training-set questions correctly and hallucinates fluently on everything adjacent, now with more confidence. Correction: facts go in context (RAG); tune only if the *behavior around* the facts is wrong.
+- **Skipping the prompted baseline.** Teams report "tuned model scores 84%" with no number for the best-effort prompted base model — which often scores 82% for free. Correction: the baseline is a mandatory row in every results table, prompted as hard as you'd prompt in production.
+- **Template mismatch between training and serving** (detailed above) — restated because it's the most frequent real-world cause of a tune underperforming its own base model. Token-level diff or it didn't happen.
+- **Evaluating with training-set-like inputs only.** The tuned model looks great on inputs drawn from the same distribution it memorized. Correction: eval set must include out-of-distribution-but-in-scope inputs and paraphrases of training inputs (verbatim-output detection).
+- **DPO on strawman pairs.** Chosen = good answer, rejected = obviously terrible answer → near-zero learning signal where it matters (the margin between decent and great). Correction: rejected responses sampled from your own SFT model's real mistakes.
+- **Training on model-generated data without a correctness filter**, including your own model's outputs (self-training loops amplify the model's existing biases and errors each generation).
+- **"More epochs fixed it" on a small dataset.** It fixed the training metric by memorizing. Correction: if 3 epochs isn't enough, the problem is data quality or task fit, not epochs.
+- **Ignoring the serving stack**: tuning a model your inference provider can't serve with adapters, or merging LoRA weights and discovering quantized serving degrades the merged model differently than the base. Verify the *deployment* path (merge → quantize → serve) end-to-end on the eval set, not just the training-time checkpoint.
+- **One mega-tune for many tasks** when per-task LoRA adapters on a shared base would be independently updatable, testable, and rollback-able. Multi-task tunes entangle regressions across tasks.
+
 ## Worked micro-example: QLoRA SFT that avoids the classic traps
 
 ```python

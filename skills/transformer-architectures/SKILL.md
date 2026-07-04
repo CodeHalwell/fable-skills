@@ -60,6 +60,16 @@ FLOPs:
 - Training: **≈ 6·N·D** FLOPs (N params, D tokens): 2N per token forward, 4N backward. Ignore attention's n² term unless n is huge relative to d.
 - Inference decode: ≈ 2N FLOPs/token, but bandwidth-bound: tokens/sec ceiling ≈ memory_bandwidth / bytes_of(weights + KV cache read per token). A 7B fp16 model on a 1 TB/s GPU: ~1000/14 ≈ 70 tok/s at batch 1 — compute this before promising latency numbers.
 
+## Inference optimization decision tree
+
+Given a latency/throughput complaint, diagnose in this order:
+1. **Batch 1, short context, slow decode** → bandwidth-bound on weights. Fixes: quantize weights (int8/int4 — near-linear decode speedup because decode reads every weight per token), smaller/distilled model, speculative decoding (draft model proposes k tokens, target verifies in one prefill-like pass — wins when draft acceptance is high, i.e., on predictable text; loses on high-entropy generation).
+2. **Large batch or long context, decode degrades as batch grows** → KV-cache bandwidth/capacity bound. Fixes: GQA (if retraining/finetuning is possible), KV quantization, paged attention (fragmentation, not bandwidth — raises max batch), sliding-window attention for tasks tolerating it.
+3. **Long prompts, high time-to-first-token** → prefill compute-bound. Fixes: prefix caching for shared prompt prefixes (system prompts, few-shot blocks — huge in practice), chunked prefill to avoid blocking decode traffic, FlashAttention.
+4. **Throughput fine, tail latency bad** → scheduling: continuous batching (token-level, not request-level) is the fix; request-level batching stalls short requests behind long ones.
+
+Speculative decoding acceptance math: with draft acceptance rate α and k draft tokens, expected tokens per target-model pass ≈ (1 − α^{k+1})/(1 − α). At α=0.8, k=4: ~3.4× fewer target passes. Quote this form, not a fixed "2–3× speedup" — α is task-dependent and collapses on creative generation.
+
 ## MoE routing basics
 
 - MoE replaces the MLP with E experts, routing each token to top-k (usually k=1–2). Params scale with E; per-token FLOPs scale with k. "8×7B" style naming ≈ total params ~8× the dense MLP share but active params ~2 experts' worth.
@@ -84,6 +94,15 @@ FLOPs:
 - Pre-LN's known cost: the residual stream norm grows with depth (nothing constrains it), which can cause late-training instability at very large scale — mitigations include a final norm before the head (standard) and variants that add extra norms (e.g., normalizing q/k, or norm after embedding). If diagnosing loss spikes in a deep pre-LN model, check stream/logit norm growth and q·k magnitudes first.
 - RMSNorm vs LayerNorm: RMSNorm drops mean-centering and bias; cheaper, equally stable in practice; a non-decision — follow the reference implementation.
 
+## Worked micro-example: "will it fit, and how fast?"
+
+Question: serve a 70B-class model (80 layers, d=8192, 64 heads, GQA with 8 KV heads, head_dim 128) on 2×80 GB GPUs, 8k context, target batch 8, int8 weights. Expert reasoning, end to end:
+1. Weights: 70e9 × 1 B (int8) = 70 GB → 35 GB/GPU under tensor parallelism. Fits with room.
+2. KV cache/token: 2 × 80 layers × 8 kv_heads × 128 × 2 B (keep cache fp16) = 0.41 MB/token.
+   At 8k × batch 8: 0.41 MB × 65,536 ≈ 27 GB → ~13.5 GB/GPU. Total ≈ 48.5 GB/GPU + activations + overhead → fits, but batch 16 at 16k would not; state the ceiling.
+3. Decode speed ceiling: per token each GPU reads ~35 GB weights + ~13.5 GB cache ≈ 48.5 GB. At ~2 TB/s HBM: ~41 tok/s *per forward pass*, shared across the whole batch of 8 → each stream sees up to ~41 tok/s only if compute overlaps perfectly; quote ~30–40 tok/s aggregate ceiling and note TP communication overhead reduces it further.
+4. Sanity: had this been MHA (64 KV heads), cache/token would be 3.3 MB → 215 GB for the same batch — infeasible. The GQA config is what makes the deployment possible; say so explicitly.
+
 ## Failure modes & pitfalls
 
 - **Sizing GPU memory by weights alone.** Inference memory = weights + KV cache (dominant at long context / large batch) + activations. Training memory = weights + grads + optimizer states (Adam fp32: ~16 bytes/param mixed-precision, so 7B ≈ 112 GB before activations) — not 2 bytes/param.
@@ -97,6 +116,9 @@ FLOPs:
 - **Treating encoder-decoders' cross-attention KV as recomputed per step.** It's computed once from the encoder output and reused — different from self-attn cache; serving math differs.
 - **MoE capacity-factor blindness:** with fixed expert capacity, overflow tokens get dropped or bypass the expert; under load imbalance this silently degrades quality. Check router load stats, not just loss.
 - **Diagnosing divergence in a post-LN model as a data problem.** Check LN placement, warmup length, and init scale first; post-LN + short warmup + depth > 24 diverges on clean data too.
+- **Ignoring the attention-sink / first-token effect when windowing.** Naive sliding-window eviction that drops the earliest tokens degrades generation sharply; attention concentrates on initial tokens as a de facto bias term. Any cache-eviction scheme must keep the first few tokens.
+- **Sizing speculative decoding by draft model quality alone.** The win is acceptance rate × verification cost; a "better" 1B draft that's 3× slower than a 0.5B draft can lose. Compute expected tokens/pass (formula above) with measured α before choosing.
+- **Assuming tensor parallelism halves latency.** TP splits matmuls but adds two all-reduces per layer; at small batch the collectives dominate and 2-way TP can be barely faster than 1 GPU with a quantized model. TP is a memory-capacity tool first, a latency tool second.
 
 ## Verification / self-check
 

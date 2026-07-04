@@ -29,6 +29,18 @@ description: Load when designing an algorithm from scratch — competitive-progr
 | Equal-probability sampling from a stream, hashing adversarial input, "with high probability" | Randomization | See below |
 | Constraints ≤ 20 items, "subsets", "orderings" | Bitmask enumeration / bitmask DP | 2^n fits the budget |
 
+Additional high-frequency triggers:
+
+| Signal | Technique | Why |
+|---|---|---|
+| Many range-sum queries, no updates | Prefix sums | `sum(l, r) = P[r] - P[l]` with half-open convention |
+| Many range *updates*, one final read | Difference array | Add v on [l, r): `d[l] += v; d[r] -= v`; prefix-sum once at the end |
+| 2-D region sums | 2-D prefix sums | Inclusion-exclusion: `P[r2][c2] - P[r1][c2] - P[r2][c1] + P[r1][c1]` — the sign pattern is where bugs live |
+| "Count subarrays with sum k" (negatives allowed) | Prefix sum + hash map of counts | Window fails on negatives; `count += seen[P[i] - k]` |
+| n ≈ 40, subsets, "exact/target" | Meet in the middle | Split into halves: 2·2²⁰ enumerations + sort/hash join beats 2⁴⁰ |
+| "At most k" AND "at least k" variants | Solve "at most", subtract: exactly(k) = atMost(k) − atMost(k−1) | Direct "exactly" is usually much harder |
+| Cyclic array problems | Concatenate (conceptually) a+a, or handle wraparound case separately | E.g., max circular subarray = max(normal Kadane, total − min subarray) |
+
 **Divide-and-conquer recognition signals:** (1) the problem on the whole array decomposes into left half + right half + *interactions across the midpoint*, and the interaction can be handled in O(n) — inversions, closest pair, maximum subarray; (2) the recursion depth is log n and work per level is linear; (3) merge sort is already computing your answer as a side effect (inversions = swaps merge sort would do). If the "combine" step needs the full sub-solutions rather than a summary, D&C won't beat brute force.
 
 **Reduction checklist (run it every time):**
@@ -67,7 +79,21 @@ A greedy without a proof sketch is a bug generator — greedy is the technique w
   - Test mentally on n = 0, n = 1, and n = 2 *before* running. Most boundary bugs are visible at n = 1.
   - When a loop processes "pairs of adjacent elements", the loop bound is `n - 1` items — say out loud which index is the *left* of the pair.
 - **Integer overflow in mid/products.** In Python irrelevant, but in C++/Java: `mid = lo + (hi - lo) / 2`, and cast before multiplying (`(long long)a * b`). If writing Python as a spec for another language, flag these.
+- **Binary search on reals with an epsilon exit.** `while hi - lo > 1e-9` can loop forever (float granularity near large values) or exit too early. Correction: iterate a fixed count — 100 halvings shrink any initial interval below any meaningful epsilon; `for _ in range(100)` is unconditionally safe and simpler to reason about.
+- **Amortized analysis missed → wrong complexity claim.** A loop containing a while-loop is not automatically O(n²): if the inner loop consumes a resource each element produces at most once (stack pops, pointer advances), total work is O(n). Conversely, don't claim O(n) for a two-pointer where a pointer can move *backward* — re-check the "only forward" property.
+- **Modular arithmetic slips.** Take the modulus after every add/multiply, not once at the end (other languages overflow; Python bigints get slow). Subtraction: `(a - b) % MOD` is already non-negative in Python but negative in C++/Java — add MOD before taking `%` when speccing for those. Division needs the modular inverse (`pow(b, MOD-2, MOD)` for prime MOD), never `//`.
+- **Floating-point equality in geometry/greedy comparisons.** Sorting by an angle or ratio and comparing with `==` misgroups equal keys. Compare cross-products/cross-multiplied fractions in integers whenever inputs are integral (`a1*b2 vs a2*b1`), reserving floats for output only.
 - **Optimizing before classifying.** Micro-optimizing an O(n²) that the budget says must be O(n log n) wastes the whole session. Re-derive the budget from constraints first; if current complexity exceeds it, the *approach* is wrong, not the constants.
+
+## When stuck: the unstick sequence
+
+Run these in order; each takes under a minute.
+1. Re-read the constraints; recompute the budget. A budget of n log n with no sort in sight means binary search on the answer or a heap/window.
+2. Sort the input (by each plausible key) and stare — order reveals greedy and two-pointer structure.
+3. Ask "what is the last decision?" (unlocks DP) and "what is the state graph?" (unlocks BFS/Dijkstra).
+4. Solve the problem with one constraint deleted, then reintroduce it — the delta names the technique.
+5. Solve n = 1, 2, 3 by hand and diff the answers — patterns in the deltas suggest recurrences or closed forms.
+6. Invert: instead of building the answer, count/remove the complement ("min removals to satisfy P" = n − "max kept satisfying P" — the kept version is often a classic).
 
 ## Worked micro-examples
 

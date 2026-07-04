@@ -21,6 +21,13 @@ description: Use for designing experiments that yield decisions — defining the
 - **When to stop:** either fix n in advance and analyze once, or use a proper sequential design (group-sequential with alpha-spending, or always-valid/e-value methods) that controls error under repeated looks. Never eyeball a dashboard and stop when it hits significance.
 - **Confounder vs collider decision:** include a variable as a control only if it's a common cause of treatment and outcome (back-door path to block). Exclude it if it's a mediator (on the causal path — controlling it removes the very effect you want) or a collider (common effect of two variables — controlling it opens a spurious path).
 
+## Control and randomization detail
+
+- **The counterfactual question.** A control answers "what would these same units have done without treatment?" Choose the control that isolates the one thing you're testing: a placebo controls for expectation effects; a sham controls for the procedure; an active comparator controls for "is it better than current practice." A no-treatment control that differs in attention, procedure, or timing confounds the treatment with those differences.
+- **Randomization vs adjustment.** Randomization balances *all* confounders — including ones you never measured or thought of — in expectation. Statistical adjustment only fixes confounders you measured and modeled correctly. Prefer randomization; use adjustment (and blocking) to reduce residual variance, not as a substitute.
+- **Blocking/stratification** groups similar units and randomizes within groups, guaranteeing balance on strong prognostic variables and shrinking variance. Block on the few variables most predictive of the outcome (site, device, baseline level); don't over-block into tiny cells.
+- **Paired/within-subject designs** remove between-unit variance entirely and can slash the required n, but only when carryover and order effects are absent or counterbalanced.
+
 ## Failure modes and pitfalls
 
 - **Peeking / optional stopping.** Repeatedly testing significance as data accrues and stopping at the first p < 0.05 inflates the false-positive rate dramatically (toward ~25–40% with frequent looks instead of 5%). Fix: pre-set n, or use group-sequential boundaries / always-valid inference. Continuous dashboards are peeking machines — gate the decision, not the chart.
@@ -35,6 +42,13 @@ description: Use for designing experiments that yield decisions — defining the
 - **Ignoring variance/replication.** Reporting a single run or ignoring the confidence interval. ML results especially need multiple seeds; the seed-to-seed spread often dwarfs the claimed improvement.
 - **Baseline drift / non-comparable periods.** Comparing treatment this week to control last week conflates the treatment with time (holidays, releases). Randomize concurrently.
 - **Survivorship / attrition bias.** Analyzing only units that completed (didn't churn, didn't drop out) breaks randomization if attrition is outcome-related. Use intention-to-treat.
+- **Regression to the mean mistaken for an effect.** Selecting units because they were extreme (worst-performing stores, sickest patients) and then observing improvement — much of which is just regression to the mean, not the intervention. A concurrent randomized control catches this; a pre-post comparison on a selected group does not.
+- **Pseudoreplication.** Treating correlated measurements (repeated measures on the same subject, multiple cells from one animal) as independent, inflating the effective n and shrinking p-values spuriously. The independent unit is the unit of randomization; use mixed models or aggregate to that level.
+- **Ceiling/floor effects.** If the metric is near its maximum (or minimum) at baseline, a real treatment effect can't register. Check the metric has headroom before designing.
+- **Non-inferiority vs superiority confusion.** "No significant difference" does not prove equivalence. A non-inferiority claim requires a pre-specified margin and adequate power to rule out a meaningful decrement — it is a different design, not a failed superiority test.
+- **Uncontrolled multiple looks across variants (A/B/n).** Running many variants at once multiplies false positives just like multiple metrics. Correct across variants, or use a design (e.g., multi-armed bandit with proper inference) built for it.
+- **Confusing the null with the alternative you care about.** Failing to reject H₀ at your n says the data are consistent with no effect *and* with small effects your study couldn't detect. Report the CI so readers see what's excluded.
+- **Optimizing a proxy metric that diverges from the true goal (Goodhart).** A/B-winning on clicks can lose on retention or revenue. Pick a metric that is causally upstream of the real objective, and monitor guardrail metrics for degradation.
 
 ## Worked micro-examples
 
@@ -45,6 +59,10 @@ description: Use for designing experiments that yield decisions — defining the
 **3. Peeking cost.** With a fixed-n test, false-positive rate is 5%. Checking significance after every 10% of data (10 looks) and stopping at first hit pushes the actual false-positive rate above ~20%. Fix by pre-committing n or using O'Brien-Fleming boundaries so the early looks require much smaller p-values.
 
 **4. Matched-compute ablation.** Claim: "component C adds +2 BLEU." Proper test: train with and without C at identical data, steps, and a *separately tuned* learning rate for each config, across 3 seeds. If the +2 lies within the ±1.5 seed spread, it's noise. Report mean ± std, not the best run.
+
+**5. Simpson's paradox.** A hospital reports 30-day mortality of 3% for surgery vs 2% for medical management — surgery looks worse. But stratifying by severity: among severe cases surgery is 10% vs medical 15%; among mild cases surgery is 1% vs medical 1.5%. Surgery is better in *both* strata; the pooled number reverses only because sicker patients were preferentially sent to surgery (confounding by severity). Trust the within-stratum (adjusted) estimate.
+
+**6. Interference in a marketplace.** Testing a feature that boosts a seller's ranking, randomized by user. Treated users buy more from boosted sellers — but that inventory/attention is finite, so *control* users see fewer of those sellers and buy less. The user-level contrast overstates the true effect because control was contaminated. Fix: randomize by market/geo or use switchback (time-based) randomization so treatment and control don't share the same supply pool.
 
 ## Verification and self-check
 

@@ -51,6 +51,21 @@ description: Load when designing, reviewing, or debugging evaluations of LLM sys
 - Nondeterminism: even at temperature 0, LLM outputs vary across runs (batching, hardware). For close comparisons, run each system 3–5 times per item and use the per-item mean; report variance across runs so readers can see the noise floor.
 - Multiple comparisons: if you slice results 10 ways, expect one slice to look "significantly" different by chance. Flag exploratory slices as hypotheses, confirm on fresh data.
 
+## Metric choice details
+
+- Prefer metrics with a decision attached: "answer contains the correct entity" (actionable) over BLEU/ROUGE (uninterpretable for most modern LLM tasks — n-gram overlap punishes valid paraphrase and rewards parroting; use them only for tightly-templated outputs, if at all).
+- For classification-shaped tasks, report precision/recall per class, not accuracy — LLM classifiers are often wildly asymmetric (high recall, low precision on the "interesting" class) and the asymmetry is what determines product impact.
+- For retrieval-augmented systems, evaluate retrieval and generation *separately* before end-to-end: recall@k of the retriever against labeled relevant docs, then generation quality given gold context. An end-to-end-only eval can't tell you which component to fix, and generation-given-gold-context is the ceiling that tells you whether retrieval is the bottleneck.
+- Latency and cost are eval metrics, not afterthoughts: report tokens in/out and p95 latency next to quality. A 1-point quality win at 3x cost is usually a loss; making this visible in the same table changes decisions.
+- Calibrate any threshold on dev data, report on held-out. Choosing the judge-score cutoff that maximizes held-out agreement is itself overfitting.
+
+## Eval infrastructure that pays for itself
+
+- Log every eval run as structured records: `{run_id, system_config_hash, eval_set_version, item_id, output, scores, judge_version, timestamp}`. Per-item records are what enable paired statistics, discordant-item review, and longitudinal diffs; aggregate-only logging destroys all three.
+- Make single-item replay trivial: `run_eval --item 42 --config prod.yaml` reproducing one failure exactly (same prompt, same context, same params) is the difference between a 5-minute and a 2-hour debugging loop.
+- Cache model outputs keyed on (model, params, prompt) — reruns for statistics or new judge versions become free, and you can re-score old outputs with a new rubric without re-generating.
+- Keep a "reading queue": every eval run samples 10 random transcripts and 10 failures into a doc a human actually opens. Metrics drift away from reality without this ritual; the discipline of reading transcripts weekly is worth more than another automated metric.
+
 ## Regression testing prompts
 
 - Treat prompts like code: every prompt change runs the eval suite in CI before merge. Store prompt + model version + eval score together.
@@ -58,6 +73,14 @@ description: Load when designing, reviewing, or debugging evaluations of LLM sys
 - Assert on **behaviors, not exact strings**: "output parses as JSON," "contains no URLs not present in context," "refuses this category of request," "mentions the required disclaimer." Exact-string assertions break on harmless rephrasing and train people to ignore red CI.
 - Every production incident becomes a permanent eval case (same discipline as adding a regression test for a bug).
 - When migrating model versions, run the full suite on both and diff **per-item**, not aggregate — an equal aggregate score can hide 10% of items flipping right→wrong and another 10% flipping wrong→right, which is a large behavioral change users will feel.
+
+## Online evaluation: the offline eval is not the end
+
+- Offline eval passing is necessary, never sufficient — production inputs will be weirder than your eval set. Instrument production: sample 1–5% of live traffic, run the calibrated judge on it asynchronously, dashboard the score by day and by slice. This catches regressions your eval set doesn't cover (new input types, upstream prompt-assembly bugs, provider-side model updates).
+- Cheap high-signal production metrics that need no judge: parse-failure rate, refusal rate, output length distribution, latency, and user behavioral signals (retry rate, copy rate, thumbs, edit distance between draft and what the user actually kept). A jump in user retries is often the first detectable symptom of a quality regression.
+- Implicit signals beat explicit feedback in volume and honesty: thumbs-up/down response rates run ~1% and skew extreme; "did the user accept/edit/abandon the output" covers every interaction.
+- Route online failures back offline: the sampled-and-judged production failures are precisely the items to add to next quarter's eval set. This loop — production failure → eval case → fixed → regression-guarded — is the whole game; teams that don't close it re-fix the same failures forever.
+- A/B tests are the ground truth for "better": when an offline eval says +5 points and you can afford an experiment, run it, and record the (offline delta, online delta) pair — over time this history tells you how much to trust the offline eval (see ml-production-systems on offline-online correlation).
 
 ## Failure modes & pitfalls
 
@@ -85,6 +108,18 @@ print(p)  # ≈ 0.24 — not significant
 ```
 
 Only 18 items distinguish the prompts, and 6 vs 12 splits are common under pure chance (p ≈ 0.24). Rule-of-thumb check agrees: at n=100 the noise floor is ~±10 points and the gap is 6. Correct action: don't conclude B is better yet — expand the eval set (targeting the discordant item types, which show you *where* the prompts differ), rerun, and require the gap to survive. Also read all 18 discordant items by hand: at this scale, reading beats statistics for deciding what to fix next.
+
+## Worked micro-example: calibrating an LLM judge
+
+You want a judge for "answer is fully supported by the provided context" on a RAG system.
+
+1. Sample 150 production (question, context, answer) triples. Two humans label each `supported` / `unsupported` / `partial` independently. Human–human agreement: they agree on 132/150 (88%). This is your ceiling — no judge can be validated beyond it, and the 18 disagreements define the genuinely ambiguous region.
+2. Write the judge prompt: context + answer, instruction to list each factual claim in the answer and mark it supported/unsupported by the context, then output `VERDICT: SUPPORTED` only if all claims pass. Temperature 0, pinned model version, third-family model (not the generator).
+3. Run judge on the 132 human-consensus items. Judge agrees on 121/132 (92% of consensus items — above the 88% human-human rate, acceptable).
+4. Inspect the 11 disagreements: 7 are the judge marking "supported" for claims that require multi-hop inference from context (judge too lenient on inference), 4 are the judge penalizing correct paraphrase. Add two rubric lines addressing exactly these; re-run; 127/132.
+5. Freeze: judge prompt + model version + the 150-item calibration set become a versioned artifact. Every future judge change reruns step 3 automatically; agreement below 90% blocks the change.
+
+Now — and only now — the judge's production numbers mean something, and you can state their error bars: a reported 85% support rate carries roughly ±4% judge error on top of sampling error.
 
 ## Verification checklist before presenting eval results
 

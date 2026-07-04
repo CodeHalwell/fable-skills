@@ -21,6 +21,12 @@ description: Use for medicinal chemistry and pharmacology reasoning — target v
 - **ADMET triage priorities:** if oral, check solubility and permeability (BCS class) and metabolic stability (microsomal/hepatocyte clearance) early; check hERG (cardiac), CYP inhibition (DDI), and reactive-metabolite alerts before committing a series.
 - **Rule-of-5 as a soft prior, not law:** MW ≤ 500, logP ≤ 5, HBD ≤ 5, HBA ≤ 10 predict oral absorption liability, but many oral drugs violate one; beyond-Ro5 chemistry (macrocycles, PROTACs) is real. Use it to flag risk, not to reject.
 
+## SAR reasoning in detail
+
+- **What a matched pair probes:** each single change interrogates a specific hypothesis about the binding site. A **methyl** tests a small hydrophobic pocket or a conformational lock (rotation restriction). A **halogen** (F, Cl) tests a small lipophilic/electronic pocket; **fluorine** also blocks metabolism at that position and tunes pKa without adding much size. A **ring nitrogen swap** (benzene → pyridine) tests an H-bond acceptor need and lowers logP/improves solubility. **Removing an H-bond donor/acceptor** tests whether a specific polar contact is real (big loss = real contact; no change = solvent-exposed).
+- **Interpret potency *cliffs*.** A tiny change causing a large potency swing ("activity cliff") signals a specific, geometry-sensitive interaction — high-value information about the pharmacophore. Flat SAR (nothing you do changes potency) is a warning of a nonspecific mechanism (aggregation, denaturation), not a robust scaffold.
+- **Bioisosteres** replace a group with one of similar properties but better ADMET (e.g., carboxylic acid → tetrazole/acylsulfonamide to keep acidity while changing permeability/metabolism; amide → oxadiazole to block hydrolysis). Use them to fix a liability while preserving the key interaction.
+
 ## Failure modes and pitfalls
 
 - **Treating IC50 as an intrinsic constant.** IC50 for a competitive inhibitor shifts with substrate concentration: Ki = IC50/(1 + [S]/Km). Two labs reporting different IC50s for the same compound may fully agree on Ki. Always ask what [S]/Km the IC50 was measured at.
@@ -34,6 +40,17 @@ description: Use for medicinal chemistry and pharmacology reasoning — target v
 - **Selectivity measured against too few off-targets.** "Selective" needs a counter-screen panel (related kinases/receptors, hERG, CYPs, safety panel). Selectivity vs one paralog is weak evidence.
 - **Species differences.** Rodent PK/metabolism/potency need not translate to human; CYP isoform differences and target sequence differences bite in translation.
 - **Static thinking about exposure.** Efficacy needs free drug above the target Ki for the relevant fraction of the dosing interval (PK/PD), not just a low in-vitro IC50. A potent, rapidly cleared compound fails in vivo.
+- **Misreading a steep or shallow Hill slope.** A dose-response Hill slope near 1 is expected for simple 1:1 binding. A very steep slope (≫1) suggests cooperativity or, more often in screening, an artifact (aggregation, precipitation). A shallow slope may indicate multiple binding sites or nonspecific effects. Don't just extract IC50; read the slope.
+- **Ki vs Kd conflation.** Kd is the equilibrium dissociation constant for a binding interaction (thermodynamic affinity). Ki is the inhibition constant from a functional/competition assay. For a simple competitive inhibitor they coincide, but for allosteric or slow-off-rate compounds they diverge — and residence time (koff) can matter more for in-vivo efficacy than equilibrium affinity.
+- **Ignoring the therapeutic index.** Potency at the target is meaningless without the margin to toxicity. TI = toxic dose / effective dose. A modestly potent compound with a wide window beats a super-potent one with a narrow window.
+- **Confusing efflux/permeability with intrinsic potency.** A cellular EC50 far worse than the biochemical IC50 usually means a permeability or efflux problem (e.g., P-gp substrate), not weak target engagement. The fix is chemistry on physicochemical properties, not more potency.
+- **Over-relying on a single docking/virtual-screen score.** Docking scores are weakly correlated with real affinity and cannot rank close analogs reliably. Treat in-silico hits as hypotheses to test, expecting most to fail on assay interference, aggregation, or poor properties.
+
+## Pharmacokinetics essentials
+
+- **The core relationships:** CL (clearance, volume cleared per time), Vd (apparent volume of distribution), t₁/₂ = 0.693·Vd/CL, and at steady state Css = (F·Dose/τ)/CL. Exposure (AUC) = F·Dose/CL. These four let you reason about dosing without a simulator.
+- **Bioavailability F** = fraction of oral dose reaching systemic circulation intact = F_absorption × (1 − gut extraction) × (1 − hepatic extraction). A high hepatic extraction ratio caps oral F regardless of perfect absorption.
+- **Clearance mechanism sets DDI/variability risk:** renal clearance is generally cleaner; hepatic CYP-mediated clearance brings drug-drug interactions and pharmacogenomic variability (CYP2D6, CYP3A4). Know which route dominates.
 
 ## Worked micro-examples
 
@@ -44,6 +61,10 @@ description: Use for medicinal chemistry and pharmacology reasoning — target v
 **3. Half-life reasoning.** Two compounds both have t₁/₂ = 12 h. Compound X: CL low, Vd normal → clearance-limited, expect dose-proportional exposure, manageable. Compound Y: CL high, Vd very large → long t₁/₂ from deep tissue distribution; high total dose needed, potential tissue accumulation/tox. Same t₁/₂, different development risk.
 
 **4. Magic methyl SAR.** Adding an ortho-methyl to a biaryl raises potency 20× and improves metabolic stability. Interpretation: the methyl enforces a twisted, bioactive conformation (restricting rotation to the bound geometry) and blocks a metabolic soft spot — a classic conformational + metabolic double win, not just added bulk.
+
+**5. Bioavailability arithmetic.** A drug is 90% absorbed from the gut but has a hepatic extraction ratio of 0.7. Oral F ≈ F_abs × (1 − E_H) = 0.90 × 0.30 = 0.27. Even near-complete absorption yields only 27% bioavailability because first-pass hepatic metabolism removes 70% on the way through. Improving absorption further is futile; the fix is reducing hepatic extraction (metabolic stability).
+
+**6. Aggregation triage.** A screening hit shows IC50 = 5 µM, Hill slope 3.5, flat SAR across 8 analogs, and activity that vanishes when 0.01% Triton X-100 is added to the assay. Verdict: colloidal aggregator, not a real inhibitor. Do not start a medchem campaign; the detergent-sensitivity and steep slope are decisive.
 
 ## Verification and self-check
 

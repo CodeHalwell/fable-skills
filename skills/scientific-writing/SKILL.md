@@ -21,6 +21,20 @@ description: Use for writing papers and technical reports — structuring by inf
 - **Related work without strawmanning:** describe prior work as its authors would recognize it, then state the specific limitation your work addresses. "Prior methods ignore X" is usually false and invites a hostile review; "prior methods address X under assumption A; we relax A" is defensible and precise.
 - **Claim calibration ladder:** reserve "prove/demonstrate" for direct, controlled evidence; use "show/find" for solid empirical results; "suggest/indicate" for correlational or limited evidence; "may/could" for speculation. Match the verb to the strength of the design.
 
+## Structuring the argument
+
+- **The introduction is a funnel with a promise.** Broad importance → the specific gap → what you do → (often) a one-sentence result preview. By the end of the intro the reader must know exactly what problem you solve and what you found. Don't make them wait for the discussion.
+- **Each section answers one question.** Intro: why care and what's the gap? Methods: what did you do (reproducibly)? Results: what happened (facts, minimal interpretation)? Discussion: what does it mean, what are the limits, what's next? Keep interpretation out of results and raw results out of discussion.
+- **Results present, discussion interprets.** A frequent structural error is editorializing in results ("impressively, the method excels") or re-listing numbers in discussion. Results = observations; discussion = meaning, mechanism, limitations.
+- **Topic sentences carry the skim.** A reader should get the argument from the first sentence of each paragraph alone. Write topic sentences that state conclusions, not topics ("Method C outperforms baselines on noisy data" not "We now discuss noise").
+
+## Figures done right
+
+- **One message per figure.** Each figure makes a single point; if it makes three, split it. The caption's first sentence is that point.
+- **Encode honestly.** Bar charts start the y-axis at zero; line charts may not need to but must not exaggerate; use position/length (most perceptually accurate) over area/angle/color intensity for quantitative comparisons. Avoid dual y-axes (they manufacture apparent correlation).
+- **Accessibility and clarity.** Perceptually uniform, colorblind-safe palettes; redundant encoding (shape + color) so the figure survives grayscale; direct labels over legends where possible; large enough fonts to read at print size.
+- **Show the data and its uncertainty.** Prefer showing distributions (points, box/violin) over bare means; always include error bars/intervals and define them and n in the caption.
+
 ## Failure modes and pitfalls
 
 - **Burying the contribution.** The novel result appears on page 7 in the discussion. Move it to the abstract and introduction; state it explicitly ("Our contribution is…"). Readers should never have to reverse-engineer what's new.

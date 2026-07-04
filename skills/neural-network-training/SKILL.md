@@ -84,6 +84,14 @@ description: Load when writing or debugging neural network training runs — los
 - Changing `num_workers`, batch size, or GPU count changes the data order and RNG consumption — bitwise reproduction requires those pinned too.
 - Save checkpoints atomically (write temp file, then rename) — a preempted job that dies mid-`torch.save` corrupts the only checkpoint otherwise.
 
+## Throughput and the "is it even training efficiently" check
+
+- Compute a rough expected throughput before long runs: for transformers, model FLOPs per token ≈ 6 × N_params (fwd+bwd); divide hardware peak FLOPs × an achievable utilization (0.3–0.5 for well-tuned training) by that to get tokens/sec. If you're at 5% utilization, you have a pipeline problem worth fixing before burning GPU-weeks.
+- GPU near 100% in `nvidia-smi` does not mean efficient — it counts any kernel activity. Profile one: if step time is dominated by data loading (GPU idle gaps between steps in the profiler timeline), raise `num_workers`, enable `pin_memory=True`, move CPU-heavy augmentation to GPU or pre-compute it.
+- The classic throughput bug: an accidental CPU–GPU sync every step (`loss.item()`, `.cpu()`, or printing a tensor inside the step) serializing the pipeline. Log scalars every N steps, not every step, or accumulate on-device.
+- Gradient accumulation is a memory trick, not free: k accumulation steps ≈ k× wall-clock per optimizer step. If a bigger effective batch isn't demonstrably helping (measure!), don't pay for it.
+- `torch.compile` / fused optimizers / flash attention are large real wins on transformer workloads — but adopt them *after* the pipeline is verified correct at baseline; a miscompiled or fused path is one more suspect during debugging.
+
 ## Worked micro-example: the one-batch overfit harness
 
 ```python
@@ -103,6 +111,25 @@ for step in range(500):
 ```
 
 Interpretation: loss should hit < 0.01 within a few hundred steps. Stuck at ~2.3 with grad_norm ≈ 0 → gradients not flowing (detach/frozen params). Stuck at ~2.3 with healthy grad_norm → LR/scheduler or label bug. Plateaus at, say, 0.7 → part of the batch is unlearnable (duplicate inputs with conflicting labels — check for exactly that) or loss masking is including padding. Passes cleanly → the core pipeline is sound; scale up.
+
+## Worked micro-example: LR range test
+
+```python
+import copy, math
+probe = copy.deepcopy(model)          # never run the sweep on your real weights
+opt = torch.optim.AdamW(probe.parameters(), lr=1e-7)
+lrs, losses, gamma = [], [], (1e-1 / 1e-7) ** (1 / 300)   # 1e-7 -> 1e-1 over 300 steps
+it = iter(train_loader)
+for step in range(300):
+    x, y = next(it)
+    loss = F.cross_entropy(probe(x.cuda()), y.cuda())
+    opt.zero_grad(); loss.backward(); opt.step()
+    lrs.append(opt.param_groups[0]["lr"]); losses.append(loss.item())
+    for g in opt.param_groups: g["lr"] *= gamma
+    if not math.isfinite(losses[-1]) or losses[-1] > 4 * min(losses): break
+```
+
+Reading the plot (loss vs log-LR): flat region at tiny LR (too small to move), a descending slope, a minimum, then explosion. Suppose loss starts descending at 3e-5, bottoms near 1e-3, explodes past 3e-3. Pick peak LR ≈ 2e-4–5e-4 (steep-descent region, 1/3–1/10 of explosion) — not 1e-3, because the minimum of this curve sits at the edge of instability and the smoothed single-batch losses understate variance over a full run. Add warmup to that peak and cosine decay to ~1/10 of it. Total cost: ~2 minutes of GPU time to replace days of guess-and-check.
 
 ## Verification checklist before blaming the model or reporting results
 

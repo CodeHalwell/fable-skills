@@ -89,6 +89,18 @@ Before trusting offline metrics to drive decisions:
 - Common causes of decorrelation: offline eval set from a different distribution than current traffic (stale, or filtered differently), label leakage inflating offline numbers, offline metric mismatch (AUC vs. top-k behavior actually shown to users), feedback-loop-biased eval data.
 - Never conclude from an online-flat result that offline gains are "noise" without checking power: small canaries are underpowered for small effects; compute the minimum detectable effect before deciding.
 
+## Failure modes & pitfalls
+
+- **Silent default-imputation.** A feature service times out, the client fills 0/mean, the model keeps predicting — degraded, uncomplaining. Correction: count and alert on imputation rate per feature; a step-change in "fraction of predictions using ≥1 fallback value" is a paging alert. Distinguish "feature legitimately 0" from "feature missing" in the encoding.
+- **Retraining on post-decision data without noticing.** The training query innocently joins to a table that already reflects the model's decisions (e.g., "transactions" excludes blocked ones). Correction: audit every training-set join against the feedback-loop map; document which slices are exploration/holdback and therefore unbiased.
+- **Eval set frozen in 2-years-ago traffic.** The model "improves" on a distribution that no longer exists. Correction: refresh eval data on a schedule; keep the old set too so you can distinguish "model got worse" from "world got harder."
+- **Schema drift from upstream teams.** A producer renames a field or changes units (cents→dollars); your pipeline coerces and continues. Correction: schema contracts with explicit versioning on every consumed feed; alert on unseen enum values and unit-scale shifts (a 100x mean shift in one feature is upstream units, not user behavior).
+- **Timezone/date-boundary bugs in features.** "Purchases today" computed in UTC at training and local time at serving; features spanning a daylight-saving transition. Shows up as a mild, periodic accuracy dip nobody attributes correctly. Correction: all feature timestamps in UTC end-to-end, tested across a DST boundary.
+- **Canary judged on the metric the model optimizes rather than guardrails.** A recommender canary "wins" on clicks while quietly tanking diversity/returns. Correction: pre-register guardrail metrics with thresholds before the rollout starts.
+- **Warm-start/cold-start asymmetry in the comparison.** The incumbent has weeks of cache warmth, per-user state, or downstream systems tuned to its score distribution; the challenger's scores hit calibrated thresholds set for the incumbent. Correction: recalibrate thresholds per model version (or calibrate scores to a common scale) before comparing; give shadow mode time to warm caches.
+- **Treating the feature store as optional plumbing.** Ad-hoc per-model feature pipelines multiply skew surfaces and make every new model a fresh chance to reimplement `days_since_signup` wrong. Correction: shared, tested, point-in-time-correct feature definitions are the investment that compounds.
+- **No ownership of the model in production.** Trained by one team, served by another, monitored by neither. Every production model needs a named owner, a runbook (top 5 failure modes + responses), and a deprecation plan.
+
 ## Worked micro-example: diagnosing "offline 0.91 AUC, online performs like 0.78"
 
 Expert debugging order (fastest elimination first):

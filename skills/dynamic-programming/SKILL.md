@@ -63,6 +63,15 @@ for w, v in items:                       # unbounded: capacity ASCENDING
 - **Memoizing on unhashable or over-rich keys.** Caching on a list argument crashes; caching on an index-pair *plus* an accumulator that's derivable from the indices wastes cache space and can hide the true state space size (turning O(n²) states into O(n²·V)). The accumulator being in the key when it shouldn't be = your state was wrong.
 - **Assuming optimal substructure that isn't there.** Longest simple path, "max sum with no two chosen elements sharing any prime factor" — subproblem solutions constrain each other globally. Test: can two different optimal sub-solutions be freely swapped without violating feasibility? If not, DP over that decomposition is unsound.
 
+## Transition-cost optimization triggers
+
+When states are right but the budget still fails, the fix is usually in the transition, not the state:
+- Transition is `min/max over a sliding range of j` → **monotonic deque** drops O(n·k) to O(n) (e.g., "jump at most k steps back").
+- Transition is `min over j < i of dp[j] + cost(j, i)` where cost is prefix-sum-decomposable → precompute prefix aggregates; many O(n²) DPs collapse to O(n) this way before any exotic trick is needed.
+- LIS-shaped transitions ("best over all previous states with key < mine") → replace the scan with a Fenwick/segment tree keyed by the coordinate, or the patience-sorting `bisect` idiom: O(n²) → O(n log n).
+- Bitmask subset-sum transitions (`for sub in submasks(mask)`) → remember the total cost over all masks is O(3^n) via `sub = (sub-1) & mask`, not O(4^n) — budget with the right number before rejecting the approach.
+- If the transition needs "best of all previous rows in a column range AND all previous columns in a row range", maintain running row/column bests alongside the table — auxiliary running aggregates are the most common expert micro-move in grid DPs.
+
 ## Top-down vs bottom-up calibration
 
 - Top-down wins when: state space is sparse (only reachable states computed — digit DP, game DP where most positions never occur), transitions are complex, you're still exploring the design, or dependency order is nontrivial.
