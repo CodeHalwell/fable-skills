@@ -95,6 +95,14 @@ Scenario: "Our Llama-3.1-70B chat service on 4×H100 (TP=4) feels sluggish; user
 
 *Plan, cheapest first:* (1) set `max_model_len` to the real product limit (say 16k) and cap concurrent sequences to what KV math supports; (2) confirm prefix caching is on — multi-turn chat re-prefills the whole history every turn without it, and that's likely half the prefill load; (3) FP8 weights + FP8 KV to double both bandwidth headroom and KV capacity; (4) re-measure the SLO triple; (5) only if TTFT p99 still fails at target load, split traffic or disaggregate prefill. Expected: steps 1–3 fix it; most "slow inference" incidents are memory-pressure-induced scheduling pathology, not slow math. That's the prior: **check KV pressure and preemption before anything with "kernel," "compile," or "speculative" in the name.**
 
+**Priors — the diagnosis order an expert defaults to** (most likely and cheapest to check first):
+1. Preemption/recompute warnings and KV pressure in engine logs — the top cause of tail-latency incidents.
+2. Prefix-cache hit rate near zero (variable content at prompt head) — the top cause of "TTFT got worse after a prompt change."
+3. Config left at defaults that don't match the product: `max_model_len`, memory utilization, scheduler batch limits.
+4. Benchmark methodology (no warm-up, identical prompts, server-side TTFT, batch-1 throughput claims) — the top cause of numbers that contradict each other.
+5. Wrong regime for the optimization (INT4 at high batch, spec decode at high batch, deep TP past fitting).
+6. Only then: kernels, attention backends, engine swaps, disaggregation — the interesting stuff is rarely the broken stuff.
+
 ## Failure modes & pitfalls
 
 - **Quoting batch-1 tokens/sec as "throughput."** Batch-1 measures the bandwidth roofline; production throughput is 10–100× higher via batching. Conversely, quoting max-batch aggregate throughput while hiding 300ms ITL. Always report the triple at a stated request rate and context-length distribution.
