@@ -61,51 +61,11 @@ Avoid re-implementing the function under test as the property — that just test
 
 ## Worked micro-examples
 
-**1. Loop invariant derivation — max subarray (Kadane).**
-Invariant to maintain at top of iteration i: `best = max subarray sum within a[0:i]`, `cur = max subarray sum within a[0:i] that ends exactly at a[i-1]` (0 for i=0... careful: use −∞/first-element init for all-negative arrays).
-```python
-def max_subarray(a: list[int]) -> int:
-    assert a, "precondition: non-empty"
-    best = cur = a[0]              # invariant established for i=1
-    for x in a[1:]:                # step: extend-or-restart
-        cur = max(x, cur + x)      # best sum ending at x
-        best = max(best, cur)      # best over prefix
-    return best                    # inv ∧ loop done ⇒ best = answer
-```
-The invariant *dictated* the two-variable design and exposed the classic bug (initializing `best = 0` returns 0 for `[-3, -1]`; the invariant "max subarray sum" is −1, so 0-init violates it at the base case).
+The two that carry non-obvious discipline (a strong model reproduces the mechanics cold; the *practice* is the point):
 
-**2. Interleaving enumeration — why "obviously fine" isn't.**
-```python
-# Two threads run: counter += 1   (counter starts at 0)
-# Compiles to: (L)oad, (A)dd, (S)tore per thread.
-```
-Interleavings of L₁A₁S₁ / L₂A₂S₂ preserving program order: 20 total. Enumerate outcomes: any interleaving where both loads happen before either store yields 1 (e.g., L₁L₂A₁A₂S₁S₂). Result: final value 1 in the majority of interleavings, 2 only when one thread's LAS completes before the other's L. A "one-line, obviously atomic" increment is wrong in most schedules. Moral: for any shared-state claim, decompose to atomic steps and enumerate — at 2 threads × 3 steps it's 20 cases, tractable by hand; that tractability is the small-scope hypothesis paying off.
+**1. Property test needs TWO properties to pin a spec.** For `merge_intervals`, a single structural property ("output sorted & disjoint") passes a merge that silently *drops* intervals; a single coverage property ("same points covered") passes one that returns an overlapping mess. You need both — one structural invariant plus one oracle/coverage check — or the test ratifies a broken implementation. The common failure is writing one plausible property and calling it tested. Bound the domain small (e.g. integers −50..50) so an exhaustive coverage oracle is feasible; that is the small-scope hypothesis paying rent.
 
-**3. Property-based test with a real oracle (Hypothesis).**
-```python
-from hypothesis import given, strategies as st
-
-def merge_intervals(iv):  # code under test
-    out = []
-    for lo, hi in sorted(iv):
-        if out and lo <= out[-1][1]:
-            out[-1] = (out[-1][0], max(out[-1][1], hi))
-        else:
-            out.append((lo, hi))
-    return out
-
-@given(st.lists(st.tuples(st.integers(-50, 50), st.integers(-50, 50))
-                  .map(lambda t: (min(t), max(t))), max_size=8))
-def test_merge(iv):
-    out = merge_intervals(iv)
-    covered = lambda x, ivs: any(lo <= x <= hi for lo, hi in ivs)
-    # Property 1: same coverage (oracle over small integer domain)
-    for x in range(-51, 52):
-        assert covered(x, iv) == covered(x, out)
-    # Property 2: output is disjoint and sorted (structural invariant)
-    assert all(out[i][1] < out[i+1][0] for i in range(len(out) - 1))
-```
-Small bounded domain (−50..50) makes an exhaustive coverage oracle feasible — deliberately small scope. Property 2 alone would pass a broken merge that drops intervals; Property 1 alone would pass one that returns overlapping mess. Together they pin the spec.
+**2. "Obviously atomic" is wrong in the majority of schedules.** `counter += 1` on two threads (L/A/S each): of the 20 program-order-preserving interleavings, only 2 give the correct final value 2 — 18/20 lose an update. The lesson is not the count (derivable) but the reflex: *decompose any shared-state operation into atomic steps and enumerate before asserting "clearly fine."* At 2 threads × 3 steps it is hand-tractable; that tractability is why small-scope enumeration beats stress-running.
 
 ## Verification / self-check
 
