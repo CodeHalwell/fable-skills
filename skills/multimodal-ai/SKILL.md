@@ -5,43 +5,41 @@ description: Engineering with vision, audio, document, and video models — imag
 
 # Multimodal AI Engineering
 
-Assumed baseline (verified expert-grade cold): Anthropic image tokens ≈ w×h/750 with ~1.15 MP/1568px downscale caps (1000×1000 ≈ 1,334 tokens); the VLM capability map (good: charts, UI, clean OCR, legible handwriting; unreliable: counting >~10, exact coordinates, sub-~15–20px glyphs, negation/absence, non-Latin/degraded OCR) and route-to-code fixes (detector counts, grounding models for geometry, crop for small text — no prompt fixes a resolution floor); nullable-fields-with-explicit-null schemas against fabrication; arithmetic cross-field consistency as the free hallucination detector on numeric documents; router + text-path/VLM-path invoice architecture rejecting both VLM-on-everything and template OCR; voice budgets (500–800ms voice-to-voice; streaming STT ~150–300ms, LLM TTFT ~200–400ms, TTS TTFB ~100–200ms), chained-vs-S2S tradeoffs, barge-in/endpointing as the hard product problem; spec-sheet WER uselessness (errors concentrate on names/IDs/jargon; phrase-biasing and timestamps matter first); video = cheap-locate-then-dense-read with absence reframed as positive detection; two-pass locate-then-read cropping as the top accuracy-per-dollar move; golden sets labeled at field level, normalization before scoring, slicing by input condition.
+Assumed baseline (verified expert-grade cold): the VLM capability map (good at chart/UI/clean-OCR/handwriting; fails at counting >~8, precise coordinates, small text, dense tables, negation, non-Latin OCR) and routing geometry-to-code/semantics-to-VLM; image tokens ≈ w×h/750 (1000² ≈ 1334) and downscale-before-tokenize; resolution-as-budget with the two-pass locate-then-read pattern; nullable schemas as fabrication control; arithmetic-consistency as the cheap numeric hallucination detector; routed digital-text-vs-VLM invoice pipeline; ~500–800ms voice tolerance with streaming component budgets and barge-in/endpointing as the hard problem; WER concentrating on proper nouns/IDs with keyword-boost/timestamps mattering more than 1% deltas; frame-sampling + audio-transcript economics for video; golden-set + normalization + per-slice/per-field eval; document-parsing tiers (deterministic text layer → OCR → layout parsers → frontier VLM).
 
-## Landscape facts worth pinning (as of mid-2026; re-verify limits/prices in-session before quoting)
+## Discipline rules
 
-- **Document pipeline tiers**: (a) parsing pipelines emitting structured Markdown/JSON — **Docling, MinerU, LlamaParse, Mistral OCR** — for high-volume ingestion; (b) OCR-purpose-built compact VLMs — **olmOCR, Surya** — self-hostable, cheap per page; (c) frontier VLM on the rendered page — highest fidelity, most expensive. Default hybrid: parse everything cheaply, route pages failing heuristics (garbled-text ratio, empty extraction, table density) to the VLM — most corpora are 90% easy pages.
-- **Provider-native PDF input** (e.g. Anthropic's) does render+text-layer for you but **bills tokens for both the page image and its extracted text** — right for in-conversation document analysis, wrong for bulk ingestion.
-- **Image generation routes per request-type**: GPT Image 2 (instruction-heavy generation/editing, layout reasoning), FLUX.2 family (photorealism + open weights/LoRA ecosystem), Imagen 4 (natural photographic looks), **Ideogram/Seedream when legible in-image text is the requirement** — text rendering is still the sharpest differentiator; test your actual text cases before committing.
-- Chained voice stacks remain the production default (AssemblyAI/Deepgram/ElevenLabs sell parts and assembled pipelines); S2S (OpenAI Realtime, Gemini Live, Hume EVI) wins on latency/prosody but loses text-domain guardrails/logging and tool-use maturity.
+- Do the token/cost arithmetic before the architecture: pages × tokens-per-page at your DPI. A 50-page PDF at high DPI is easily 100k+ tokens; naive 1 fps video is ~4.7M tokens/hour/question.
+- Route work to the model's strengths and let *code* do the rest: detect-then-count, crop-then-read, overlay-grid-then-locate, and verify any extraction by rendering the evidence (draw the box / play the span) — a pipeline that can't produce that evidence view can't be audited.
+- Numeric documents: code checks `qty×unit_price ≈ line_total` and `Σ ≈ total` — the model never checks its own math; a fabricated field almost never balances.
+- Re-run the golden set on every model/prompt/**DPI/JPEG-quality** change — multimodal pipelines are exquisitely sensitive to preprocessing config; treat it as versioned code under eval, not environment.
+
+## The hard-floor fact and the numbers to pin
+
+- **Glyph size is a hard floor, not a soft one**: below ~**10 px cap-height as the model sees it** (after provider downscale), reading collapses and *no prompt recovers it* — the information is gone at the tokenizer input. Target ~16–20 px. Compute glyph height after downscale (original px × resized/original), and remember a 300-DPI A4 scan (~8.7 MP) gets shrunk ~3× against the ~1.15 MP / ~1568-px-edge cap before tokenization. This converts "the model misreads small text" from a prompting problem into a tiling/DPI problem.
+- **Verify every provider constant against current docs this session** — the /750 divisor, the ~1.15 MP cap, max edges, per-tile pricing, and audio model names have churned repeatedly through 2024–2026. Never recite a stale ceiling into a design or a customer quote.
 
 ## Sharpenings the strong baseline lacks
 
-- **Schema mechanics that measurably move extraction accuracy**: order fields to mirror the document's reading order; split mega-schemas — two ~30-field passes on crops beat one 60-field pass (tail-field accuracy degrades) and usually cost less than the retries.
-- **Streaming and batch STT are different products with different models and accuracy** — never validate on batch and ship streaming. Slice STT evals by accent and SNR on ~50 real clips; never let a voice agent take an irreversible action off a single unconfirmed transcription (read back critical alphanumerics).
-- **Audio carries most of a video's semantic load at ~100× less cost per minute** — transcribe first, sample frames second; use shot/scene detection over uniform fps.
-- **Blocking steps in voice need a spoken filler** ("let me check that…") — silence past ~1s reads as broken; retrofitting barge-in into a half-duplex design is a rewrite, so build kill-able TTS playback and history reconciliation ("how much did the user actually hear?") from day one.
-- **Preprocessing is versioned code under eval**: a default DPI bump or new JPEG quality setting silently shifts accuracy — re-run the golden set on every preprocessing change, not just model/prompt changes. Send PNG for screenshots/documents; JPEG smears 1px UI text, and your own aggressive pre-resize destroys what the provider resize would have kept.
-- **Track fallback and human-queue rates as first-class metrics** — a pipeline whose accuracy "improved" by routing 30% of traffic to humans moved cost, not quality. Separately track hallucinated-when-absent (false positives on truly-null fields) — the dangerous error class that aggregate accuracy hides.
-- Capability-map maintenance: the failure rows improve every model generation — re-verify "unreliable" rows against the current frontier before designing around a limitation, but never *assume* one was fixed.
-
-## Worked anchor: budget before architecture
-
-```
-Invoice page @150 DPI → 1275×1650 px → ~2,800 tokens/page (w×h/750)
-40k docs × 1.4 pages × 2.8k ≈ 157M image tokens/month → dominant cost line;
-routing the ~70% digital-PDF share to the text path cuts it ~70% before any model tuning.
-```
-
-Stopping rule: done when failing slices are identified and routed (fallback or human) and residual error is priced in — past that, effort goes to preprocessing and routing, not bigger models.
+- **Schema ordering and splitting**: order fields to mirror the document's reading order (extraction quality measurably improves when the model fills fields in encounter order); split mega-schemas — one pass for header fields, one per table/region. A 60-field single pass degrades tail-field accuracy; two 30-field passes on crops usually cost less than the retries.
+- **Grounding is verify-by-rendering, not trust-the-citation**: where the stack supports boxes/citations, draw the box and confirm the value is inside it; where it doesn't, require a verbatim source snippet per field and string-match it against the OCR/text layer — a snippet absent from the source is an automatable hallucination flag.
+- **Provider-native PDF input pays tokens for both the rendered image and the extracted text of each page** — a solid default for *analysis of a document in a conversation*, wrong for bulk ingestion. For mixed corpora, parse everything cheaply and route only pages failing heuristics (garbled-text ratio, empty extraction, table density, low OCR confidence) to the VLM path — most corpora are 90% easy pages.
+- **Chained voice stack is still the production default in 2026** (swappable best-in-class parts, a text checkpoint for guardrails/logging, mature tool use); native speech-to-speech wins on latency/prosody but is harder to guardrail (no mid-pipeline text checkpoint unless you add one) and has less mature tool-calling. Barge-in requires always-on VAD, instantly-killable TTS, and state reconciliation ("how much did the user actually hear before cutting me off?") — deciding what the LLM's history says it said. Semantic endpointing (done vs pausing) is the current quality frontier; a fixed silence timeout either interrupts thinkers or feels laggy.
+- **Send PNG for screenshots/documents**: JPEG-compressing a screenshot smears 1px UI text; aggressive pre-upload downscale (to "save bandwidth") pre-destroys what the provider resize would have kept. Do your own resize only after verifying target legibility.
+- **STT streaming vs batch are different products/models** — don't validate on batch and ship streaming; slice WER by accent and SNR on 50 real clips with ground truth (beats any leaderboard).
+- **Track fallback/human-queue rate as a first-class metric**: a pipeline whose accuracy "improved" by routing 30% to humans didn't improve, it moved cost. Normalize (currency/number/date/text) before scoring or exact-match understates real quality; label at the *field* level ("83% of documents perfect" hides "the total is wrong 15% of the time").
+- **Image-gen market is multi-model by request-type** (mid-2026): GPT-image / Gemini-Imagen-class for legible in-image text and prompt adherence, FLUX family for open-weight/self-host/fine-tune, Midjourney for aesthetics, Firefly for rights-cleared enterprise, Ideogram for typography. Text rendering is the sharpest differentiator — test your actual text cases before committing. Route per request rather than picking one winner.
 
 ## Verification / self-check
 
-1. Extraction claims spot-checked by rendering the evidence (draw the cited box / play the cited span); a pipeline that can't produce that view can't be audited.
-2. Numeric outputs re-checked by code (`qty × unit_price ≈ line_total`, totals foot) — the model never checks its own math.
-3. Glyph height computed *post-downscale* before diagnosing OCR failures; crops verified to stay under the resize caps.
-4. Provider limits/prices/token formulas verified against current docs this session — they have churned repeatedly through 2024–2026.
+1. Extraction claims spot-checked by rendering the cited region/box or playing the cited span.
+2. Numeric/cross-field consistency checks rerun by hand on a sample — arithmetic balance is the strongest cheap signal.
+3. Provider limits/prices/token formulas verified against current docs this session before quoting.
+4. Golden set sliced by input condition (digital/scan/photo, accent, SNR, chart type); fallback/human-queue rate reported alongside accuracy.
+
+Stopping rule: done when failing slices are identified and routed to fallback/humans and residual error is priced into the product — not when the aggregate metric stops improving. Past that, effort goes to preprocessing and routing, not bigger models.
 
 ## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
-- Probed 14 claims: 11 baseline (cut/compressed), 3 partial (sharpened), 0 delta.
-- Biggest baseline gaps found: 2026 tool-tier specifics (MinerU/olmOCR/Surya/Mistral OCR; GPT Image 2/FLUX.2/Imagen 4/Seedream naming) and provider-native PDF's image+text double token cost; core engineering judgment (token math, crop-first, arithmetic verification, voice budgets, absence-reframing) was produced cold.
-- Retained value: pinned landscape facts, schema-ordering/split mechanics, streaming-vs-batch STT trap, audio-first video economics, fallback-rate accounting.
+- Probed 14 claims: 12 baseline (cut/compressed), 2 partial (sharpened), 0 hard delta (baseline independently flagged the token constants as worth re-verifying, matching the skill's own caution).
+- Biggest baseline gaps found: none factually wrong — Opus produced the capability map, /750 formula, glyph-floor, arithmetic-check detector, and voice budgets cold; it was vaguer on schema ordering/splitting and grounding-by-rendering.
+- Retained value: the hard-floor glyph number as an actionable threshold, verify-provider-constants discipline (constants drift), schema-ordering/splitting mechanics, and the current-generation image-gen routing map.
