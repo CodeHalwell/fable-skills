@@ -159,6 +159,25 @@ changed. Report gaps against the spec only — no style preferences, no
 
 The last sentence is load-bearing: a gap-hunting reviewer always finds something, and unfiltered findings drive the over-engineering spiral.
 
+**A workflow skill — the compounding version of a pasted procedure (Claude Code format, verified as of 2026):**
+
+```markdown
+# .claude/skills/fix-issue/SKILL.md
+---
+name: fix-issue
+description: Fix a GitHub issue end-to-end
+disable-model-invocation: true
+---
+Fix GitHub issue $ARGUMENTS.
+
+1. `gh issue view $ARGUMENTS` — read the issue and acceptance criteria.
+2. Write a failing test that reproduces the reported behavior first.
+3. Implement the fix; run the test plus `npm run lint` and typecheck.
+4. Show the test output, commit referencing the issue, open a PR with `gh`.
+```
+
+Invoked as `/fix-issue 1234`. `disable-model-invocation: true` keeps a side-effectful workflow manual-trigger-only. Note the embedded discipline: failing-test-first and show-the-output are baked into the procedure, so every future run — including by teammates and CI agents — inherits the verification habits instead of relying on someone remembering to prompt for them.
+
 **CLAUDE.md that earns its context (bridging AGENTS.md for other tools):**
 
 ```markdown

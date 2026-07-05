@@ -108,6 +108,16 @@ Scenario: a support-automation product spends $38k/month; the CFO wants it halve
 - **Explicit cache storage rent outliving its usefulness (Gemini).** An explicit CachedContent with a long TTL bills storage per token-hour whether or not anyone reads it. A 500k-token cache at ~$4.50/MTok/hr is ~$54/day of pure rent — forgotten test caches and over-long TTLs are recurring silent spend. Set TTLs from measured reuse windows and delete caches when jobs finish.
 - **Provider-limit surprises breaking the caching plan.** Anthropic allows max 4 `cache_control` breakpoints and looks back only ~20 content blocks for a prior cache entry — an agent turn that adds 30 tool_use/tool_result blocks silently misses the previous turn's cache. Place an intermediate breakpoint inside long turns.
 
+## Monitoring & unit economics
+
+Instrument from day one; retrofitting attribution after the first scary invoice means debugging blind.
+
+- **Tag every request** with: feature, prompt version, model actually served, task ID, user/tenant ID, and the four usage fields (input, output, cache write, cache read). This is one logging middleware; everything below derives from it.
+- **The unit metrics that matter:** $/task (sum over the task's requests — the number that maps to product margin), $/user/month and its p95 (a free tier is only viable if you know the tail), $/feature/day (the runaway-feature detector), cache-hit ratio per feature (`cache_read / (cache_read + input + cache_write)` — target depends on workload; multi-turn agents should sit >80%), and turns-per-task for agents.
+- **Anomaly alerts, in order of value:** (1) tokens-per-task p95 jumping >50% vs trailing 7-day — catches prompt regressions and loop pathologies the day they ship, not at month-end; (2) feature spend per hour vs trailing average — catches fleets of runaways; (3) effective billed $/MTok vs your date-stamped price table — catches provider price changes, intro-price expiries, and quiet fallbacks to a pricier model; (4) cache-hit ratio dropping — catches the innocent prompt edit that inserted a dynamic byte into the prefix.
+- **Two fuse layers:** the per-task hard budget (kill-switch sketch below) stops a single runaway loop in seconds; the feature-level spend-rate alert catches what individual budgets can't — many tasks each just under their cap. Both are cheap; neither substitutes for the other.
+- **Close the loop monthly:** recompute the design-time cost model against actual token logs. >20% drift means either the model was wrong (fix the model) or the product changed shape (re-run the optimization ladder against the new distribution).
+
 ## Worked micro-examples (prices as of mid-2026 — re-verify before reusing)
 
 **1. Caching a 20k-token system prompt — Claude Opus 4.8 ($5/MTok in, $25/MTok out), 10,000 requests/day, continuous traffic.** Each request: 20k stable prefix + 1k dynamic input + 500 output.
