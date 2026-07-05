@@ -3,144 +3,73 @@ name: concurrency-and-parallelism
 description: Load when writing or reviewing concurrent/parallel/async code — threads, locks, atomics, async/await, channels/actors, thread pools — or diagnosing races, deadlocks, and event-loop stalls. Also load for questions about Python's GIL, memory models, pool sizing, or choosing between shared memory and message passing.
 ---
 
-# Concurrency and Parallelism
+# Concurrency and Parallelism — correction sheet
 
-## Core mental model
+Baseline model knowledge already covers the textbook layer well (data race vs. race condition, GIL mechanics, Goetz pool sizing, double-checked locking, fork+threads, lock-free caveats, Little's law). This sheet keeps only the review rules and operational specifics that don't surface unprompted.
 
-- **Data race ≠ race condition; you must fix both, and fixing one doesn't fix the other.**
-  - A *data race* is two threads accessing the same memory unsynchronized with at least one write — undefined behavior in C/C++ (and Go, and unsafe Rust); torn or stale values elsewhere.
-  - A *race condition* is a correctness bug from operation *ordering*, and it survives full synchronization: `if key not in cache: cache[key] = compute()` over a lock-per-operation dict is data-race-free and still a check-then-act race.
-  - Locks and atomics remove data races. Only redesigning the *protocol* — compound atomic operations, CAS loops, single-writer ownership — removes race conditions.
-- **Reason in happens-before, not in time.** Without a synchronization edge (mutex release→acquire, channel send→receive, thread start/join, acquire/release atomics), another thread may observe your writes reordered — or never. Compilers and CPUs both reorder aggressively. "Thread B runs later, so it sees A's write" is false without an edge. Every shared datum needs an answer to one question: *which edge publishes it to its readers?*
-- **Prefer moving data ownership over sharing it.** The cheapest concurrency bug is the one made impossible: single-writer designs, message passing that *transfers* ownership, immutable snapshots, and thread confinement eliminate bug classes instead of guarding them. Locks are for when ownership genuinely must be shared — a tool of last resort with a discipline attached, not the default.
-- **Concurrency ≠ parallelism.** Concurrency is structure (dealing with many things at once); parallelism is execution (doing many things at once). Async/await provides concurrency on one core — it helps I/O-bound waiting and does *nothing* for CPU-bound work. Threads/processes provide parallelism. Choosing async to speed up computation, or thread-per-request to fix I/O-wait cost at 10k connections, is a category error.
-- **Every unbounded queue is a lie about capacity.** A producer faster than its consumer means either a bounded queue that pushes back or memory growth until OOM at peak load — exactly when you can least afford it. Backpressure is a design requirement: decide explicitly what happens when full (block, shed, coalesce), don't let the allocator decide for you.
+## Rules that don't surface unprompted
 
-## Decision frameworks
+- **Blocking put under a lock is the invisible deadlock.** Holding lock L while doing a blocking `put` on a bounded queue whose *consumer* needs L deadlocks with two moving parts nobody sees in review — no lock cycle appears in the code. Generalize: any blocking operation (queue op, `join`, network call) under a lock needs a comment justifying it; the default answer is no.
+- **Granularity = one lock per named invariant, and write the invariant in a comment next to the lock.** Reviewers reflexively check contention (too-coarse) but miss invariant span: lock-per-field tears invariants spanning two fields between acquisitions. If you can't state what a lock guards, it's decorative.
+- **Never call unknown code while holding a lock** — callbacks, listeners, logging that might flush, `__eq__`/`hashCode` on user-supplied types, signal emission. Snapshot state under the lock, release, invoke outside.
+- **Guarding writes but not reads.** "It's just a read" is not a memory-model argument: readers see mid-rebalance structures (dict resizing, tree rotating) and, without an acquire edge, possibly stale values forever. The lock or snapshot-publication must cover readers too.
+- **Every unbounded queue is a lie about capacity.** Producer faster than consumer = OOM at peak load. Decide full-behavior explicitly — block, shed, or coalesce — don't let the allocator decide.
+- **Bulkheads per external dependency.** One pool shared by "call slow service X" and "serve all requests" lets X's brownout consume every thread — pool exhaustion is the classic cascading-failure mechanism. Dedicated bounded pool + bounded queue + timeout per dependency.
+- **Every blocking call carries a timeout** and a defined behavior on expiry (retry, shed, escalate). Timeout-free `acquire`/`get`/`join`/read is a hang waiting for its trigger.
+- **Never test concurrency with sleeps.** `time.sleep(0.1)` "to let the other thread run" flakes in CI forever. Force interleavings with `threading.Event`/barriers/latches, stress-loop the race body thousands of times, and run detectors: `go test -race` (non-negotiable in Go), TSan for C/C++, `loom` for Rust lock-free logic, asyncio debug mode for Python.
+- **Shutdown is a concurrency protocol of its own:** stop accepting work → drain or persist queued work → cancel in-flight in dependency order (consumers before their resources) → join with timeouts → close connections. Ad-hoc shutdown (kill, daemon threads evaporating) is where "rare" data loss actually lives. Test it like the hot path.
+- **Fairness is a requirement, not a default.** Writer-preferring RW locks starve readers (and vice versa); constant high-priority arrivals starve the low tier; wakeups aren't FIFO. If a consumer *must* eventually run, verify the primitive documents fairness or add aging/quotas.
+- **Sharing non-thread-safe clients:** one `sqlite3` connection or SQLAlchemy `Session` across threads/tasks corrupts only under load. One client per thread/task, or an explicitly thread-safe pool — check the library's documented thread-safety.
+- **`ThreadPoolExecutor.submit` stores the exception until `.result()`** — a Future nobody reads dies silently. Every spawned unit needs a place its exception lands: TaskGroup/nursery, done-callback that logs, or a join that inspects results.
+- **At-least-once and unordered is the default assumption.** Handlers idempotent and order-tolerant unless the specific mechanism documents otherwise.
 
-### Concurrency model selection
-| Workload | Model | Why |
-|---|---|---|
-| Many concurrent I/O waits in one runtime (servers, scrapers, API fan-out) | async/await or lightweight tasks (asyncio, Node, Go goroutines) | 10k+ concurrent waits at trivial memory; OS threads cap around thousands (MB-scale stacks, scheduler overhead) |
-| CPU-bound parallelism in Python | `concurrent.futures.ProcessPoolExecutor` / `multiprocessing`, or push work into GIL-releasing native code (NumPy, polars) | Threads give ~zero CPU parallelism under the GIL |
-| CPU-bound in Go/Rust/Java/C# | Thread pool sized ≈ core count | Real parallelism; extra threads beyond cores only add context-switch cost |
-| Pipeline stages, fan-out/fan-in, cancellation trees | Channels/CSP or structured concurrency (Go channels, `asyncio.TaskGroup`, Trio nurseries) | Ownership transfer plus explicit topology; the deadlock surface is the channel graph, which you can draw and audit |
-| Stateful entities with independent lifecycles (sessions, devices, game objects) | Actors — one mailbox, one owner per entity | Serializes access per entity without locks; scales with entity count |
-| Read-mostly shared config/lookup tables | Immutable snapshot swapped atomically (`AtomicReference`, RCU-style) | Readers take zero locks; writer copies, mutates, publishes. Beats a RWLock on both speed and correctness |
-| Genuinely shared hot mutable state (counters, small maps) | Locks — or per-thread sharding aggregated on read (`LongAdder` pattern) | Sharding beats one contended atomic; *contention*, not locking, is the real cost |
+## Exact numbers, flags, and detection
 
-Channels vs shared memory rule: channels when the design is *data flowing through stages with clear ownership transfer*; shared memory + locks when many parties need random access to one structure. Forcing random-access patterns through channels produces a slow, deadlock-prone reimplementation of a lock.
+- `asyncio.run(main(), debug=True)` logs any callback over **100 ms**; run a loop-lag watchdog metric in production — single-request tests never observe loop starvation, only concurrent load does. The diagnostic tell for a blocked loop: latency degrades *globally* (unrelated endpoints, health checks) in multiples of one operation's duration.
+- `-W error::RuntimeWarning` in tests turns Python's "coroutine was never awaited" warning into a failure.
+- Hung process: **take dumps before restarting** — `py-spy dump --pid` (Python, no restart needed), `jstack`/`kill -3` (JVM, flags deadlocks itself), `SIGQUIT` (Go), `gdb -p` + `thread apply all bt` (native). The evidence dies with the restart.
+- Pool math: threads ≈ cores × (1 + wait/compute); an absurd output (thousands) is the signal to go async, not spawn. Little's law first: in-flight = rate × latency — run this arithmetic before tuning anything.
+- Uncontended mutex ≈ tens of ns. *Contention*, not locking, is the cost: shard per-thread and aggregate on read (`LongAdder` pattern) instead of hammering one atomic; under real contention a CAS retry loop can burn more CPU than a well-held mutex.
+- Free-threaded (no-GIL) CPython builds remove even bytecode-level accidental atomicity — code that "worked" by leaning on the GIL breaks there. Never rely on it.
+- `multiprocessing` in any process that also uses threads: force `spawn` (or `forkserver`) start method; `fork` copies locks held by other threads as permanently locked.
 
-### Lock discipline (when you do lock)
-- **Granularity = one lock per named invariant.** Not lock-per-field (invariants spanning two fields get torn between acquisitions) and not one-lock-for-everything (contention). Write the invariant each lock guards in a comment next to its declaration; if you can't state it, the lock is decorative.
-- **Deadlock prevention is a global acquisition order:** establish a total order over locks (by layer, by address, by entity ID) and only ever acquire in that order. Every code path taking 2+ locks must be checkable against the order.
-- **Never call unknown code while holding a lock** — callbacks, listeners, logging that might flush, `__eq__`/`hashCode` on user-supplied types, signal emission. That code may take another lock (ordering violation → deadlock) or reenter yours. Snapshot state under the lock; invoke the callback outside it.
-- **Hold time:** compute nothing, await nothing, do no I/O under a lock. Copy in, compute outside, write back under re-acquired lock with revalidation (or CAS).
-- **Bounded-queue interaction:** holding lock L while doing a blocking `put` on a bounded queue whose consumer needs L is a deadlock with two moving parts nobody sees in review. Any blocking operation under a lock deserves a comment justifying it — the default answer is no.
+## Model selection (compressed)
 
-### Thread-pool sizing math
-- CPU-bound: threads = cores (±1). More only adds switching overhead.
-- Mixed blocking: threads ≈ cores × (1 + wait_time/compute_time). Example: 8 cores, tasks spend 90ms waiting on I/O per 10ms of CPU → 8 × (1 + 9) = 80 threads to saturate the cores. If the formula outputs an absurd number (thousands), that's the signal to switch to async rather than spawn.
-- **Bulkheads:** separate bounded pools per external dependency. One pool shared by "call slow service X" and "serve all requests" lets X's brownout consume every thread — thread-pool exhaustion is the classic cascading-failure mechanism. Dedicated pool + bounded queue + timeout per dependency.
-- **Little's law sanity check:** required concurrency = arrival rate × latency. 500 req/s × 0.2s = 100 in-flight; a 50-thread synchronous server *cannot* serve it regardless of CPU headroom. Run this arithmetic before tuning anything else.
-
-### async/await pitfalls (Python-flavored; same shapes in JS/C#)
-- **Blocking the loop:** one synchronous call — `requests.get`, `time.sleep`, a heavy CPU loop, a `psycopg2` query — freezes *every* task on the loop. Rules: inside `async def`, only awaitable I/O, trivial CPU, or explicit offload via `await asyncio.to_thread(fn)` / `run_in_executor`. Detection: `asyncio.run(main(), debug=True)` logs callbacks over 100ms; run a loop-lag watchdog metric in production.
-- **Forgotten await / lost tasks:**
-  - Calling `coro()` without `await` does nothing; Python's "coroutine was never awaited" warning should be treated as an error in CI (`-W error::RuntimeWarning` in tests catches it).
-  - `asyncio.create_task(...)` without keeping a reference can be garbage-collected mid-flight. Keep handles (a set with a done-callback that discards) or use `asyncio.TaskGroup`, which also propagates exceptions.
-  - A bare task whose exception is never retrieved fails *silently* until interpreter shutdown prints a cryptic message. Every spawned task needs an owner.
-- **Cancellation:** every `await` is a cancellation point; `CancelledError` can surface at any of them.
-  - Cleanup goes in `finally` or an `async with` context manager; cleanup that itself awaits can be re-cancelled — shield it (`asyncio.shield`) or use the pattern your framework provides.
-  - Never swallow `CancelledError`: it's a `BaseException`, so `except Exception` correctly misses it, but bare `except:` and `except BaseException:` swallow it and silently break every timeout and task group upstream. Re-raise it if you must intercept.
-- **Cooperative means cooperative:** a tight async loop that never awaits starves all peers. `await asyncio.sleep(0)` yields explicitly when chunking semi-CPU work you can't offload.
-- **Sync and async colored functions don't mix silently:** calling an async API from sync code needs `asyncio.run`/a running loop; blocking on `loop.run_until_complete` from *inside* a coroutine deadlocks. Design libraries to pick one color per layer.
-
-### Python GIL realities
-- One interpreter lock, one bytecode-executing thread at a time: threads give **zero** speedup for pure-Python CPU work, often a mild slowdown from handoff churn.
-- Threads *do* parallelize whatever releases the GIL: all blocking I/O, plus C extensions that release it around long operations — NumPy kernels, `hashlib` on large buffers, zlib, most database drivers, `bcrypt`.
-- Therefore: I/O-bound → threads are fine (or async at high fan-out); CPU-bound → processes (`ProcessPoolExecutor`; mind pickling cost of arguments and results — chunk work so IPC amortizes) or native/vectorized code.
-- **The GIL does not make your code thread-safe.** It makes individual bytecodes atomic-ish; `x += 1`, `d[k] = d.get(k, 0) + 1`, and every check-then-act sequence interleave and corrupt. You still need locks/queues for compound operations. Free-threaded (no-GIL) builds remove even the bytecode-level accident — never rely on it.
-
-### Memory-model quick facts by language
-| Language | What you must know |
+| Workload | Model |
 |---|---|
-| C/C++ | Any data race = undefined behavior, full stop — not "stale value" but license to miscompile. `std::atomic` default (`seq_cst`) is the safe choice; use `acquire`/`release` only with a proven need and a comment; `relaxed` is for counters you never branch on |
-| Java | Data races are defined but vicious: you can see stale values and impossible interleavings. `volatile` gives visibility + ordering (an acquire/release edge), *not* compound atomicity; `final` fields are safely published after the constructor — non-final fields of an unsafely published object are not |
-| Go | Data races are effectively fatal (may corrupt memory); `go test -race`/`go run -race` in CI is non-negotiable. Channels and `sync` primitives create the happens-before edges; "it's just an int" is not an excuse |
-| Rust | Safe Rust prevents data races at compile time (`Send`/`Sync`); it does *not* prevent race conditions or deadlocks — check-then-act across two `Mutex` acquisitions still races |
-| Python | GIL prevents torn reads of single objects but not compound-op races; C extensions can release the GIL anywhere. Multiprocessing sidesteps the memory model entirely — data is copied, and "shared" state silently isn't |
-| JS/TS | Single-threaded, so no data races — but every `await` is an interleaving point: state checked before an `await` may be invalid after it. Re-validate, or restructure so the check and use straddle no await |
+| Many concurrent I/O waits | async/await or goroutines — OS threads cap ~thousands (MB stacks) |
+| CPU-bound Python | processes (`ProcessPoolExecutor`; chunk work so pickling/IPC amortizes) or GIL-releasing native code |
+| CPU-bound Go/Rust/Java/C# | pool ≈ core count |
+| Pipelines, fan-out/fan-in, cancellation trees | channels/CSP or structured concurrency (`TaskGroup`, nurseries) — the deadlock surface is the channel graph, which you can draw |
+| Stateful entities with independent lifecycles | actors: one mailbox, one owner per entity |
+| Read-mostly shared config | immutable snapshot behind one atomic reference — beats RWLock on speed and correctness |
+| Shared hot mutable state | locks, or per-thread sharding aggregated on read |
 
-### Lock-free: when and when not
-- Legitimate uses: hot counters and flags (`fetch_add`), publish-once pointer swaps (immutable snapshot pattern), and established library structures (`java.util.concurrent`, `crossbeam`, `folly`). Also when priority inversion or signal/interrupt context forbids locks.
-- **Never hand-roll linked lock-free structures.** ABA, safe memory reclamation (hazard pointers/epochs), and memory-ordering subtleties defeat almost everyone, and the failure reproduces only under production contention. Use a library or use a lock.
-- "Lock-free" means guaranteed system-wide progress, not "faster": under real contention a CAS retry loop can burn more CPU than a well-held mutex. Benchmark under realistic contention before choosing it — an uncontended mutex costs ~tens of nanoseconds and is boring, which is a feature.
+Channels vs shared memory: channels when data *flows through stages with ownership transfer*; shared memory + locks when many parties need random access to one structure. Forcing random access through channels reimplements a lock, slowly, with deadlocks.
 
-## Failure modes & pitfalls
+## Memory-model one-liners
 
-- **Check-then-act on shared state.** `if not path.exists(): create()`, `if balance >= amt: balance -= amt`, singleton `if instance is None: instance = ...` — state changes between the check and the act. Fix with one atomic compound operation: `dict.setdefault`, `INSERT ... ON CONFLICT`, compare-and-swap, `open(..., "x")`/`O_EXCL`, or one lock held across check *and* act.
-- **Guarding writes but not reads.** Locking mutations "because reads are safe" — readers see torn or mid-rebalance state (a dict resizing, a tree rotating), and without an acquire edge possibly stale values forever. The lock or snapshot-publication must cover readers too; "it's just a read" is not a memory-model argument.
-- **Atomic/volatile as a lock substitute.** Atomicity of a single load or store doesn't make read-modify-write atomic: two threads doing atomic-read, add, atomic-write still lose updates. You need `fetch_add`/CAS or a lock. Same trap as the GIL one — single-operation atomicity never implies compound-operation atomicity.
-- **Deadlock via the invisible second lock.** The production deadlock is rarely two explicit mutexes; it's your lock plus the logging handler's lock, a GC finalizer, a `synchronized toString()`, or a blocking put on a bounded queue whose consumer needs your lock. Audit everything callable under each lock. Diagnosis: a thread dump (`py-spy dump`, `jstack`, `kill -QUIT`) names both holders instantly — *always take dumps before restarting a hung process*; the evidence dies with the restart.
-- **The async function that's secretly synchronous.** An `async def` doing CPU work or calling a sync driver stalls the entire service — and passes all tests, because single-request tests never observe loop starvation. Review rule: every operation inside `async def` is awaited non-blocking I/O, trivial CPU, or explicit offload. Verify under concurrent load with a loop-lag metric.
-- **Fire-and-forget without exception routing.** Background work (`create_task`, `Thread(daemon=True)`, executor `submit` whose Future nobody reads) dies silently. `ThreadPoolExecutor.submit` stores the exception until `.result()` is called — iterate the futures and call it. Every spawned unit needs a place its exception lands: TaskGroup/nursery, a done-callback that logs, or a join that inspects results.
-- **Sharing non-thread-safe clients across threads/tasks.** One `sqlite3` connection across threads, an SQLAlchemy `Session` shared by workers, one DB transaction object used concurrently — corruption or crosstalk that appears only under load. Rule: one client/session per thread or task, or an explicitly thread-safe pool. Check the library's documented thread-safety, don't assume.
-- **Timeout-free blocking calls.** Any lock acquire, `queue.get`, `join`, or network read without a timeout is a hang waiting for its trigger. Production rule: every blocking call carries a timeout and a defined behavior on expiry (retry, shed, escalate).
-- **Testing concurrency with sleeps.** `time.sleep(0.1)` "to let the other thread run" produces tests that pass on your laptop and flake in CI forever. Instead: force the interleaving with `threading.Event`/barriers/latches; stress-loop the race body thousands of times; run race detectors — `go test -race` (non-negotiable in Go), TSan for C/C++, `loom` for Rust lock-free logic, asyncio debug mode for Python.
-- **Cleanup after the await instead of in `finally`.** On timeout the caller cancels you mid-await; a connection/file/lock released on the line *after* the await leaks. Acquire with `async with`/`with` wherever the resource supports it; otherwise `try/finally` from the moment of acquisition.
-- **Assuming FIFO or exactly-once anywhere it isn't promised.** Thread wakeups aren't FIFO, queue consumers interleave, and most delivery systems are at-least-once. Handlers must be idempotent and order-tolerant unless the specific mechanism documents otherwise.
-- **Double-checked locking without a publication edge.** `if instance is None:` → lock → check again → construct → assign looks airtight, but without acquire/release semantics on the field, another thread can observe the assignment *before* the constructor's writes (in Java pre-`volatile`, C++ without atomics). Use the language's blessed form: `volatile` field in Java, `std::call_once`/static-local init in C++, module-level init or `functools.lru_cache` in Python.
-- **Mixing `fork()` with threads.** `fork` copies only the calling thread; any lock held by another thread at fork time is locked *forever* in the child — classic hang in the logging module or malloc. On Linux+Python this bites via multiprocessing's default `fork` start method in threaded apps (and is why `spawn` is the safer default): set `multiprocessing.set_start_method("spawn")` in any process that also uses threads.
-- **Await-point invalidation in single-threaded async.** "No threads, so no races" — false: `await` yields control, and the world changes underneath. `if user_id in active: ...await notify()...; active.remove(user_id)` can double-remove or act on gone state if two tasks interleave. Every fact established before an `await` must be re-validated after it, or the critical section must contain no awaits (or be guarded by an `asyncio.Lock`).
-- **Shutdown as an afterthought.** Clean shutdown is a concurrency protocol of its own: stop accepting new work, drain or persist queued work, cancel in-flight tasks in dependency order (consumers before the resources they use), join with timeouts, *then* close connections. Ad-hoc shutdown (process kill, daemon threads evaporating) is where "rare" data loss actually lives. Design it with the same care as the hot path, and test it.
-- **Starvation and fairness assumptions.** Writer-preferring RW locks can starve readers and vice versa; a busy-polling task can starve a cooperative scheduler; a priority queue with constant high-priority arrivals never serves the low tier. If any consumer *must* eventually run, that's a fairness requirement — verify the primitive documents it, or add aging/quotas yourself.
-
-## Worked micro-examples
-
-### 1. The GIL-safe-looking counter that isn't
-```python
-import threading
-counter = 0
-def bump():
-    global counter
-    for _ in range(1_000_000):
-        counter += 1          # LOAD, ADD, STORE — three interleavable steps
-threads = [threading.Thread(target=bump) for _ in range(4)]
-for t in threads: t.start()
-for t in threads: t.join()
-print(counter)                # far below 4_000_000, different every run
-```
-Lost updates despite the GIL: the interpreter can hand off between the load and the store. Fixes, best first: (1) restructure so each thread owns a local count, summed after join — no sharing, no bug, no lock; (2) one `threading.Lock` around the increment; (3) a per-operation lock on a shared counter is the worst-performing correct option. General lesson: *prove* compound-op atomicity; never infer it from "GIL" or "atomic type."
-
-### 2. Deadlock by lock ordering, and the fix
-```python
-def transfer(src, dst, amt):
-    with src.lock:                     # T1: transfer(a, b) holds a.lock
-        with dst.lock:                 # T2: transfer(b, a) holds b.lock
-            src.bal -= amt             # both wait forever
-            dst.bal += amt
-
-def transfer(src, dst, amt):           # fix: global acquisition order
-    first, second = (src, dst) if src.id < dst.id else (dst, src)
-    with first.lock, second.lock:
-        src.bal -= amt
-        dst.bal += amt
-```
-Verification habit: for any code taking two or more locks, name the global order, then check every acquisition site against it. A site where the order can't be known at acquisition time must be redesigned — single lock, single owner, or trylock-with-backoff.
-
-### 3. Event-loop stall, quantified
-An asyncio service handles 200 concurrent requests at p99 = 30ms. Someone adds `bcrypt.hashpw` (~200ms of CPU) inline in an `async def` login handler. At just 5 logins/s × 200ms, the loop is 100% occupied: *every* request — health checks included — queues behind hashing, p99 goes to seconds service-wide, and the failing health check gets the instance killed, shifting load to its neighbors (cascade).
-Fix: `await asyncio.to_thread(bcrypt.hashpw, pw, salt)` — bcrypt releases the GIL, so a thread genuinely parallelizes it; use a process pool if the work were pure-Python CPU. Diagnostic tell for this whole class: latency degrades *globally* (unrelated endpoints too) in multiples of one operation's duration.
+- C/C++: any data race = license to miscompile, not "stale value". `seq_cst` default; `acquire`/`release` only with a proven need and a comment; `relaxed` only for counters you never branch on.
+- Java: `volatile` = visibility + ordering edge, never compound atomicity; only `final` fields survive unsafe publication.
+- Go: races may corrupt memory; `-race` in CI non-negotiable; "it's just an int" is not an excuse.
+- Rust: `Send`/`Sync` kill data races at compile time but not race conditions — check-then-act across two `Mutex` acquisitions still races.
+- Python: GIL prevents torn single-object reads, never compound-op races; multiprocessing "shared" state is silently copies.
+- JS/TS: no data races, but every `await` is an interleaving point — every fact established before an `await` must be re-validated after it, or the critical section must contain no awaits.
 
 ## Self-check before presenting concurrent code
 
-- For every shared mutable datum: name its owner, or the lock/edge that guards it — *including all readers*. Anything unnamed is a bug you haven't met yet.
-- For every check-then-act or read-modify-write on shared state: point to the mechanism making the compound operation atomic (lock span, CAS, `setdefault`, DB constraint).
-- Locks: is there a stated global acquisition order? Is anything awaited, blocking, I/O-bound, or user-callable executed while held?
-- Async: zero blocking calls inside any `async def`? Every spawned task owned (TaskGroup/nursery/handle + exception sink)? Every cleanup path cancellation-safe (`finally`/`async with`)? `CancelledError` never swallowed?
-- Every queue bounded, with a stated full-behavior? Every blocking call timeboxed?
-- Pool sizes justified by the arithmetic (cores × (1 + wait/compute); Little's law), with bulkheads per external dependency?
-- Did it run under a race detector or debug mode (`-race`, TSan, loom, asyncio debug) and a stress loop with forced interleavings — not just once, green, on a warm laptop?
-- Is the shutdown path specified (drain order, cancellation order, join timeouts) and exercised by a test, not just the happy path?
-- In async code, list every fact carried across an `await` — is each one re-validated after the interleaving point, or protected so it can't change?
+- Every shared mutable datum: name its owner or the lock/edge that guards it — *including all readers*.
+- Every check-then-act / read-modify-write: point to the mechanism making the compound op atomic (lock span, CAS, `setdefault`, DB constraint, `O_EXCL`).
+- Locks: global acquisition order stated? Anything awaited, blocking, I/O-bound, or user-callable held under one?
+- Async: zero blocking calls inside `async def`? Every task owned with an exception sink? Cleanup in `finally`/`async with` (cleanup that awaits can be re-cancelled — shield it)? `CancelledError` re-raised if intercepted?
+- Every queue bounded with a stated full-behavior? Every blocking call timeboxed?
+- Pool sizes justified by arithmetic, with bulkheads per dependency?
+- Run under a race detector and stress loop with forced interleavings — not once, green, on a warm laptop?
+- Shutdown path specified (drain order, cancellation order, join timeouts) and exercised by a test?
+- Every fact carried across an `await` re-validated or protected?
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 13 claims: 13 baseline (cut/compressed), 0 partial, 0 delta.
+- Opus cold-answered everything at full specificity: race taxonomy, GIL counter, Goetz formula (exact 80-thread result), bcrypt-releases-GIL fix, weak-ref task GC + TaskGroup, CancelledError/BaseException, per-language DCL forms, fork+held-locks (knew the 3.14 start-method change), dump-before-restart tooling, snapshot-vs-RWLock, JS await races, Little's law, lock-free vs wait-free with ABA/reclamation.
+- Restructured into a correction sheet: residual value is the unprobed operational layer — blocking-put-under-lock deadlock, lock-per-invariant commenting, bulkheads, shutdown protocol, fairness, sleep-free testing, and exact detection flags (asyncio 100 ms debug threshold, `-W error::RuntimeWarning`, loom).
+- Worked examples deleted: all three matched probes Opus nailed cold.
