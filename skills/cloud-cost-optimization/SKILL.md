@@ -13,6 +13,26 @@ description: Load when analyzing or reducing cloud spend — bill investigation,
 - **Optimization has an ROI ladder — work it in order.** Delete unused (infinite ROI, zero risk) → right-size (high ROI, low risk) → schedule off-hours (high ROI for non-prod) → commitment discounts (financial move, no engineering) → architectural change (highest ceiling, highest cost/risk). Teams jump to re-architecture because it's interesting; the boring rungs usually contain 60–80% of the achievable savings.
 - **Savings that require sustained vigilance don't persist.** Prefer structural fixes (lifecycle policy, autoscaling floor, policy-blocked SKUs, gateway endpoints) over heroic cleanups. A one-time cleanup without the policy that prevents recurrence is renting the savings, not buying them.
 
+## The cost map — where money hides, with numbers (AWS-flavored; Azure/GCP analogous)
+
+| Line item | Rate (order of magnitude, 2026) | Why it surprises |
+|---|---|---|
+| Internet egress | ~$0.09/GB first tier | Priced per GB nobody estimated; CDN-out is the fix |
+| Cross-AZ traffic (AWS) | $0.01/GB *each direction* | Invisible on diagrams; chatty services and replication pay it twice |
+| NAT gateway processing | $0.045/GB + ~$32/mo each | Stacks *on top of* egress; free gateway endpoints often eliminate it |
+| Log ingestion (CloudWatch/Log Analytics) | ~$0.50/GB order | DEBUG × never-expire retention is a choice made by default |
+| Inter-region replication/pulls | ~$0.02/GB | Enabled once, billed forever |
+| Snapshots/orphaned storage | per-GB-month, compounding | Only ever grows unless a policy shrinks it |
+
+The pattern: per-GB charges attached to *movement and retention* — costs proportional to data flows nobody drew on the architecture diagram. Price every arrow.
+
+## Unit economics discipline
+
+- Build the metric as `allocated cost ÷ business denominator` per service: cost-per-1k-requests for APIs, cost-per-customer for tenancy decisions, cost-per-job/run for batch and ML. Pick the denominator the *business* already tracks, define it in writing, and never change it silently.
+- Use it to route effort: a unit cost flat while traffic doubled means the architecture is scaling sub-linearly — leave it alone regardless of the total. A unit cost creeping 3%/month is the leak worth a project even if the total looks stable.
+- Unit economics also answers pricing questions engineering gets dragged into: "can we offer a free tier?" is answerable only as marginal-cost-per-free-user.
+- Present every optimization in both currencies: "$8k/mo" and "−22% cost-per-request" — the first gets budget approval, the second proves it wasn't just traffic decline.
+
 ## The optimization ladder — reasoning at each rung
 
 1. **Delete unused.** Unattached EBS volumes/managed disks, aged snapshots, idle load balancers, stopped-but-EBS-billing instances, unused elastic IPs, empty-but-provisioned databases, forgotten dev environments, orphaned NAT gateways ($32+/mo each doing nothing). Find via cost tools (Cost Explorer resource view, Azure Advisor, or Cloud Custodian rules). Expect 5–15% of the bill in a mature-but-unaudited account. This rung requires no design conversation — do it first, always.
@@ -49,7 +69,21 @@ description: Load when analyzing or reducing cloud spend — bill investigation,
 - Every log/backup/artifact bucket gets a lifecycle policy at creation: transition to IA/Cool after 30 days, archive tiers after 90, **expiry** after the retention requirement — the delete rule matters more than the tiering. Verify minimum-storage-duration math (30d IA / 90–180d archive tiers) against object churn before tiering; small hot-churning objects can cost *more* tiered.
 - Intelligent-Tiering (AWS) as default for unknown patterns; it caps the downside of nobody-ever-audits-this.
 - Snapshots: orphaned EBS/disk snapshot chains from deleted volumes are the classic ratchet — automate retention (Data Lifecycle Manager / Azure Backup policies).
-- Data transfer checklist for any bill review: NAT gateway processing (add S3/DynamoDB gateway endpoints — free — and interface endpoints where volume justifies), cross-AZ chatter (co-locate chatty pairs, topology-aware routing, single-AZ for dev), internet egress (CloudFront/CDN in front — origin-to-CDN is free on AWS), cross-region replication you forgot about, and per-GB log ingestion (CloudWatch $0.50/GB, Log Analytics similar order — sample debug logs, set retention; "never expire" is the default and it is a trap).
+- Data transfer checklist for any bill review: NAT gateway processing (add S3/DynamoDB gateway endpoints — free — and interface endpoints where volume justifies), cross-AZ chatter (co-locate chatty pairs, topology-aware routing, single-AZ for dev), internet egress (CloudFront/CDN in front — origin-to-CDN is free on AWS), cross-region replication you forgot about, and per-GB log ingestion (sample debug logs, set retention; "never expire" is the default and it is a trap).
+
+Worked lifecycle policy (S3, the shape to copy — tier *and* expire, with the multipart cleanup everyone forgets):
+```json
+{ "Rules": [{
+    "ID": "logs-standard-lifecycle", "Status": "Enabled",
+    "Filter": { "Prefix": "logs/" },
+    "Transitions": [ { "Days": 30, "StorageClass": "STANDARD_IA" },
+                     { "Days": 90, "StorageClass": "GLACIER_IR" } ],
+    "Expiration": { "Days": 365 },
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 },
+    "NoncurrentVersionExpiration": { "NoncurrentDays": 30 }
+}]}
+```
+The `AbortIncompleteMultipartUpload` and noncurrent-version rules are where versioned buckets silently hoard invisible gigabytes — invisible in the console object list, fully visible on the bill.
 
 ## Guardrails and anomaly detection — savings that persist
 
@@ -71,6 +105,8 @@ description: Load when analyzing or reducing cloud spend — bill investigation,
 - **Utilization is the real GPU metric.** A reserved H100 at 30% utilization costs 3.3× its sticker per useful hour — worse than on-demand neocloud. Measure GPU-hours-per-training-run and $-per-training-run; hunt idle allocations (notebooks holding GPUs overnight is the #1 offender — idle-kill policies).
 - **Inference cost ladder:** per-token APIs (zero commitment, best below sustained volume) → provisioned throughput / PTU-style reservations when steady → self-hosted open-weights on rented GPUs when volume is high and prompts are cacheable/batchable. Prompt caching, batching (batch APIs typically ~50% off), model right-sizing (a distilled/small model for the 80% easy cases, escalate the rest) usually beat infrastructure heroics; measure $-per-1k-requests before and after.
 - Training: spot + aggressive checkpointing (every N minutes to object storage) makes 60–70% discounts survivable; the checkpoint cadence is your maximum loss-per-interruption — set it by arithmetic, not vibes.
+- Token-spend hygiene mirrors infra hygiene: per-feature token metering (the tagging equivalent), max-token caps on every call, context windows trimmed to what the eval says is needed, and a monthly "cost per successful task" number — LLM bills have the same Pareto (one verbose feature is usually half the spend) and the same fix (measure, attribute, cap).
+- Verify GPU rates at decision time, not from memory or this file — the market moves quarterly and a stale $/hr in a proposal invalidates the whole comparison.
 
 ## How an expert thinks through this
 

@@ -50,6 +50,13 @@ Lifetime defaults worth defending in review: access token 5–15 min; refresh to
 - Implementation: use a maintained server library (`@simplewebauthn/server` for Node, `webauthn` by duo-labs lineage for Python, `go-webauthn`); decisions that matter: require user verification (`userVerification: "required"`) for sensitive apps; register the RP ID as your registrable domain (subdomain scoping follows from it); store multiple credentials per user and *encourage* multi-enrollment (second device, security key) at signup — this is your cheapest recovery insurance; handle `excludeCredentials` so users don't double-register a device.
 - **The real design problem is recovery, not the ceremony.** Measurable fractions of users lose all authenticators within a year or two (lost/wiped/switched-ecosystem devices). Synced passkeys shifted the problem: recovery of your account now often reduces to recovery of the user's *Apple/Google account* — acceptable for consumer apps, unacceptable for high-assurance ones. Ladder of recovery paths, strongest first: second enrolled authenticator → hardware security key kept offline → one-time recovery codes issued at enrollment (shown once, hashed at rest) → identity-verification re-proofing (document check) for high-value accounts → email reset (weakest; if present, your account security equals email security — say so in the threat model, or remove it for admin/finance roles). Helpdesk-mediated recovery must itself be phishing-resistant: callback to number on file + verified re-enrollment, never "read me the code I just emailed you" (that's how the big 2023–2025 helpdesk-social-engineering breaches worked).
 
+## API keys and machine credentials
+
+- API keys persist because they're operationally simple (no token endpoint, no expiry dance) — legitimate for server-to-server B2B APIs. Engineer them like passwords, not like identifiers: ≥256-bit random, **store only a hash** (SHA-256 is fine here — keys are high-entropy, unlike passwords), show once at creation, allow ≥2 active keys per client so rotation is overlap-and-retire instead of a coordinated outage.
+- Prefix keys with an identifiable marker (`sk_live_`, `yourco_`) — this is what lets secret scanners (GitHub push protection, trufflehog) catch leaks in commits, and it's why every serious API vendor does it. Register your format with GitHub's secret-scanning program if you're a platform.
+- Scope and attribute every key: per-key permissions, per-key rate limits, `last_used_at` tracking (the key nobody has used in 9 months should alarm someone before an attacker uses it), and revocation that takes effect in seconds (keys check a store/cache, they're not self-validating — that's their one advantage over JWTs; don't throw it away by caching validation for an hour).
+- Inside one cloud/cluster, long-lived static credentials are a smell: workload identity (IRSA, GKE Workload Identity, SPIFFE/SVID) gives you attested, auto-rotating, short-lived credentials with no secret to leak. The decision rule: a static secret is acceptable only when the two sides share no platform that can attest identity.
+
 ## Multi-tenancy and B2B SSO realities
 
 - **Model tenancy in the token, decide it at login.** Every access token should carry the tenant (`org_id` claim); every authorization check is (user, tenant, resource) — a user existing in two orgs must get *different* tokens per org, never one token with ambient access to both. Home-realm discovery (email domain → which IdP) happens before authentication; cache the mapping, and beware domain-based auto-join (anyone with a `@corp.com` address joins Corp's tenant — verify domain ownership via DNS TXT before enabling).
@@ -83,6 +90,9 @@ Don't build an IdP — pick one (say Keycloak self-hosted, or Auth0 if ops budge
 - **Using the ID token as an API credential.** The ID token's `aud` is the *client*, not your API; APIs accepting ID tokens can't distinguish "user logged into any app" from "user authorized this API" — and lifetimes/claims are wrong for the job. APIs accept access tokens with their own `aud`, full stop.
 - **Comparing secrets with `==`** (reset tokens, API keys, HMACs) → timing side-channel. `hmac.compare_digest` / `crypto.timingSafeEqual`.
 - **Storing TOTP seeds and recovery codes in plaintext** next to the password hashes they're supposed to back up. Encrypt seeds (KMS-wrapped), hash recovery codes like passwords.
+- **Session fixation**: session ID not regenerated at login, so an attacker who planted a pre-auth session ID (via a subdomain cookie, or a shared computer) owns the post-auth session. Rotate the session identifier on every privilege change — login, sudo-mode, role switch.
+- **`Access-Control-Allow-Origin` reflected from the request with `Allow-Credentials: true`** — that's "any website may make authenticated requests as the visiting user and read the responses," i.e., CORS configured into a vulnerability. Credentials mode requires an exact-match origin allowlist; never reflect, never `*`.
+- **Tokens in URLs** (query-string access tokens, SAML responses via GET, reset links that get forwarded) — URLs land in server logs, browser history, and `Referer` headers. Tokens travel in headers, bodies, or httpOnly cookies; anything that must be a link (reset, magic login) is single-use and short-lived *because* it will leak.
 - **SAML without signature-on-assertion verification, or verifying the *response* signature while reading an unsigned *assertion*** (signature-wrapping). Use a hardened library, require signed assertions, validate `InResponseTo`, and pin the IdP cert per tenant — a tenant's IdP must never be able to mint assertions for another tenant (check the `Issuer` against the tenant's registered entity ID, not a global list).
 
 ## Worked micro-examples
@@ -133,6 +143,27 @@ def refresh(presented: str):
 ```
 
 The family revocation on reuse is the difference between rotation-as-ritual and rotation-as-detection: whichever of {user, attacker} presents the stale token second proves the token leaked, and both lines of descent die.
+
+**4. WebAuthn registration options — the decisions live in these fields (@simplewebauthn/server):**
+
+```ts
+const options = await generateRegistrationOptions({
+  rpID: "example.com",                      // registrable domain: credentials work on all subdomains
+  rpName: "Example",
+  userID: user.stableIdBytes,               // stable opaque ID — NOT email (emails change; this can't)
+  userName: user.email,                     // display/selection only
+  attestationType: "none",                  // don't demand attestation unless you'll actually verify+police it
+  excludeCredentials: user.credentials.map(c => ({ id: c.id })),  // no double-registering the same device
+  authenticatorSelection: {
+    residentKey: "required",                // discoverable credential -> usernameless + autofill UI works
+    userVerification: "preferred",          // "required" for high-assurance apps; "preferred" maximizes reach
+  },
+});
+```
+
+Then verify the response server-side checking `origin` and `rpID` match expectations, store `credentialID`, `credentialPublicKey`, and `counter` — and prompt the user to add a *second* authenticator now, because that prompt is your recovery story.
+
+
 
 ## Verification / self-check
 

@@ -101,6 +101,8 @@ Monday, revenue for Friday shows 40% down. Internal monologue: *First: real or d
 - **Lineage built once, never maintained** — decays in months as pipelines change; stale lineage is worse than none because people trust it. Correction: lineage emitted automatically from the orchestrator/dbt runs (OpenLineage events per run), never hand-drawn.
 - **PII discovered by grep during an audit.** Correction: classification at ingestion as part of the contract; automated PII scanners as a backstop, not the primary control.
 - **Governance rolled out as a freeze** ("no new datasets until cataloged"). The org routes around it within a month. Correction: govern the paved road — make the compliant path the easiest path (templates that emit contracts, classification, and ownership by default).
+- **Quarantine tables nobody drains**: rejected rows accumulate for months — which means either the checks are wrong (false rejects nobody noticed) or real data is silently missing from the marts. Correction: quarantine gets an SLA and an owner like any queue; reject volume is itself a monitored metric.
+- **Test severity misconfigured**: dbt tests defaulting to `error` on statistical checks block the whole DAG nightly for noise; or everything set to `warn` so key violations flow through. Correction: severity is per-check and deliberate (`severity: warn` for distribution checks, `error` for contracted invariants) — audit the config, it drifts.
 
 ## Worked micro-example: contract enforced in dbt
 

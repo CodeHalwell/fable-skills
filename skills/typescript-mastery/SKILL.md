@@ -88,6 +88,9 @@ Prior: **when types and runtime disagree at a module boundary, believe the runti
 - **`keyof` + generics access surprise.** Inside `function get<T, K extends keyof T>(o: T, k: K): T[K]`, writing through `o[k] = value` needs `T[K]` exactly — assignments to generic indexed-access types are checked pessimistically; if you hit "not assignable to T[K]", the honest fixes are a mapped-type setter design or a justified assertion, not loosening `K`.
 - **Losing literal types through intermediate variables.** `let method = 'GET'; fetchIt(method)` fails when `fetchIt` wants `'GET' | 'POST'` — `let` widens to `string`. Use `const`, `as const`, or `satisfies` at the definition, not a cast at the use site.
 - **Global augmentation leakage in tests.** Adding `declare global { var testDb: Db }` in a test helper leaks into production type space for the whole project — scope test globals to a `tsconfig.test.json` include, or pass fixtures explicitly.
+- **`Promise<T>` lies of omission.** A function typed `(): Promise<User>` says nothing about rejection types — TypeScript has no checked exceptions, and `catch (e)` gives `unknown` (under `useUnknownInCatchVariables`, part of `strict`). Never write `catch (e: Error)`; narrow with `instanceof` or a schema, and encode *expected* failures in the return type (`Promise<Result<User, AuthError>>`-style discriminated results) when callers must handle them.
+- **Structural typing defeats exhaustive `switch` on classes.** Discriminate unions on literal *properties* (`kind: 'circle'`), not `instanceof`, when values may cross serialization boundaries — a deserialized object loses its prototype, `instanceof` returns false, and your "exhaustive" switch falls through at runtime while the types still say it can't.
+- **Widening in returned literals.** `function conf() { return { retries: 3, mode: 'fast' } }` infers `mode: string`, breaking downstream literal checks. Fix at the source: `as const` on the literal or `satisfies Config` — not casts at every consumer.
 
 ## Worked micro-examples
 
@@ -170,5 +173,7 @@ Before presenting TypeScript advice or code:
 3. Count the axioms: every `as`, `any`, and `!` must carry a stated justification, and unvalidated external data must pass a parser before gaining a type.
 4. If a type-level construct took more than a few minutes to understand, write the boring duplicated version and compare; ship whichever a reviewer parses faster.
 5. Check the error-message quality at a representative wrong call site — a sound API with unreadable errors will be `any`-ed around by teammates.
+6. For anything crossing a serialization or module boundary, re-verify at the runtime level: discriminants over `instanceof`, actual import shapes over `.d.ts` claims, parsed data over asserted data.
+7. Complex generic utilities get type-level tests (`expect-type` / `tsd`) in CI — a refactor that silently broadens `never` to `any` is otherwise invisible until a consumer breaks.
 
 Stopping rule: stop hardening when remaining `any`s are quarantined at boundaries behind validated parsers and `strict` + `noUncheckedIndexedAccess` are clean. Chasing type purity inside generated or vendored code, or golfing conditional types that already work as overloads, is waste.

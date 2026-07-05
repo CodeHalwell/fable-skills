@@ -134,6 +134,41 @@ process.on('SIGTERM', async () => {
 process.on('unhandledRejection', (err) => { log.fatal(err); process.exit(1); }); // crash-only
 ```
 
+**CPU work off the loop with a worker pool (piscina):**
+```ts
+// worker.ts — pure function, no app state
+import { createHash } from 'node:crypto';
+export default function thumbnail({ buf }: { buf: ArrayBuffer }): ArrayBuffer {
+  // ... sharp/resize etc. Return transferable, don't structured-clone megabytes.
+  return buf;
+}
+
+// server.ts
+import Piscina from 'piscina';
+const pool = new Piscina({
+  filename: new URL('./worker.js', import.meta.url).href,
+  maxThreads: 4,                       // size to cores minus loop headroom; measure, don't max
+});
+app.post('/thumbnail', async (req, reply) => {
+  const buf = await req.file();        // stream to buffer with a size cap
+  const out = await pool.run({ buf: buf.buffer }, { transferList: [buf.buffer] }); // transfer, not copy
+  reply.type('image/webp').send(Buffer.from(out));
+});
+```
+
+**Supply-chain guardrails (.npmrc + CI):**
+```ini
+# .npmrc — checked into the repo
+ignore-scripts=true          # no lifecycle-script execution on install (allowlist exceptions)
+save-exact=true              # applications pin direct deps exactly
+```
+```yaml
+# CI install step
+- run: npm ci --ignore-scripts        # lockfile-exact, scripts still disabled
+- run: npx --yes @lavamoat/allow-scripts@<pinned> run   # run ONLY allowlisted build scripts
+```
+Plus: Renovate/dependabot configured with a ≥7-day `minimumReleaseAge` cooldown, and lockfile diffs reviewed like code — a dependency bump that edits resolved URLs or adds install scripts is a stop-the-line signal.
+
 ## Verification and stopping rule
 
 Before presenting Node backend advice or code:

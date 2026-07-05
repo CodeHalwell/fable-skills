@@ -21,7 +21,26 @@ description: Load when designing, reviewing, or debugging serverless systems —
 4. **Connection model:** long-held stateful connections (WebSockets, gRPC streams, DB pools per instance) → FaaS fights you; either use the platform's managed WebSocket layer (API Gateway WebSocket APIs, Azure Web PubSub, SignalR) or use containers.
 5. **State between steps:** none → functions. Workflow state across steps → orchestration layer (Step Functions / Durable Functions), never in-memory or "in the queue message that grows forever."
 
+| Workload signal | Verdict | Reasoning anchor |
+|---|---|---|
+| Spiky API, ms–s handlers, idle nights | FaaS | Pay-per-use dominates; cold starts engineerable |
+| Queue/stream consumers, batch glue | FaaS | Cold starts irrelevant; retry/DLQ machinery free |
+| Steady ≥50% duty-cycle traffic | Containers | Per-invocation premium compounds against you |
+| WebSockets/long-lived connections | Containers or managed WS layer | FaaS instance lifecycle fights held connections |
+| Heavy deps, >15 min, >10GB, GPU | Serverless containers / batch | FaaS caps are hard walls |
+| Sub-50ms p99 always-hot API | Containers (or paid-for warm FaaS) | You'd pay to delete FaaS's defining property |
+
 **FaaS vs serverless containers:** prefer containers-on-demand (Fargate/ACA/Cloud Run) over FaaS when: dependencies are heavy (multi-GB images, native libs), work units exceed FaaS caps, you need concurrency >1 per instance to amortize expensive initialization (loaded ML model serving many requests), or the team already ships containers and FaaS would fork the toolchain. Cloud Run's request-concurrency-per-instance model and ACA's KEDA scaling give scale-to-zero with container ergonomics — as of 2026 this middle ground is where most "serverless API" workloads actually belong.
+
+## State management without servers
+
+Name where every piece of state lives; "in the function" is never an answer (instances are recycled without notice — warm-instance memory is a cache at best, never a store):
+- **Workflow state** (where is order 123 in its 6-step process): Step Functions / Durable Functions execution state — durable, visible, owned by the orchestrator.
+- **Aggregation/join state** (are all N parts done): conditional writes on a DynamoDB/Cosmos item — atomic counters with `ConditionExpression`, not read-modify-write.
+- **Session/user state:** external store keyed by session (DynamoDB with TTL, Redis/ElastiCache Serverless) — chosen by latency need and whether eviction is acceptable.
+- **Rate/dedup/lock state:** the same conditional-write pattern with TTLs; never in-memory token buckets (each instance would have its own).
+- **Large payloads:** object storage + reference (claim check), always.
+The discipline: draw the pipeline, and for each arrow and box write the state's home and its TTL. Unhomed state is where serverless designs corrupt data.
 
 ## Cold start engineering (state of 2026)
 

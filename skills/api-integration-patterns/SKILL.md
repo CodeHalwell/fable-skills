@@ -87,6 +87,8 @@ Payments-provider calls fail ~2% of the time, "randomly." Internal monologue: *"
 - **Auth expiry as a surprise**: OAuth refresh tokens expiring from disuse, API keys rotated by a teammate, certs expiring. Correction: monitor auth failures as their own alert class (a 401 spike is an ops event, not an error blip); refresh proactively before expiry; alarm on token age.
 - **Clock skew breaking signed requests** (AWS SigV4-style and webhook timestamps tolerate minutes at most). Symptom: everything 403s on one misconfigured host. Correction: NTP everywhere; include skew in the debugging taxonomy.
 - **Silent schema drift**: provider adds an enum value or nulls a field your code assumed present; nothing 4xxs. Correction: validate responses at the boundary (Pydantic/zod) in *warn* mode with alerting — strict mode turns every benign additive change into your outage; unknown enum values route to an explicit `unknown` branch, never `else: assume old behavior`.
+- **Token-refresh stampede**: an access token expires and 200 in-flight workers simultaneously hit the refresh endpoint — some providers invalidate the refresh token on concurrent use, locking the whole integration out. Correction: single-flight the refresh (mutex/distributed lock), refresh proactively at ~80% of token lifetime, and serialize refresh-token rotation.
+- **200-with-errors blindness**: GraphQL and batch endpoints return HTTP 200 with per-item/partial failures in the body; `raise_for_status()` sees success. Correction: the boundary wrapper inspects the body's error envelope and converts partial failures into typed results — never let "HTTP succeeded" stand in for "operation succeeded."
 
 ## Worked micro-example: resilient client core (Python, httpx + tenacity)
 

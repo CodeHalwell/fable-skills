@@ -89,6 +89,19 @@ Decision tree an expert actually runs, in order of prior probability:
 - Define quality SLOs the same way as availability SLOs: "≥97% of sampled traces pass the groundedness judge, 7-day window" — with an error budget that gates risky prompt experiments.
 - Every alert links to the trace sample that triggered it. An alert without traces attached is a mystery, not a signal.
 
+Starting-point alert set (tune to your baselines; the *shape* is the advice):
+
+| Signal | Condition | Severity |
+|---|---|---|
+| Refusal rate | >3× 7-day same-hour baseline, 30 min sustained | Page |
+| Parse/schema failure (structured outputs) | >2% of requests, 15 min | Page |
+| Judge score (random sample) | Below SLO band 24 h | Ticket |
+| Regeneration rate | >2× baseline, 1 h | Ticket |
+| Agent loop cutoffs | >1% of traces hit step/token budget, 1 h | Page (burns money) |
+| TTFT p95 | >2× baseline, 15 min | Page |
+| Hourly token spend | >3× same-hour baseline | Page |
+| Judge–human agreement (calibration set) | Drops on scheduled re-run | Ticket (measurement broken) |
+
 ## How an expert thinks through it: "quality dropped Tuesday"
 
 Support-bot CSAT dips; no deploy in the changelog. Internal monologue: *No deploy — but the changelog only covers code. Check the prompt registry: no change. Check model pinning… the config says `gpt-x-latest`-style alias, not a pinned snapshot. Provider release notes: model updated Monday. Strong suspect — but verify, don't conclude.* Pull 50 negative-feedback traces from Tuesday vs. 50 from last week. *Diff the behavior: refusal rate similar (weakens the model-update theory for refusals), but answers now cite the wrong plan tier.* Look at retrieval spans: same doc IDs as before. *So not retrieval ranking… open the chunks themselves — they contain BOTH old and new pricing; the pricing page was re-ingested Monday with a migration that concatenated versions.* Root cause: ingestion bug, coincident with (innocent) model update. *Rejected hypotheses and why: model update (behavior diff didn't match — refusals stable, factuality on one topic broken); prompt regression (registry immutable, no change); input drift (topic mix unchanged in the input dashboard).* Fixes: re-ingest with dedup, add a judge rubric "cites exactly one plan tier" to online sampling, pin the model alias, and add the 50 bad traces as eval cases. Stopping rule: judge score for the pricing slice back to baseline for 48h, and the new eval cases pass in CI.

@@ -21,6 +21,13 @@ description: Load when sizing a system before building it or scaling it — back
 - **Storage arithmetic:** 1M events/day × 1KB ≈ 1GB/day ≈ 365GB/yr raw — ×2–3 for indexes+replication+overhead. Logs/telemetry usually dwarf business data 10:1; estimate them separately or the storage estimate is fiction.
 - **People-scale anchors:** 1M DAU with 20 requests/user/day ≈ 20M req/day ≈ 230 req/s average ≈ ~700–1200 req/s at diurnal peak. Memorize this shape: *DAU → daily requests → ÷86,400 → ×3–5 for peak*.
 
+**Arithmetic anchors that make envelopes fast:**
+- 1 day ≈ 86,400 s ≈ 10⁵ s; 1 month ≈ 2.6M s; 1 year ≈ 31.5M s ≈ π×10⁷ s.
+- 1M/day ≈ 11.6/s; 100M/day ≈ 1,160/s; 1/s ≈ 86k/day ≈ 2.6M/month.
+- 1KB × 1M/day ≈ 1GB/day ≈ 30GB/month ≈ 365GB/year.
+- 1 Gbps ≈ 125 MB/s ≈ 10.8 TB/day; a 4G/5G user video stream ≈ 3–8 Mbps.
+- 8 bits/byte trips someone in every bandwidth meeting — say "bytes" or "bits" out loud.
+
 ## Little's Law, worked
 
 `L = λ × W`. Three directions, all useful:
