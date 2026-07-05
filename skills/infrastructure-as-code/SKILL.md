@@ -7,160 +7,73 @@ description: Load when writing or reviewing Terraform/OpenTofu (or Pulumi/CDK), 
 
 ## Core mental model
 
-- **State is the crown jewel.** Terraform/OpenTofu is a three-way diff engine: configuration (desired) vs state (last-known) vs reality (refreshed). Every mystery — orphaned resources, "already exists" errors, plans that want to recreate everything — is one of those three legs disagreeing. Lose the state file and the tool forgets it owns anything; corrupt it and the tool will confidently do the wrong thing. Remote state with locking (S3 with native locking, or equivalent) is non-negotiable from day one; state file access is admin access (state contains resource attributes, historically including secrets — treat the bucket like a credentials store).
-- **Never hand-edit what IaC manages.** A console change creates drift: the next plan either silently reverts the "fix" (re-breaking prod at an arbitrary future time, in someone else's unrelated apply) or errors. The discipline is cultural, not technical: emergency console changes are allowed, but the incident isn't closed until the change is codified or reverted. Detect drift by running plans on a schedule, not only on PRs.
-- **The plan is the code review.** HCL diffs lie: a one-line change can mean in-place update, or destroy-and-recreate of a database. Review the *plan output*, not the diff. The three symbols that matter: `~` update in-place (usually fine), `-/+` **replace** (destroy then create — the dangerous one; the plan names the attribute that forced it), `-` destroy. Any replace or destroy of a stateful resource requires explicit human intent.
-- **Blast radius is a design input.** One giant state = one lock queue, one plan that takes 20 minutes, one bad apply that can touch everything, one state corruption that loses everything. Split state along ownership and change-frequency lines; wire the pieces with remote-state reads or data sources.
-- **Ordering comes from the graph, not the file.** Resources apply in dependency-graph order derived from references. If you need `depends_on`, first ask why no attribute reference exists — hidden dependencies (IAM propagation, eventual consistency) are legitimate; using `depends_on` to paper over a missing reference is a smell.
+- **State is the crown jewel** — a three-way diff (config vs state vs reality); every mystery is one leg disagreeing. Remote state with locking from day one; state access is admin access.
+- **Review the plan, not the HCL diff.** `~` update, `-/+` replace (the plan names the forcing attribute — that attribute is the whole investigation), `-` destroy. Any replace/destroy of a stateful resource requires explicit human intent.
+- **Blast radius is a design input**: split state by owner × change cadence (`network`/`data`/`platform`/per-team services), stateful stores in their own smallest-possible state. Prefer plain data-source lookups by tag over `terraform_remote_state` across team boundaries — remote-state reads couple you to the producer's layout and grant access to their secret-bearing state.
+- Emergency console changes are allowed; the incident isn't closed until codified or reverted. Run scheduled drift plans, not just PR plans.
 
-## Tool landscape (as of 2026)
+## Tool landscape (as of 2026 — the fast-moving part)
 
-- **Terraform vs OpenTofu**: genuinely diverged tools now, not a re-badge. Terraform (BSL license — restricts building competing products; ~1.14.x as of mid-2026) shipped ephemeral resources (1.10) and write-only arguments (1.11). OpenTofu (MPL-2.0, CNCF, ~1.11–1.12) has state encryption (1.7 — note: enabling it makes state unreadable by Terraform, a one-way door), early variable evaluation in backends/modules (1.8), provider `for_each` (1.9), OCI registry support (1.10), and its own ephemeral/write-only support (1.11). State remained binary-compatible around the 1.5.x fork point, but HCL-level divergence is growing — don't assume a config written for one runs on the other. Choosing: BSL exposure or wanting state encryption → OpenTofu; deep HCP/Sentinel investment → Terraform; either is production-grade, so the real answer is usually "whichever your org already standardized on — don't run both."
-- **Pulumi/CDK** (programmatic): choose when the *logic* is genuinely programmatic — loops with complex conditionals, sharing types with app code, teams that refuse HCL. Costs: plan/preview is less universally reviewable, testing culture required (you now have real code paths), CDK adds CloudFormation's slowness and rollback model underneath. Don't pick Pulumi because HCL `for_each` felt awkward once; do pick it when you're generating infrastructure from application metadata.
-- HCL remains the ecosystem default; provider coverage, hiring, and examples all favor it.
+- **Terraform (BSL, ~1.14.x) and OpenTofu (MPL-2.0/CNCF, ~1.11–1.12) are genuinely diverged tools now.** Terraform: ephemeral resources (1.10), write-only arguments (1.11), Stacks (HCP-coupled). OpenTofu: **state encryption (1.7 — enabling it is a one-way door; encrypted state is unreadable by Terraform)**, early variable eval in backends (1.8), provider `for_each` (1.9), OCI registry support (1.10), its own ephemeral/write-only (1.11), **dynamic/conditional `prevent_destroy` (1.12 — stock Terraform still requires a literal)**. Models trained pre-2026 lag OpenTofu by 2+ minor versions and miss the one-way encryption door. Choosing: BSL exposure or state encryption → OpenTofu; HCP/Sentinel investment → Terraform; otherwise whichever the org standardized on — never both on the same resources.
+- **S3-backend locking is native lockfile-based now** (`use_lockfile = true`, TF 1.10 / Tofu 1.9); the DynamoDB table is legacy for new setups. Bucket versioning is the state-corruption undo button — verify before needing it.
+- Pulumi/CDK: pick when the logic is genuinely programmatic (generating infra from application metadata), not because HCL `for_each` felt awkward once; you inherit a testing-culture requirement, and CDK adds CloudFormation's slowness and rollback model underneath.
 
-## State and environment architecture — the reasoning chain
+## Environments, modules, layout
 
-Questions, in order:
+Directory-per-environment (thin roots calling versioned modules, own backends); workspaces only for ephemeral copies — as prod/staging separation, `workspace show` is the only guard against applying prod with staging vars, and you can't pin prod to an older module. `envs/prod` and `envs/staging` should diff cleanly; every directory maps to exactly one state, guessable from the path; roots contain no resource logic. Modules: small opinionated variable surfaces (a god-module with 80 variables is a config file wearing module syntax); pin by tag (`?ref=v2.3.0` — an unpinned source means someone else's merge changes your prod plan); outputs are contract (removal breaks unknown remote-state readers); ≤2 nesting levels; no one-resource pass-through modules unless they add policy.
 
-1. **Who changes this and how often?** Network/VPC (platform team, monthly) doesn't belong in the same state as app services (app teams, daily). Split by owner × cadence. A rough shape that scales: `network` / `data` (stateful, guarded) / `platform` (cluster, shared services) / one state per app team or service group.
-2. **What's the blast radius of a bad apply here?** Databases and stateful stores get their own state with `prevent_destroy` and the smallest possible surrounding config.
-3. **How do environments differ?** Prefer **directory-per-environment** (`envs/prod/`, `envs/staging/`), each a thin root module calling shared versioned modules with different variables and its own backend. Workspaces share one backend and one code version — fine for ephemeral short-lived copies (PR previews), dangerous as prod/staging separation because `terraform workspace show` is the only thing between you and applying prod with staging vars, and you can't pin prod to an older module while staging tests a new one. Terragrunt or stacks tooling helps when directory count explodes; adopt when the pain is real, not preemptively.
-4. **How do split states communicate?** `terraform_remote_state` data sources or plain data-source lookups by name/tag. Prefer the latter across team boundaries — remote-state reads couple consumers to the producer's *state layout* and require access to the producer's entire (secret-bearing) state; a data source by tag couples only to reality.
+## Validation ladder
 
-## Module design
+fmt/validate → tflint (invalid instance types, deprecated args) → **policy on the JSON plan (the highest-value layer)** → `terraform test` for modules with real logic → Terratest-style ephemeral integration only for a platform team's core modules. Leaf-config confidence comes from plan review + staging applies, not test suites. Policy starts warn-only, promotes to deny after tuning — a policy that blocks legitimate work gets culturally bypassed and then protects nothing.
 
-- **Thin modules, versioned contracts.** A good module wraps a coherent unit (a service's runtime footprint; an opinionated VPC) with a small variable surface encoding *your org's* opinions. A god-module with 80 variables that "does everything" is a config file wearing module syntax — every consumer change risks every consumer.
-- Version modules with git tags or a registry and pin consumers (`?ref=v2.3.0`). An unpinned module source means someone else's merge changes your prod plan.
-- Composition over nesting: roots compose modules; modules nesting modules more than ~2 deep makes plans unreadable and variables tunnel through layers.
-- Don't wrap a single resource in a module unless it adds real policy (naming, tags, mandatory encryption). One-resource pass-through modules are indirection tax.
-- Outputs are the contract too: removing an output is a breaking change for unknown remote-state readers — version accordingly.
+## Import, refactor, secrets
 
-## Repository layout — the shape that survives growth
+- Import blocks (declarative, plannable) over CLI import; iterate until **plan is empty — that is the definition of done** (a non-empty post-import plan would mutate the live resource you just adopted). `moved` blocks > `state mv`; `removed` blocks to disown without destroying. Import stateful/referenced things; recreate cheap fungible ones.
+- Secrets, best first: (1) never let Terraform touch them (IAM roles/OIDC, `manage_master_user_password`, ACM); (2) **ephemeral values + write-only arguments** (TF 1.10–1.11 / Tofu 1.11) — e.g. `password_wo` + `password_wo_version` fed from an ephemeral secrets-manager read, landing in neither state nor plan; (3) reference-don't-inline (pass the ARN/path); (4) `sensitive = true` is display masking only — plaintext in state, plan files, and `output -json`; (5) when a secret unavoidably lands in state: access control + encryption + audit. **Plan artifacts embed values, including sensitive ones — classify tfplan like state**; teams lock the bucket then upload the plan as a world-readable CI artifact.
 
-```
-infra/
-  modules/                    # shared, versioned via tags (or a separate modules repo)
-    service-runtime/          # opinionated: ECS/k8s service + alarms + dashboard
-    postgres/                 # opinionated: encrypted, backed-up, prevent_destroy baked in
-  envs/
-    prod/
-      network/                # one state each — split by owner × cadence × blast radius
-        backend.tf  main.tf   # main.tf is THIN: module calls + env-specific variables only
-      data/
-      platform/
-      services/
-    staging/                  # same structure, different variables — diffable against prod
-```
+## Plan-review discipline
 
-Rules that make this work: roots contain no resource logic (if a root grows raw resources, that's a module trying to be born); `envs/prod` and `envs/staging` should diff cleanly (structural drift between envs is how "worked in staging" dies); every directory maps to exactly one state file, and the mapping is guessable from the path.
+CI posts the plan; humans approve the plan; **apply runs the saved plan artifact** — a fresh apply after approval ships whatever changed in between, sight-unseen (and `apply tfplan` refusing a stale plan is the safety working, not an obstacle). Automate destructive-change detection on `terraform show -json` (require elevated approval on any `delete` action — humans skim 400-line plans). `prevent_destroy` on every database/state bucket/DNS zone/KMS key — **but the guard lives in config: deleting the resource block deletes the guard with it, and the next plan happily destroys.** Backstop with plan-JSON policy (deny deletes on protected tags) and cloud-native deletion protection (`deletion_protection`, termination protection), which survive config deletion.
 
-## Validation and testing — what's worth the effort
+## Debugging a surprising plan
 
-In increasing cost, stop where returns flatten:
-1. **`terraform fmt -check` + `terraform validate`** in CI — free, catches syntax and internal consistency.
-2. **`tflint`** with provider rulesets — catches invalid instance types, deprecated arguments, unused declarations that `validate` misses.
-3. **Policy on the plan** (OPA/conftest/Sentinel) — org rules, the highest-value layer (see below).
-4. **`terraform test`** (native, 1.6+) for *modules with logic*: variable validation branches, conditionals, for_each shaping. Run with mocked providers or plan-only assertions in CI; reserve real-apply tests for the few modules where a regression is catastrophic and cheap to exercise in a sandbox account.
-5. Full ephemeral-environment integration tests (Terratest-style) — expensive to keep green; justified for a platform team's core modules, waste for leaf configs. Most leaf-config confidence should come from plan review + staging applies, not test suites.
+Which leg moved? Config (check module refs and provider bumps — zero local diff needed), state (surgery?), reality (console drift). Perpetual `~` normalization diffs: match the API's canonical form, don't `ignore_changes`. `-/+`: read the `# forces replacement` attribute. `known after apply` cascades: find the one upstream computed root; ignore the fan-out. "Already exists" on create: import or delete the stray — never rename-to-dodge (now there are two). Priors in mature configs: provider bumps > unpinned modules > console drift > API normalization > actual Terraform bugs, in that order.
 
-## Import vs recreate
+## Escape hatches
 
-When infrastructure exists but state doesn't know it (console-created legacy, state surgery, adoption): **import if it's stateful or referenced** (databases, DNS zones, IAM consumed by others), **recreate if it's cheap and fungible** (a security group nobody references, a lambda redeployable in seconds). Use `import` blocks (declarative, plannable, reviewable in the PR) over one-shot `terraform import` CLI where available. After import, iterate until `plan` is *empty* — a post-import plan showing changes means your config doesn't match reality yet, and applying would mutate a live resource you just adopted. For state surgery on refactors, `moved` blocks > `state mv` (reviewable, replayable); `removed` blocks / `state rm` to disown without destroying.
+Native resource → community provider → generic API/REST resource → `local-exec` **last** (invisible to plan, no drift detection, CI-runner deps; no `triggers` = runs once ever, `timestamp()` triggers = dirty every plan — hash the actual inputs). Two `local-exec`s orchestrating each other means this piece doesn't belong in Terraform. Every one carries a comment naming the native gap and an issue link for removal.
 
-## Secrets in IaC (as of 2026)
+## Failure modes & pitfalls (checklist)
 
-Layered defense, best first:
-1. **Keep secrets out of the workflow entirely**: IAM roles/OIDC instead of keys, cloud-managed passwords (e.g. RDS `manage_master_user_password`), certs from ACM — resources that never expose a secret to Terraform can't leak it.
-2. **Ephemeral values / write-only arguments** (Terraform 1.10–1.11, OpenTofu 1.11): read a secret at apply time and hand it to a resource without it ever entering state or plan artifacts. This is the current-best pattern for "Terraform must pass a secret."
-3. **Reference-don't-inline**: resource fields that accept a secret-manager ARN/path keep the secret in Vault/ASM/GSM; Terraform only handles the pointer.
-4. `sensitive = true` is **display masking only** — the value still sits in state in plaintext. Never mistake it for protection.
-5. Accept-and-contain: when a secret unavoidably lands in state (many older providers), the mitigation is state-store access control + encryption (OpenTofu state encryption, or KMS-encrypted backend) + audit.
-Never: secrets in `.tfvars` committed to git, in HCL literals, or in plan files uploaded as CI artifacts (plans contain values too — guard plan artifacts like state).
+- `count` for collections with changeable membership → index-shift destroys everything after the removed element; the tell is a plan destroying resources whose config "didn't change." `for_each` on stable keys.
+- Unpinned providers / uncommitted lockfile → different plans from identical config; `providers lock -platform=` for both CI and laptop platforms.
+- `ignore_changes` as drift concealer (legitimate only for externally-mutated fields like autoscaler `desired_count`).
+- `depends_on` on a data source forces read-at-apply → perpetual `known after apply`; if the object is managed in the same config, reference the resource attribute instead. Bootstrap circularity = split bootstrap state or explicit two-phase, not data-source hacks.
+- Wrong-workspace applies; `-lock=false` habits and state surgery under a live lock (stuck locks: `force-unlock` with the lock ID after confirming the holder is dead); `-target` as a habit is a state-splitting problem being solved with a footgun — every use ends with a full clean plan.
+- State in git/on laptops: the first thing to fix in any inherited config (`init -migrate-state` before touching anything else).
 
-## Plan-review discipline & policy-as-code
-
-- CI posts the plan on the PR; humans approve the *plan*; apply runs the *saved plan artifact* (`terraform apply tfplan`), not a fresh plan — otherwise the thing applied isn't the thing reviewed.
-- Automate destructive-change detection: parse `terraform show -json tfplan` and require elevated approval when any resource has `"actions": ["delete"]` or `["delete","create"]` — humans skim 400-line plans and miss the one replace.
-- `lifecycle { prevent_destroy = true }` on every database, state bucket, DNS zone, KMS key. It fails the plan rather than allowing a quiet replace. (OpenTofu 1.12 allows dynamic/conditional `prevent_destroy`; stock Terraform requires a literal.)
-- Policy-as-code (OPA/conftest on the JSON plan, or Sentinel on HCP): encode the rules you'd otherwise repeat in review — tags required, no public buckets, instance-type allowlists, "no delete on resources tagged critical". Start warn-only, promote to deny after tuning; a policy that blocks legitimate work gets bypassed culturally and then protects nothing.
-
-## Debugging a surprising plan — the reasoning chain
-
-When a plan shows changes nobody expects, walk the three-way diff deliberately:
-1. **Which leg moved?** Config (check `git log -p` on the directory *and* on module refs — an unpinned module or bumped provider changes plans with zero local diff), state (did someone run surgery? check backend versioning/audit), or reality (drift: someone touched the console).
-2. **For a `~` update**: is the new value yours (config change) or the API's (normalization — e.g., a policy JSON reordered, case-folded ARN)? Perpetual normalization diffs get fixed by matching the canonical form in config, not by `ignore_changes`.
-3. **For `-/+` replace**: the plan prints `# forces replacement` next to the exact attribute. That attribute is the whole investigation — who changed it, and is replacement acceptable for this resource class?
-4. **For unexplained `known after apply` cascades**: usually one upstream computed attribute changed (or a data source moved to apply-time), fanning out. Find the root resource; ignore the fan-out.
-5. **For "already exists" on create**: reality has it, state doesn't — import or delete the stray, never blind-apply with a rename to dodge the collision (now you have two).
-Prior: in mature configs, the most common causes of surprise plans are, in order: provider version bumps, unpinned modules, console drift, and API normalization. Genuine Terraform bugs are last — exhaust the boring causes first.
-
-## Escape hatches — the taxonomy, in descending order of preference
-
-1. Native resource (always look again — providers grow fast).
-2. Community/partner provider for the API.
-3. Generic API resource (e.g. a REST/`http`-based provider) — declarative even if crude.
-4. `null_resource`/`terraform_data` + `local-exec` — **last resort**: invisible to plan, no drift detection, runs where the plan runs (CI runner deps), and triggers/re-run semantics are a bug farm. Every `local-exec` needs a comment saying what native gap it fills and an issue link tracking its removal. Two or more `local-exec`s orchestrating each other means this piece doesn't belong in Terraform — move it to a real workflow (CI job, operator, script) that Terraform merely triggers or that runs after apply.
-
-## Failure modes & pitfalls
-
-- **`count` where `for_each` belongs.** Resources created with `count` are addressed by index; removing the first element of the input list shifts every index, and the plan destroys-and-recreates *everything after it*. Use `for_each` keyed on stable identifiers for any collection that can change membership. The tell in review: a plan destroying resources whose config "didn't change."
-- **Removing a resource block removes its `prevent_destroy` with it.** Lifecycle guards live in config: delete the block and the next plan happily destroys the resource — the guard can't protect against its own removal. Backstop with policy-as-code on the JSON plan (deny deletes on protected tags), which survives config deletion.
-- **Unpinned providers / uncommitted lockfile.** No `required_providers` version constraint + no committed `.terraform.lock.hcl` = teammates and CI resolve different provider versions and get different plans from identical config. Commit the lockfile; run `terraform providers lock -platform=linux_amd64 -platform=darwin_arm64` so both CI and laptops verify hashes.
-- **Applying a fresh plan after approving an old one.** `plan` on PR, human approves, CI later runs `apply` (no saved plan): whatever changed in between — new commits, drift, provider release — is applied sight-unseen. Apply the saved artifact; and treat a plan older than ~a day as stale (re-plan and re-review; the world drifted under it).
-- **`sensitive = true` mistaken for encryption.** It masks CLI output only. The value is plaintext in state and in plan files. Protection = state-store access control/encryption + ephemeral/write-only patterns, not the flag.
-- **Refactoring addresses without `moved` blocks.** Renaming a resource or moving it into a module changes its address; Terraform sees "old one deleted, new one added" → destroy/create. Every refactor PR that touches addresses needs `moved` blocks (or documented `state mv`), and its plan must show *zero* create/destroy.
-- **`ignore_changes` as drift concealer.** Legitimate for fields mutated by external systems (autoscaler-managed `desired_count`). Illegitimate as a way to stop plan noise you don't understand — you've now made Terraform blind to that field forever, and the config is a lie. Diagnose the perpetual diff instead (usually API normalization or a provider default).
-- **Wrong-workspace apply.** Workspaces share directory and backend; the only guard is remembering `terraform workspace select`. If prod and staging are workspaces, an automation bug or tired human applies across the boundary. Directory-per-env makes the mistake structurally harder; if you keep workspaces, hard-fail in CI when `terraform.workspace` doesn't match the pipeline's target var.
-- **Data source vs bootstrap ordering.** A config whose data source looks up a resource that doesn't exist yet fails at *plan* time — circular on first bootstrap. Split bootstrap state, or accept explicit two-phase applies; don't hack it with `depends_on` on data sources (that forces read-at-apply and perpetual "known after apply" diffs).
-- **State surgery under a live lock, or `-lock=false` habits.** Running `state` commands while CI holds the lock, or routinely passing `-lock=false` because "the lock was stuck", is how state corruption happens. Stuck locks have a real cause (killed run); use `force-unlock` with the lock ID after confirming the holder is dead, and never disable locking in automation.
-- **Secrets in plan artifacts.** Teams lock down state, then upload `tfplan` (which embeds values, including sensitive ones) as a world-readable CI artifact. Plan files inherit state's classification.
-- **`-target` as a habit.** `terraform apply -target=...` skips the rest of the graph — dependencies don't update, and repeated targeting leaves state permanently inconsistent with config. It's a break-glass tool for recovering from a wedged state, and every use should end with a full clean plan. A runbook that says "always apply with -target" describes a state-splitting problem being solved with a footgun.
-- **State in git or on a laptop.** Local `terraform.tfstate` committed to the repo: no locking (concurrent applies corrupt), secrets in git history forever, merge conflicts in JSON nobody can safely resolve. This is the first thing to fix in any inherited config — migrate with `terraform init -migrate-state` before touching anything else.
-- **`local-exec` with unpinned triggers.** A `null_resource`/`terraform_data` provisioner with no `triggers` runs exactly once ever (never re-runs on input changes); with `triggers = { always = timestamp() }` it runs every apply and makes every plan dirty. Both are usually wrong — trigger on the hash of actual inputs, and re-read the escape-hatch taxonomy before keeping it at all.
-
-## Worked micro-examples
-
-**Destructive-change gate in CI (the check humans skip):**
+## Worked micro-example — the destructive-change gate
 
 ```bash
 terraform plan -out=tfplan
 terraform show -json tfplan | jq -e '
-  [.resource_changes[]
-   | select(.change.actions | index("delete"))] | length == 0
+  [.resource_changes[] | select(.change.actions | index("delete"))] | length == 0
 ' >/dev/null || { echo "::error::plan contains destroys — needs elevated approval"; exit 1; }
 ```
 
-**Safe refactor, adopt, and guard — the three blocks that replace CLI surgery:**
+## How an expert thinks through it: "plan wants to destroy/recreate prod RDS"
 
-```hcl
-moved {                                   # rename without destroy/create
-  from = aws_s3_bucket.assets
-  to   = module.assets.aws_s3_bucket.this
-}
-
-import {                                  # adopt console-created resource, reviewably
-  to = aws_db_instance.legacy
-  id = "legacy-prod-db"
-}
-
-resource "aws_db_instance" "legacy" {
-  # ... config matching reality; iterate until `plan` is empty ...
-  lifecycle { prevent_destroy = true }
-}
-```
-
-**Backend that treats state as a crown jewel (AWS shape):** S3 bucket with versioning + SSE-KMS + tight bucket policy, native S3 state locking (lockfile-based, current replacement for the DynamoDB-table pattern), and separate keys per state: `key = "network/prod/terraform.tfstate"`. Bucket versioning is your state-corruption undo button — verify it's on before you need it.
-
-## How an expert thinks through it: "plan wants to destroy and recreate the prod RDS instance"
-
-Never apply; read *why*. The plan marks `-/+` and names the culprit: `identifier` forces replacement — someone renamed the instance to match a new convention. Options: (a) apply — destroys prod data; obviously no, but say why in the PR so the author learns the `-/+` semantics. (b) Revert the rename — safe, but the convention change had a reason. (c) Check whether this is rename-in-place-able: for RDS, `identifier` change is actually an in-place rename via the API, but the provider models it as replacement? Verify in provider docs/changelog rather than assume — if the provider genuinely forces replacement, (d) do it as a managed migration: snapshot, create new alongside, cut over, then remove the old — as explicit separate changes, not one hidden inside a plan. Also fix the process gap: why did no `prevent_destroy` exist on this instance, and why did CI not flag a delete action on a `data`-tier resource? Add both. Considered and rejected: `terraform state rm` + re-import under the new name — actually the *right* trick when only the resource *address* changed (use `moved` blocks for that), but here the *cloud-side identifier* changed, so state surgery can't help. The lesson encoded: replaces are diagnosed from the plan's "forces replacement" attribute, and stateful resources get both a lifecycle guard and a policy check, because humans will eventually skim.
+Read why before anything: `-/+` names `identifier` as forcing replacement — a naming-convention rename. Options: revert (safe, default); if only the *Terraform address* changed, `moved` blocks (state surgery can't help when the *cloud-side identifier* changed — know which case you're in); if the cloud identifier genuinely must change, check whether the provider models an API-supported in-place rename as replacement (verify in provider docs; RDS `ModifyDBInstance` can rename), else snapshot → create-alongside → cutover as explicit separate changes. Then fix the process gap: why no `prevent_destroy`, why no CI delete-gate on a `data`-tier resource — add both, because humans will eventually skim.
 
 ## Verification / self-check
 
-- After any apply: run `plan` again — it must be empty. A non-empty second plan means perpetual drift (a provider default fighting your config, a value normalized by the API); fix it now or every future plan carries noise that trains reviewers to ignore plans.
-- After import or refactor: empty plan is the definition of done.
-- Grep state for secrets before declaring a workflow secure: `terraform show -json | grep -i` the credential names you fear. If present, that's your real security boundary — act accordingly.
-- For a module: can you write its README contract (inputs, outputs, invariants) in 15 lines? If not, it's doing too much.
-- Destructive-change drill: does your pipeline actually stop a plan containing a delete on a guarded resource? Test with a scratch resource, not by faith.
-- Stopping rule: infrastructure code is done when plans are empty, state contains no unguarded secrets, every stateful resource has `prevent_destroy`, and a new team member can find which state owns a resource in under a minute. Refactoring module trees beyond that is aesthetics.
+- After any apply/import/refactor: a second plan must be **empty** — perpetual diffs train reviewers to ignore plans.
+- Grep rendered state for the credential names you fear; if present, that's your real security boundary.
+- Destructive-change drill: prove the pipeline stops a delete on a guarded resource with a scratch resource, not faith.
+- A module README contract fits in 15 lines, or it's doing too much; a new team member finds which state owns a resource in under a minute.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+
+- Probed 14 claims: 13 baseline (cut/compressed), 1 partial (sharpened), 0 delta.
+- Opus cold nails: native S3 lockfile locking, ephemeral/write-only secret flow with exact versions, `sensitive=true` scope, count/for_each shift, prevent_destroy's self-deletion gap + backstops, moved/import blocks, workspace anti-pattern, saved-plan-artifact discipline, plan-file classification, `-target` judgment, and the RDS-rename walkthrough (including the ModifyDBInstance nuance).
+- Sharpened: OpenTofu currency — Opus lags at "1.9–1.10," misses OCI registry support (1.10), dynamic `prevent_destroy` (1.12), and the **one-way door of state encryption** (Terraform can't read encrypted state); that irreversibility is the delta worth keeping loud.
