@@ -33,6 +33,29 @@ What changes the answer: a "private" branch that CI or a deploy system tracks by
 - **Removing a secret or huge blob from history:** `git filter-repo` (the tool the git project itself points to; `filter-branch` is deprecated, slow, and footgun-laden), e.g. `git filter-repo --invert-paths --path secrets.env` or `--strip-blobs-bigger-than 10M`. It rewrites every descendant hash — this is a coordinated event (everyone re-clones, all open PRs die), not a quiet fix. And rotate the secret regardless: history rewriting doesn't un-leak anything already fetched by forks, mirrors, or scrapers.
 - **Server-side / worktree-less plumbing** worth knowing exists: `git merge-tree` performs *real* merges (rename detection, recursive bases) with no worktree or index — since Git 2.38 this is how platforms do server-side merges, and it's the fast way to answer "will these two branches conflict?" without touching your checkout. `git replay` (Git 2.44+) is an in-memory rebase that works in bare repos and can replay multiple branches at once.
 
+## Interrogating history: which tool answers which question
+
+| Question | Tool | Notes |
+|---|---|---|
+| When did this exact string appear/disappear? | `git log -S 'needle' --oneline` | Pickaxe: matches count changes, so it skips commits that merely move the line |
+| When did lines *matching a pattern* change? | `git log -G 'regex' -p` | Unlike `-S`, catches modifications, not just add/remove |
+| Full history of one function/line range | `git log -L :funcname:file.py` or `-L 10,40:file` | Follows the range through edits; slow but decisive |
+| Who really wrote this line? | `git blame -w -C -C -C file` | `-w` ignores whitespace, `-C`s track copies across files — default blame stops at the last refactor |
+| Did commit X make it into release Y? | `git branch --contains X`, `git tag --contains X` | Exact-hash ancestry only |
+| Which of my patches are already upstream? | `git cherry -v upstream mybranch` | Patch-identity, catches cherry-picked equivalents |
+| What did that force-push actually change? | `git range-diff main old-tip new-tip` | Diff-of-diffs per commit; the re-review tool |
+| Will these branches conflict if merged? | `git merge-tree A B` (Git 2.38+) | Real merge, no worktree touched |
+| What human-readable version is this build? | `git describe --tags --dirty` | Nearest tag + distance + sha |
+
+Reach for these *before* reading code or asking people: `log -S` plus `blame -w -C` answers "why is this line here" in minutes, with the commit message (if the team writes real ones) explaining intent.
+
+## Bisect: debugging as binary search
+
+- Bisect requires zero understanding of the code — that's its value. When a regression window exists, bisect *before* reading diffs: O(log n) commits tested beats O(n) commits understood. 1,000 commits ≈ 10 tests.
+- Always drive it with `git bisect run <script>` rather than manually — manual bisect sessions die to one mistyped `good`/`bad` (though `git bisect log` + editing + `git bisect replay` can fix a single wrong answer without restarting).
+- Merge-heavy history: `git bisect start --first-parent` (Git 2.29+) tests only mainline merge points — coarser answer ("which PR"), far fewer broken intermediate states to skip.
+- The test script must test *the symptom*, not "the tests pass" — CI-green commits can still carry the regression if coverage is the gap. And pin the environment: a bisect whose script depends on lockfile-installed deps must reinstall per step or it's testing a chimera.
+
 ## Worktrees: parallel work without stashing
 
 - `git worktree add ../repo-hotfix hotfix-branch` gives a second working directory sharing the same object store and refs — near-instant, no duplicate storage (vs. a second clone which duplicates objects and has *separate* refs you must push/pull between).

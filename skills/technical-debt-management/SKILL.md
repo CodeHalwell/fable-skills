@@ -94,6 +94,11 @@ If someone proposes a rewrite and can't produce the strangler costing (item 3), 
 - **Attach debt to features, not to virtue:** "Feature X routes through `billing/`; at current friction it lands ~3 weeks later and with elevated incident risk. Two weeks of paydown first makes X faster *and* Y and Z after it." This converts paydown from a tax into an investment with a named beneficiary.
 - **Bring the localized evidence** (friction log, per-module lead time) and a small ask with a payback date. Small, measured, delivered-on-time debt projects build the credit rating that funds bigger ones. A vague "we need a quality sprint" spends credibility and buys nothing durable.
 - **Concede genuinely free debt.** Publicly deprioritizing ugly-but-frozen code is the move that makes product trust your prioritization of the rest. An engineer who wants to fix everything is arguing aesthetics; one who declines to fix cold code is arguing economics.
+- **Pre-handle the standard objections**, because they will come in this order:
+  - *"Can't we do it after the release?"* — Sometimes yes; say yes when true (that's the deliberate-prudent quadrant: record it, schedule it). Say no with a number when false: "after" means the feature is built *on top of* the debt, raising the principal — give the revised estimate for fixing it post-release vs pre.
+  - *"Why wasn't this raised earlier?"* — Don't get defensive; the honest answer is usually "the interest rate just changed" (the roadmap moved into this module). Debt priorities are supposed to change when plans change.
+  - *"How do I know this won't grow into a rewrite?"* — Show the scoped end condition and the pause-safe sequencing (each slice ships alone). This is exactly the fear the strangler structure exists to answer; if you can't answer it, your plan is under-specified.
+  - *"Can we just be more careful instead?"* — "Careful" is not a mechanism. Point at the generator analysis: the debt regrows because a pressure or tooling gradient favors it; the ratchet changes the gradient, willpower doesn't.
 
 ## Debt in the AI-codegen era (as of 2026)
 
@@ -126,6 +131,20 @@ You inherit a 7-year-old order-management service. The team says "it's all debt,
 *Now the PM conversation.* Not "the code is bad": "Tickets touching these 2 files run 3× lead time — here's the Jira query. Q3's discount-engine work lives exactly there. Proposal: 3 weeks — characterization tests, extract the rule engine behind a seam, ratchet on. Discount engine then lands faster than currently forecast, and we deprioritize everything else on the debt list, including things engineers complain about." The concession buys the credibility; the named-feature payback buys the three weeks.
 
 *Stopping rule:* refactor until the discount-engine work is unblocked and the ratchet holds — not until the file is beautiful. Remaining ugliness in the hotspot reprices next quarter with fresh churn data.
+
+### Second scenario: the AI-velocity trade
+
+Six months after rolling out coding agents, feature throughput is up ~40% and leadership wants to bank all of it. You're asked whether that's safe. Internal monologue:
+
+*What does the evidence say generically?* As of 2026: throughput gains are real (DORA 2025 reversed its 2024 finding), but stability degrades where controls are weak, and the industry-wide code signature is more duplication, less refactoring, less old-code maintenance (GitClear). Generic evidence justifies checking, not concluding — *measure this repo.*
+
+*Cheap local measurements, one afternoon:* duplicate-block trend (`jscpd` on HEAD vs 6 months ago), churn concentration (is new code piling up in new files beside an untouched core?), revert/hotfix rate trend, and the friction log. Suppose results: duplication up 2.2×, hotfix rate creeping, and the old `auth/` core has near-zero edits but rising numbers of new wrappers around it.
+
+*Reject "pause AI usage"* — throughput gain is real value, and the tool isn't the quadrant; the missing controls are. This is deliberate-reckless *by the organization* if it continues after this analysis, which is exactly the framing that gets leadership's attention: the loan is now being taken knowingly.
+
+*Reject "add a quality gate on everything"* — blanket gates on a 40%-faster pipeline create queue pressure that teams will route around; gates must be few and targeted (duplication ratchet, error-contract lint) or they get exception-processed to death.
+
+*Proposal:* bank 30 of the 40 points; reinvest 10 as agent-driven paydown aimed at the wrapper accretion around `auth/` (the same agents that generated the wrappers can execute the consolidation cheaply, with human design review). Re-measure duplication and hotfix rate in a quarter; the reinvestment slice floats on those two numbers. *The deliverable is a control system, not a one-time cleanup.*
 
 ## Failure modes & pitfalls
 
@@ -174,6 +193,26 @@ Rank by churn, then flag files that are also large/deep. Expect a power law — 
 | D-31 | Pricing switch, src/billing/pricing_rules.py | delib-reckless | ~23 dd/yr (friction log 03-06/2026; PR lead time 3.1x repo median) | ~15 dd | lint: no new cases in legacy switch; new rules via RuleTable | before Q3 discount engine | FUNDED 2026-07 |
 | D-14 | Report renderer string templating | inadv-prudent | ~2 dd/yr | ~20 dd | n/a | revisit if reporting re-enters roadmap | ACCEPTED permanently 2026-04 |
 ```
+
+**4. Strangler-fig sequencing** (for the `OrderProcessor` scenario above — the shape generalizes):
+
+```text
+Step 0  Seam audit: all order-state transitions already pass through dispatch();
+        if they didn't, step 0 becomes "route them through one" (weeks, ships alone).
+Step 1  Characterization tests at the seam: record real inputs/outputs at dispatch()
+        (goldens from prod traffic samples), not unit tests of internals.
+Step 2  Ratchet ON before any migration: CI fails if a new transition type is
+        added to the legacy switch. New behavior must use the new handler API.
+Step 3  Migrate ONE transition (pick the simplest, not the most valuable) end-to-end,
+        behind a flag; run old and new in shadow mode, diff outputs for a week.
+Step 4  Cut over that transition; DELETE the legacy branch for it in the same PR.
+        No deletion, no progress — parallel paths kept "just in case" are the
+        two-dialects failure mode with extra steps.
+Step 5  Repeat by risk-ascending order. Publish a burn-down (transitions remaining);
+        a visible counter is what keeps a multi-quarter migration funded.
+```
+
+Each step ships independently and the project can pause safely after any step 4 — that pause-safety is the economic argument that beats a rewrite, and it's worth stating explicitly in the product negotiation.
 
 ## Verification / self-check
 

@@ -108,6 +108,11 @@ Stopping rule: the evaluation above took ~15 minutes. Spend that for any new pro
 - **Vendoring a security-relevant lib and forgetting it exists.** The vendored copy silently exits the advisory pipeline — scanners key off manifests and lockfiles, not copied source. If you vendor, add the upstream to your watch list explicitly and record the commit SHA in the vendored tree.
 - **Monorepo internal deps by registry version.** `"@ourorg/utils": "^2.1.0"` inside the same monorepo builds against the *published* package, so local changes to utils don't take effect until publish — the "my fix works locally in utils but not in the app" mystery. Use `workspace:*` (it's rewritten to a real version at publish time).
 - **Adopting a package because an LLM (or a tutorial) named it, without checking the registry.** Hallucinated package names get registered by attackers (slopsquatting). Before installing anything you didn't already know: open the registry page, check downloads, repo link that actually contains the code, and publish date — a 3-week-old package with a famous-sounding name is a trap.
+- **`npm audit fix --force` as a reflex.** The `--force` variant installs semver-*major* bumps of direct deps to satisfy advisories — it will silently move you across breaking majors with zero migration work done. Run plain `npm audit fix`, triage the remainder by reachability, and take majors deliberately. Related: chasing a zero-advisory dashboard by force-pinning transitive versions trades a *known, possibly unreachable* vuln for *unknown, untested* version combinations.
+- **Misreading caret semantics on 0.x.** `^0.2.3` means `>=0.2.3 <0.3.0` — for 0.x, caret only floats the *patch* level, and 0.x minors are declared-breaking. Teams "on the latest 0.x" via caret are actually frozen at a minor and surprised months later. If you must depend on 0.x software in prod, treat every update as a major: read the diff.
+- **Depending on a git branch instead of a tag/SHA.** `"foo": "github:org/foo#main"` is a moving target with no immutability, no cooldown, no registry-side malware scanning, and it breaks the moment the branch is force-pushed or deleted. Pin git deps to a full commit SHA, and treat them as vendoring-with-extra-steps: you now own watching that repo.
+- **Misusing `peerDependencies` direction.** A plugin must declare its host (`react`, `eslint`) as a peer, not a regular dep — declaring it regular bundles a second host copy into every consumer (the dual-React bug again, self-inflicted). Symmetric error: apps "fixing" peer-warnings with `--legacy-peer-deps` permanently, which disables the resolver's only compatibility check; fix the actual conflict or use an explicit override with a tracking issue.
+- **The kitchen-sink internal `common`/`utils` package.** Every internal consumer inherits every transitive dep of everything in the grab-bag, and any change forces a rebuild/republish cascade across the monorepo. Split by dependency weight: pure-function utils (zero deps) separate from the package that drags in AWS SDKs.
 
 ## Worked micro-examples
 
@@ -140,7 +145,27 @@ onlyBuiltDependencies:          # install-script allowlist — keep this list ti
 ```
 Scripts blocked by default (v10 behavior); the two entries are real native-build packages. Every addition to this list is a security decision, not a warning-silencing chore.
 
-**3. The buy-vs-build arithmetic, explicit.** Feature: retry-with-jitter around HTTP calls. Library option: a retry package + 6 transitive deps, history of 2 majors in 3 years. Build option: ~40 lines with tests. Cost model: build = 3 hours once. Buy = 0 hours now + 2 major migrations × ~2h + weekly Renovate PR review amortized ~15 min/yr + nonzero compromise tail on a package with one maintainer. Build wins — *and* the code has zero upgrade treadmill forever. Flip the inputs (feature = TLS cert validation, build cost = weeks, bug cost = catastrophic): buy wins in one step. The framework is the same; only the numbers move.
+**3. Python app discipline with uv (as of 2026):**
+
+```toml
+# pyproject.toml — ranges express intent; uv.lock is the law
+[project]
+dependencies = ["httpx>=0.27,<1", "pydantic>=2.7,<3"]
+
+[tool.uv]
+exclude-newer = "7 days"   # uv's cooldown: resolver ignores anything published more recently
+```
+
+```bash
+uv lock                      # resolve; commit uv.lock
+uv sync --locked             # CI/prod install: fails if lock is stale, never re-resolves
+uv lock --upgrade-package httpx   # targeted upgrade, one PR, one review
+uv export --format pylock.toml -o pylock.toml   # PEP 751 interchange for pip-only consumers
+```
+
+Same shape as the JS setup: cooldown at resolve time, frozen installs in automation, upgrades as reviewable single-package diffs. Publishing side: use PyPI Trusted Publishing via `pypa/gh-action-pypi-publish`, which generates PEP 740 attestations automatically — no API token to leak.
+
+**4. The buy-vs-build arithmetic, explicit.** Feature: retry-with-jitter around HTTP calls. Library option: a retry package + 6 transitive deps, history of 2 majors in 3 years. Build option: ~40 lines with tests. Cost model: build = 3 hours once. Buy = 0 hours now + 2 major migrations × ~2h + weekly Renovate PR review amortized ~15 min/yr + nonzero compromise tail on a package with one maintainer. Build wins — *and* the code has zero upgrade treadmill forever. Flip the inputs (feature = TLS cert validation, build cost = weeks, bug cost = catastrophic): buy wins in one step. The framework is the same; only the numbers move.
 
 ## Verification / self-check
 
