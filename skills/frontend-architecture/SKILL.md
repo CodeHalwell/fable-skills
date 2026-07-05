@@ -17,13 +17,27 @@ description: Load when designing or reviewing React-era frontend architecture at
 
 Ask these questions **in order** — the first "yes" decides:
 
-1. **Does the server own the truth?** (user profile, list of orders, anything fetched) → Server-cache layer: TanStack Query / SWR on the client, or fetch in Server Components. Never copy it into a client store; you'd own invalidation, dedup, and staleness by hand — exactly what these libraries exist to solve. `useEffect`+`setState` fetching is the pathology: no dedup, no cache, race-prone, waterfall-prone.
-2. **Should a shared link or the back button reproduce it?** (filters, tab, pagination, search query, selected item) → URL state (`useSearchParams`, or `nuqs` for typed search params in Next.js). Teams habitually put filter state in `useState` and then discover users can't share filtered views — this is a rewrite, so ask early.
-3. **Is it a form?** → Form state library or uncontrolled inputs (react-hook-form's register model; or platform `<form>` + Actions in React 19). Controlled-everything forms re-render the entire form per keystroke; that's the main reason "our form is slow."
-4. **Is it needed by distant components?** → Small client store (Zustand, Jotai) *only now*. Context is fine for rarely-changing values (theme, auth identity); it's wrong for frequently-changing values because every consumer re-renders on any change.
+1. **Does the server own the truth?** (user profile, list of orders, anything fetched)
+   - → Server-cache layer: TanStack Query / SWR on the client, or fetch in Server Components.
+   - Never copy it into a client store; you'd own invalidation, dedup, and staleness by hand — exactly what these libraries exist to solve.
+   - `useEffect`+`setState` fetching is the pathology: no dedup, no cache, race-prone, waterfall-prone.
+2. **Should a shared link or the back button reproduce it?** (filters, tab, pagination, search query, selected item)
+   - → URL state (`useSearchParams`, or `nuqs` for typed search params in Next.js).
+   - Teams habitually put filter state in `useState` and then discover users can't share filtered views — this is a rewrite, so ask early.
+   - Corollary: if the back button should *not* restore it (a half-typed search box), keep the pending value local and commit to the URL on apply/debounce.
+3. **Is it a form?**
+   - → Form state library or uncontrolled inputs (react-hook-form's register model; or platform `<form>` + Actions and `useActionState` in React 19).
+   - Controlled-everything forms re-render the entire form per keystroke; that's the main reason "our form is slow."
+4. **Is it needed by distant components?**
+   - → Small client store (Zustand, Jotai) *only now*.
+   - Context is fine for rarely-changing values (theme, auth identity); it's wrong for frequently-changing values because every consumer re-renders on any change.
+   - If subscribing to a non-React external source (browser API, third-party store), use `useSyncExternalStore`, not effect+state mirroring — it's tearing-safe under concurrent rendering.
 5. **Otherwise** → `useState`/`useReducer`, colocated as close to usage as possible. Lifting state up is a cost, not a virtue — lift only as far as the lowest common ancestor.
 
-What changes the answer: needing optimistic updates or offline (consider a sync engine — see `realtime-web`); needing undo/history (reducer with explicit event log); state that's purely derivable (never store it — compute it, `useMemo` only if measurably expensive).
+What changes the answer:
+- Optimistic updates or offline requirements → consider a sync engine (see `realtime-web`).
+- Undo/history requirements → reducer with an explicit event log, not snapshot-copying components.
+- State that's purely derivable → never store it; compute it during render, `useMemo` only if measurably expensive. Storing derived state creates the synchronization bugs the effect section below describes.
 
 ## Rendering performance reasoning
 
