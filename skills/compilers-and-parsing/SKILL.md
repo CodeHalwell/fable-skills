@@ -5,147 +5,42 @@ description: Load when building anything that processes a language — parsers, 
 
 # Compilers and Parsing
 
-## Core mental model
+Most of this domain is strong-model baseline (Pratt parsing, left-recursion, occurs check, UB-enables-optimization, eval-sandbox escapes, panic-mode recovery). This sheet keeps the architecture rules, the decision ladders, and the design-it-first items that can't be retrofitted.
 
-- **A language processor is a pipeline of lossy summaries:** text → tokens → AST → resolved/typed AST → IR → output. Each stage should do ONE thing and produce a structure the next stage can consume without re-deriving. The most common architectural failure is smearing stages together (parsing that also evaluates, type checking woven into codegen) — it works for v1 and makes v2 impossible.
-- **Choose parsing technology by the grammar's nesting, not by familiarity.** Regex handles regular languages only — the moment structures nest (parentheses, blocks, nested tags), regex is *mathematically* insufficient, not merely inelegant. The ladder below is a mechanical decision.
-- **Errors are a first-class output, not an afterthought.** Real language tools spend more code on error reporting and recovery than on the happy path. Source locations must flow from the lexer through every stage — retrofitting spans onto an AST that lacks them is a full rewrite. Design the token and AST node to carry `(start, end)` offsets from day one.
-- **The AST is an API.** Every later stage, plus tests, plus tooling, consumes it. Prefer many specific node types over stringly-typed generic nodes (`BinOp(op="+")` is fine; `Node(kind="binop", children=[...])` breeds `kind`-switch bugs the type checker can't catch).
-- **Semantics before optimization.** Name resolution and type checking define what the program *means*; only then can optimization ask what may be changed without changing meaning. Optimizations are legal exactly when they preserve observable behavior *for defined programs* — which is why undefined behavior exists (see below).
+## Architecture rules (violations cost a rewrite, not a patch)
 
-## The lexing/parsing decision ladder
+- Pipeline of lossy summaries: text → tokens → AST → resolved/typed → IR → output; one job per stage. Smearing stages (parsing that evaluates, checking woven into codegen) works for v1 and makes v2 impossible — folding `2+3` inside `parse_expr` dies the day you need short-circuit semantics or error spans.
+- **Spans from day one**: tokens carry `(start, end)` offsets; AST nodes carry the union of their tokens'; retrofitting spans onto a span-less AST is a full rewrite. Store offsets, not line/col (bloats, breaks under rewriting; wrong under tabs/UTF-8) — build a sorted line-start array once and `bisect` at print time. Pick one offset unit (Python: str code points) end-to-end; mixing byte and char offsets garbles spans on non-ASCII source.
+- The AST is an API: one typed dataclass per construct, `span` mandatory; keep it syntactic — names/types go in separate tables or annotations, not in-place mutation (mutation kills re-analysis and source printing). Rewriting passes return new nodes; in-place stops composing at ~3 passes.
+- Semantics before optimization: passes are legal exactly when they preserve observable behavior *for defined programs*. For a DSL, define everything (trap overflow, error on null): you don't need the last 10% of performance and your users need determinism; every UB you copy from C is an optimizer license to delete their safety checks.
 
-| Input shape | Tool | Notes |
-|---|---|---|
-| Flat tokens, no nesting (log lines, ISO dates, simple key=value) | Regex / `str.split` | Fine. Anchor patterns; use named groups |
-| Nesting of ANY kind (parens, brackets, blocks, HTML/XML) | **Never regex.** | Balanced nesting is non-regular; the "it works on my examples" regex fails on depth or on strings containing delimiters. For HTML use an HTML parser (`html.parser`, lxml); for JSON use `json` |
-| Small grammar you control, want great errors (config lang, expression evaluator, DSL) | Hand-written lexer + recursive descent | The professional default: total control over error messages and recovery; every major production compiler (GCC, Clang, Go, Rust, TypeScript, V8) uses hand-written recursive descent |
-| Medium/large grammar, spec exists, speed of development matters | Parser generator / PEG library (Python: Lark, or `pyparsing` for small ones) | Lark's earley mode swallows ambiguity silently — prefer `parser="lalr"` to be *forced* to fix ambiguity; grammar conflicts are bugs surfaced early |
-| Someone else's real language (Python, SQL, JS) | Use the existing parser (`ast` module, `sqlglot`, tree-sitter) | Writing your own parser for a real language is a multi-month underestimate — string escapes, unicode, and edge-case grammar will eat you |
+## Decision ladders
 
-Lexer specifics that bite: maximal munch (`>=` is one token — order alternatives longest-first, or in a master regex put `>=` before `>`); keywords vs identifiers (lex as identifier, then check a keyword set — don't make keywords separate regex alternatives or `ifx` lexes as `if` + `x`); string escapes handled in the lexer, once; track line/col by counting newlines at token boundaries, or store byte offsets and compute line/col lazily from a line-start index (cheaper and simpler).
+- **Parsing tech by nesting, not familiarity**: flat tokens → regex/split; ANY nesting → never regex (mathematically non-regular, not merely inelegant); own small grammar → hand-written lexer + recursive descent (the production default: GCC, Clang, Go, Rust, TypeScript are all hand-written RD — error messages and recovery are why); medium grammar with a spec → Lark with `parser="lalr"` — earley mode swallows ambiguity silently, LALR conflicts are bugs surfaced early (prototype in earley, ship on lalr); someone else's real language → their parser (`ast`, `sqlglot`, tree-sitter); writing your own for a real language is a multi-month underestimate.
+- **Embedded vs external DSL vs data format**: programmers-as-users + host available → embedded (free tooling, host escape hatch). Non-programmers, serialized artifacts, sandboxing, or static analyzability → external. Genuinely declarative data → JSON/YAML + schema — until it grows `if`/`for`/interpolation, the Helm/Ansible template-soup failure mode; that's the signal it wanted a real parser — budget it then, not three hacks later.
+- **Tree-walk vs bytecode**: tree-walk (1–2 hours) is right when evaluation is dominated by the operations themselves; bytecode VM buys ~5–10× on arithmetic-heavy code (flat arrays, slot-indexed locals, no host recursion). Before rewriting: resolve names to (depth, slot) at parse time, compile nodes to closures (kills isinstance dispatch), cache lookups — recovers 3–5×. A tree-walker inherits the host's stack: deep user recursion crashes *you*; catch it or implement your own call stack.
+- **Untrusted expressions**: sandboxing Python `eval` with a restricted namespace is a known-lost battle (`().__class__.__mro__`/`__subclasses__` escapes defeat namespace filtering). Your own small interpreter IS the sandbox — a primary reason DSL interpreters exist. Restricted-`eval` is acceptable only for trusted input.
 
-## Expressions: ambiguity and precedence climbing
+## Mechanics with exact edges
 
-Grammar `E → E + E | E * E | (E) | num` is ambiguous — `1+2*3` has two parse trees. Resolve with precedence and associativity, implemented by **precedence climbing** (a.k.a. Pratt parsing) — one 15-line function replacing a cascade of `parse_addexpr → parse_mulexpr → ...` levels:
-
-```python
-PREC = {'+': (1, 'L'), '-': (1, 'L'), '*': (2, 'L'), '/': (2, 'L'), '**': (3, 'R')}
-
-def parse_expr(ts, min_prec=1):
-    lhs = parse_atom(ts)                      # num | '(' expr ')' | unary op
-    while ts.peek() in PREC and PREC[ts.peek()][0] >= min_prec:
-        op = ts.next()
-        prec, assoc = PREC[op]
-        rhs = parse_expr(ts, prec + 1 if assoc == 'L' else prec)
-        lhs = BinOp(op, lhs, rhs, span=(lhs.span[0], rhs.span[1]))
-    return lhs
-```
-The `prec + 1` for left-associative vs `prec` for right-associative is the entire associativity mechanism — flipping it makes `2**3**2` parse as `(2**3)**2` = 64 instead of 2⁹ = 512, and `a-b-c` as `a-(b-c)`. Test associativity explicitly with three-operand chains. Unary minus needs its own (high) precedence in `parse_atom`, and note `-2**2` is `-(2**2)` in Python — check the target language's spec, don't assume.
-
-## AST design and the visitor question
-
-- Node design: one dataclass per construct, fields typed, `span` mandatory. Keep the AST *syntactic* — resolve names and types into separate tables or later annotations rather than mutating parse output in place (mutation destroys the ability to re-run analysis or print original code).
-- **Visitor pattern tradeoffs, honestly:** Visitors (double dispatch / `visit_NodeType` methods, like Python's `ast.NodeVisitor`) win when you have many operations over a stable set of node types — add a type checker, formatter, and interpreter without touching node classes. Methods-on-nodes win when node types change often and operations are few. The *expression problem* means you can't have both open. In Python, a third option often beats both: structural `match` statements (3.10+) per operation — `match node: case BinOp('+', l, r): ...` — exhaustive, readable, no framework. Pitfall with `NodeVisitor`: forgetting `generic_visit` means children are silently skipped — a linter that "misses" nested cases has this bug.
-- Immutable-ish ASTs + rewriting passes that return new nodes (like `ast.NodeTransformer`) compose far better than in-place mutation once you have 3+ passes.
-
-## Name resolution and scoping
-
-- Core structure: a stack of scope dicts. `resolve(name)` walks outward; declaration inserts into the top. Push on block/function entry, pop on exit. Resolve *once* in a dedicated pass, annotating each identifier node with its declaration (or a (depth, index) slot) — re-resolving by name at every runtime access is both slow and semantically wrong for closures.
-- The decisions you must make consciously (each is a language design fork, and defaulting silently causes bugs): shadowing allowed? use-before-declaration (hoisting)? does a block create a scope or only functions (JS `var` vs `let`)? closure capture by reference or by value (the Python `for i ... lambda: i` trap is capture-by-reference of a loop variable)?
-- Closures need the resolver to mark captured variables — the interpreter must heap-allocate ("box") captured locals or capture the environment; stack-frame locals that die at return can't be captured. Missing this yields closures that see garbage or the *last* loop value.
-- Forward references (mutual recursion between functions/types) require two passes: declare all top-level names first, then resolve bodies. Single-pass resolution rejects legal mutually-recursive programs.
-
-## Type checking as constraint solving
-
-- Simple explicit-types checking is a bottom-up AST walk: compute each expression's type, check against expectations at usage sites. Report errors with BOTH the offending span and the expected-vs-actual types; on error, assign a poison type `Error` that unifies with everything and is never re-reported — this single trick prevents the 50-error cascade from one typo.
-- Type *inference* is constraint generation + unification: walk the AST emitting equations (`typeof(f) = typeof(arg) → T_fresh`), then solve by unification (recursively match type constructors, bind type variables, with the **occurs check** — `T = List[T]` must fail or you infer infinite types and loop). This is Hindley-Milner's core; you can implement a useful subset in ~150 lines.
-- Practical calibration: for a DSL, monomorphic types + explicit annotations at function boundaries gives 90% of the value at 10% of the complexity of full inference. Add inference only for locals (like modern Java/C++ `var`/`auto`).
-- Subtyping breaks pure unification (equations become one-directional constraints); if the DSL needs subtyping, use bidirectional type checking (check-mode vs infer-mode functions) instead of trying to bolt subsumption onto unification.
-
-## IR and the optimization catalog
-
-Optimize on an IR (three-address code, SSA, or even a simplified AST), not on source or final output. The core catalog and what *invalidates* each:
-
-- **Constant folding** (`2*3` → `6`): invalidated by side-effectful or trapping operations (division by zero must still trap — folding `1/0` to a poison constant changes behavior), and by floating-point subtleties (folding must use the target's FP semantics; `0.1+0.2` folded at build time must equal runtime).
-- **Dead code elimination:** removing a computation is legal only if it's *pure*; a "dead" call may write, throw, or not terminate. DCE therefore requires an effects analysis, however crude (a `has_side_effects(node)` conservative predicate). Also: code after `return` vs code that's dynamically unreachable — the first is syntactic, the second needs constant-propagation first (the passes feed each other; run to fixpoint).
-- **Inlining:** the enabler optimization (exposes constants and DCE opportunities across call boundaries). Invalidated by recursion (bound the depth), and it changes observable behavior if the language exposes call stacks (`traceback`) or relies on function identity. Watch code-size blowup: inline small/hot, not everything.
-- **Common subexpression elimination:** requires purity AND that no store between the two occurrences may alias the operands — aliasing analysis is why CSE is hard in languages with pointers and trivial in pure expression DSLs.
-- The pass-ordering reality: folding exposes DCE, inlining exposes folding — production compilers run pass pipelines repeatedly. For a small compiler, a loop of `fold; propagate; dce` until no change is simple and effective.
-
-**Why undefined behavior enables optimization:** UB is a *contract*: the compiler may assume UB never happens, so every program state that would trigger it can be assumed unreachable, and facts can be propagated backward from that assumption. Signed-overflow UB lets C compilers treat `i + 1 > i` as always-true and keep loop variables in registers with simple induction analysis; null-deref UB lets a dereference *prove* the pointer non-null and delete subsequent null checks (the famous kernel-bug pattern: `p->x; if (!p) return;` — the check is deleted). Design consequence for YOUR language: every behavior you define costs optimization freedom, every behavior you leave undefined costs user sanity. For a DSL, define everything (trap on overflow, error on null) — you don't need the last 10% of performance, and your users need determinism.
-
-## Interpreters: tree-walk vs bytecode, performance reality
-
-- **Tree-walk** (recursive `eval(node, env)`): 1–2 hours to write, perfect for DSLs, config evaluation, and anything where evaluation time is dominated by the operations themselves (I/O, numpy calls). Overhead: ~10–100× slower than CPython-level bytecode for tight loops, dominated by per-node dispatch and env dict lookups.
-- **Bytecode VM** (compile AST → flat instruction list, loop-and-switch dispatch): ~5–10× faster than tree-walk for arithmetic-heavy code; required if user programs contain hot loops. The wins come from: flat arrays instead of pointer-chasing, slot-indexed locals instead of dict lookups (do the slot assignment in the resolver pass), and no Python-level recursion.
-- Cheap tree-walk speedups before jumping to bytecode: resolve names to (depth, slot) at parse time; closure-compile nodes to Python closures (`compile_node` returns a lambda — removes the dispatch `isinstance` chain); cache method lookups. These can recover 3–5×.
-- Recursion limit: a tree-walk interpreter inherits the host's stack — deep user recursion crashes the *interpreter*. Either implement your own call stack (bytecode VMs get this for free) or set limits and produce a proper "stack overflow" error for the user.
-- Don't hand-roll if the host has it: for embedded expressions, compiling to Python `ast` and calling `compile()`/`eval` with a restricted namespace outperforms any interpreter you'll write — but ONLY for trusted input; sandboxing Python `eval` against adversaries is a known-lost battle (dunder escapes like `().__class__.__mro__` defeat namespace filtering). For untrusted input, your own small interpreter IS the sandbox — that's a primary reason DSL interpreters exist.
-
-## Source locations and error messages — design it first
-
-- Tokens carry `(start_offset, end_offset)`; AST nodes carry the union span of their tokens; every semantic error carries the span of the *most specific* relevant node plus, when applicable, a secondary span ("expected int because of the declaration here").
-- Store offsets, not line/col; build a sorted array of line-start offsets once and `bisect` to render line/col only when printing an error. Storing line/col per token bloats and breaks under any source rewriting.
-- Parser error recovery so users get more than one error per run: on failure, report, then skip tokens to a synchronization point (statement start keywords, `;`, `}`) and resume. Without recovery, a missing brace on line 3 makes lines 4–500 unparseable and users fix errors one compile at a time.
-- The quality bar for messages: point at the span, say what was expected AND what was found, and when the cause is remote, show it ("unclosed '(' opened at 4:12"). "Syntax error" alone is a bug report generator.
-
-## Failure modes & pitfalls (the recurring ones)
-
-- **Left recursion in recursive descent.** Grammar rule `E → E '+' T` transcribed literally into `parse_E` calling `parse_E` first = infinite recursion on the first token. Correction: iteration (`parse_T`, then a while-loop over `'+' T`) or precedence climbing. This is THE classic recursive-descent bug; any grammar taken from a spec (specs favor left recursion for left associativity) must be transformed before hand-implementation.
-- **Regex lexer alternation order.** `TOKEN_RE = '|'.join([...])` with `>` listed before `>=` lexes `>=` as two tokens; with `if` before identifier, `ifx` becomes `if`, `x`. Order: longest-fixed-strings first, keywords via post-check on the identifier rule, and end the master regex with a catch-all error rule so illegal characters produce a positioned error instead of silently vanishing (unmatched input with `re.finditer` just gets skipped — the silent-skip is the bug).
-- **Consuming vs peeking confusion.** Every parser bug cluster traces to a function that sometimes consumes the lookahead and sometimes doesn't. Fix the contract globally: every `parse_X` consumes exactly the tokens of X, nothing more; `expect(tok)` consumes-or-errors; `peek()` never consumes. Enforce in code review of your own output.
-- **Evaluating during parsing.** Folding `2+3` inside `parse_expr` works until short-circuit semantics, variables, or error spans are needed. Parse to AST; evaluate/fold in separate passes — the two-hour "shortcut" costs the whole architecture.
-- **Environments shared by reference in interpreters.** Implementing function calls as `eval(body, env)` with the *caller's* env gives dynamic scoping (usually wrong); with the *definition-time* env unclosed, closures break. Correct: `Env(parent=fn.defining_env)` per call, parameters bound in the new frame.
-- **`ast.NodeTransformer` returning `None`** silently deletes the node; forgetting to return the node from `visit_X` after modifying it does the same. Always `return node` (or the replacement).
-- **String offsets vs unicode.** Mixing byte offsets (from a bytes-oriented lexer) with str indexing produces garbled spans on non-ASCII source. Pick one unit (Python: str code-point offsets) end-to-end.
-- **Precedence table drift.** Adding an operator to the lexer but not the precedence table makes it parse as an atom boundary — expression silently truncates. Keep one table that drives both lexer symbol list and parser precedence.
-- **Grammar tested only on positives.** A parser that accepts everything passes every positive test. Half the test suite must be *rejection* tests asserting both the refusal and the error position.
-
-## Worked micro-example: 30-line lexer with spans and error handling
-
-```python
-import re
-TOKEN_SPEC = [                      # order matters: longest / most specific first
-    ('NUM',   r'\d+(\.\d+)?'),
-    ('ID',    r'[A-Za-z_]\w*'),
-    ('OP',    r'\*\*|[+\-*/()]'),   # '**' before '*'
-    ('SKIP',  r'[ \t]+'),
-    ('NL',    r'\n'),
-    ('ERR',   r'.'),                # catch-all: never silently drop input
-]
-MASTER = re.compile('|'.join(f'(?P<{n}>{p})' for n, p in TOKEN_SPEC))
-KEYWORDS = {'if', 'else', 'while'}
-
-def lex(src):
-    line_starts = [0]
-    for m in MASTER.finditer(src):
-        kind, text, start = m.lastgroup, m.group(), m.start()
-        if kind == 'NL':
-            line_starts.append(m.end())
-        elif kind == 'SKIP':
-            continue
-        elif kind == 'ERR':
-            raise SyntaxError(f'illegal character {text!r} at offset {start}')
-        else:
-            if kind == 'ID' and text in KEYWORDS:
-                kind = text.upper()          # keyword post-check, not regex alternatives
-            yield (kind, text, start, m.end())
-    yield ('EOF', '', len(src), len(src))    # explicit EOF token simplifies every parser
-```
-Three deliberate choices to copy: the ERR catch-all (positioned errors, no silent skips), keyword post-check, and the explicit EOF token — parsers without an EOF token special-case "end of input" in every function and one of those cases is always wrong.
-
-## DSLs: when embedded beats external
-
-- **Embedded DSL** (a Python API/fluent builder/operator overloading — like SQLAlchemy, pytest fixtures, Keras): free lexer/parser/editor-support/debugger, host escape hatch for anything unanticipated. Choose when users are programmers and the host language is available in their context.
-- **External DSL** (own syntax + parser): choose when users are NOT programmers (analysts, designers, ops), when the artifact must be serialized/versioned/exchanged as data, when you need syntax the host can't express, or when execution must be sandboxed/limited (see eval above) or statically analyzable (termination guarantees, cost bounds — impossible for host-language snippets).
-- The middle path that wins surprisingly often: define the language as a **data structure** (JSON/YAML/TOML with a schema, or Python dicts) — zero parser, trivially serializable, and validation via `jsonschema`/pydantic. Its ceiling: expressions and abstraction (variables, conditionals in YAML → the Helm/Ansible template-soup failure mode). When your data format grows `if`/`for`/string-interpolation, that's the signal it wanted to be a real DSL with a real parser — budget the recursive descent parser then, not three hacks later.
+- Precedence climbing: `rhs = parse_expr(prec + 1 if left_assoc else prec)` — that one token is the entire associativity mechanism; flipping it makes `2**3**2` = 64 instead of 512. Unary minus gets its own precedence in `parse_atom`, and `-2**2` is `-(2**2)` in Python — check the target language's spec. Test associativity with three-operand chains explicitly.
+- Left recursion: `E → E '+' T` transcribed literally = infinite recursion on the first token; specs *favor* left recursion for left associativity, so every spec grammar needs the loop transform (`parse_T` + while) or Pratt before hand-implementation.
+- Lexer: master regex ordered longest-first (`**` before `*`, `>=` before `>`); keywords by post-check on the identifier rule (separate keyword alternatives lex `ifx` as `if`+`x`); an `ERR` catch-all rule as the last alternative — `re.finditer` silently *skips* unmatched characters otherwise; emit an explicit EOF token (parsers without one special-case end-of-input in every function and one case is always wrong).
+- Token-consumption contract, enforced globally: `parse_X` consumes exactly X; `expect(tok)` consumes-or-errors; `peek()` never consumes. Every parser bug cluster traces to a function that sometimes consumes lookahead and sometimes doesn't.
+- Type checking: poison `Error` type that unifies with everything and never re-reports — the single trick preventing 50-error cascades. Inference = constraints + unification with the occurs check (`T = List[T]` must fail). Subtyping breaks pure unification (equations become directional) → bidirectional checking, not bolted-on subsumption. Calibration: monomorphic + annotations at function boundaries = 90% of the value at 10% of the complexity; add inference for locals only.
+- Resolution: resolve once in a dedicated pass, annotate identifiers with (depth, slot); conscious forks — shadowing, hoisting, block vs function scope, capture by reference vs value (the `for i ... lambda: i` trap is by-reference capture of one loop binding; fresh binding per iteration is the fix). Closures need captured locals boxed/heap-allocated. Mutual recursion needs two passes: declare all top-level names, then resolve bodies.
+- Optimization passes: folding must not change trap behavior (`1/0` stays) and must use target FP semantics; DCE needs an effects predicate, however crude — a "dead" call may write, throw, or not terminate; CSE needs purity AND no aliasing store between occurrences; passes feed each other — loop `fold; propagate; dce` to fixpoint. `ast.NodeTransformer` returning `None` silently deletes the node; forgetting `generic_visit` silently skips children — the linter that "misses nested cases" has this bug.
+- Parser error recovery: report, skip to a synchronization point (statement keywords, `;`, `}`), resume — without it a missing brace on line 3 makes lines 4–500 unparseable and users fix one error per compile. Message bar: span + expected + found + remote cause ("unclosed '(' opened at 4:12").
 
 ## Verification / self-check
 
-- Round-trip test: parse → pretty-print → parse again; the two ASTs must be equal. Catches precedence and associativity bugs mechanically.
-- Differential test expressions against the host: for arithmetic grammars, compare your evaluator against Python `eval` on 1000 random well-formed expressions (generate from the grammar). Disagreement = precedence/associativity/semantics bug.
-- Adversarial inputs, always: empty input, a lone operator, unclosed delimiters, 10⁴-deep nesting (recursion check — parsers should error gracefully, not segfault), strings containing your delimiters and escapes, unicode identifiers if permitted.
-- For each optimization pass: run the test suite with the pass ON and OFF and diff program *outputs* — any difference is a soundness bug in the pass (or exposed UB in the test).
-- Error-message audit: for five representative typos, does the message include a correct span and an actionable expectation? Line numbers off by one = the lexer counts newlines wrong at token boundaries (usually the newline-inside-string case).
-- Scoping audit: test shadowing, use-before-decl, closure-over-loop-variable, and mutual recursion explicitly — these four cases catch nearly all resolver bugs.
+- Round-trip: parse → pretty-print → parse; ASTs must be equal — catches precedence/associativity mechanically.
+- Differential: your evaluator vs host `eval` on 1000 grammar-generated random expressions; optimizer soundness = full test suite with each pass ON and OFF, diffing program outputs — any difference is an unsound pass.
+- Adversarial always: empty input, lone operator, unclosed delimiters, 10⁴-deep nesting (graceful error, not segfault), strings containing your delimiters, `-2**2`-class cases, `>=`-vs-`>`+`=`, `ifx`, unicode identifiers.
+- Half the test suite must be *rejection* tests asserting both refusal and error position — a parser that accepts everything passes every positive test.
+- Scoping audit: shadowing, use-before-decl, closure-over-loop-variable, mutual recursion — four cases catch nearly all resolver bugs. Error-message audit: five representative typos → correct span and actionable expectation; off-by-one line numbers = newline counting at token boundaries (usually the newline-inside-string case).
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 14 claims: 14 baseline (cut/compressed), 0 partial, 0 delta.
+- Opus 4.8 nailed everything: Pratt lbp/rbp associativity with -2**2, left-recursion fixes, maximal munch/keyword post-check/finditer silent-skip, poison types and the occurs check, bidirectional typing for subtyping, hand-written RD in GCC/Clang/Go/Rust/TS, 1/0-folding and DCE purity traps, UB with the CVE-2009-1897 null-check deletion, tree-walk vs bytecode with matching speedup numbers, eval-sandbox escape payloads, offsets + line-start bisect, panic-mode recovery, earley-vs-lalr, round-trip and differential testing, the loop-variable capture trap, two-pass resolution, and the Helm/Ansible config-language failure mode.
+- No substantive gaps; retained value is the design-it-first items (spans, stage separation, consumption contract), the decision ladders, and rejection-test discipline.
