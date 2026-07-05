@@ -154,6 +154,25 @@ dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1"]
 ```
 Workflow: `uv add httpx` (updates pyproject + `uv.lock`), `uv sync` (reproduce the env), `uv run pytest` (never hand-activate venvs in scripts/CI), `uv export -o pylock.toml` when another tool needs the PEP 751 standard format. Single-file scripts: PEP 723 inline metadata + `uv run script.py`.
 
+**The boundary pattern: pydantic at the edge, dataclass inside:**
+```python
+from dataclasses import dataclass
+from pydantic import BaseModel, EmailStr
+
+class SignupRequest(BaseModel):          # EDGE: untrusted JSON crosses here
+    email: EmailStr
+    referrer: str | None = None
+
+@dataclass(slots=True, frozen=True)      # INTERIOR: constructed only from validated parts
+class Account:
+    email: str
+    tier: str
+
+def create_account(req: SignupRequest) -> Account:   # the one conversion point
+    return Account(email=req.email, tier="free" if req.referrer is None else "trial")
+# Everything downstream takes Account and never re-validates. One parse per datum per entry.
+```
+
 ## Verification and stopping rule
 
 Before presenting Python advice or code:

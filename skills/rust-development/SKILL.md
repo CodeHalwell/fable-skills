@@ -149,6 +149,34 @@ impl Sim {
 }
 ```
 
+**Workspace + feature layout that survives growth:**
+```toml
+# Cargo.toml (root)
+[workspace]
+members = ["crates/core", "crates/store", "crates/api", "crates/cli"]
+resolver = "3"                       # edition-2024 default; declare it explicitly at the root
+
+[workspace.dependencies]             # single source of version truth
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+thiserror = "2"
+anyhow = "1"
+
+# crates/store/Cargo.toml
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+core = { path = "../core" }
+
+[features]
+default = []                         # libraries: minimal defaults
+postgres = ["dep:sqlx"]              # additive opt-in via dep: syntax
+[dependencies.sqlx]
+version = "0.8"
+optional = true
+```
+Dependency direction: `cli`/`api` → `store` → `core`; traits live in `core` so higher crates can implement them (coherence). CI runs `--no-default-features` and `--all-features` jobs to catch feature-unification masking.
+
 ## Verification and stopping rule
 
 Before presenting Rust code or advice:

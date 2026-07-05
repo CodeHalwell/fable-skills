@@ -55,6 +55,12 @@ Agents multiply everything: one user request = N model calls, M tool calls, loop
 - **Tool error vs. tool-error-handled distinction**: log whether the model acknowledged a failed tool result or narrated past it — the latter is the dangerous one, and it's detectable (tool span status=error followed by a confident final answer with no retry).
 - **Trajectory outcome labels**: completed / gave-up / budget-cutoff / user-abandoned. The cutoff and gave-up rates are the agent's real reliability metrics; final-answer judge scores alone miss the requests that never produced an answer.
 
+## Session-level and structured-output signals
+
+Two commonly missed telemetry layers:
+- **Session metrics** (multi-turn products): turns-to-resolution, topic-switch rate, and the "clarification spiral" (model asks a question, user answers, model asks again — 3+ cycles = the model isn't extracting intent; detectable from turn-role patterns alone, no judge needed). Per-*message* quality can look fine while sessions are failing; the session is the user's actual unit of experience.
+- **Structured-output health** (JSON/tool-schema outputs): parse-failure rate, schema-validation failure rate, *and* retry-to-valid rate (how often the repair loop saved it — a rising repair rate is a leading indicator that a prompt or model change degraded format adherence before hard failures appear). Log the pre-repair raw output on failures; you can't fix a format bug you never captured.
+
 ## Drift and regression detection
 
 - **Input drift**: monitor input length distribution, language mix, topic cluster shares (embed + cluster daily, compare to baseline), and rate of out-of-scope requests. Input drift explains quality drops that no deploy caused — your users changed, or a new integration started sending garbage.

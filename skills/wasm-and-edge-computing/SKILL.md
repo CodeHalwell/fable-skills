@@ -22,6 +22,19 @@ Ask in order:
 4. **Do you need one artifact across browser/server/edge/embedded?** Portable business logic, shared validation, cross-platform SDK cores → wasm as the distribution format.
 If none of the four: you don't need wasm. "We rewrote our React app's utils in Rust" is a negative-ROI story with rare exceptions — say so.
 
+Quick placement/tech table for common workloads:
+
+| Workload | Verdict | Why |
+|---|---|---|
+| Image/video/audio transcode in browser | wasm (main-thread-off, in a Worker) | Sustained bytes-in-linear-memory compute; existing C libs |
+| Form validation, date math, app state | JS | Boundary tax > compute; JIT handles it |
+| SQLite/DuckDB in the browser | wasm (official builds exist) | Proven engine, batch boundary via SQL strings |
+| Per-tenant user scripts in a SaaS backend | wasm + Wasmtime fuel/epoch limits | Sandbox is the requirement, speed is incidental |
+| JWT verify / AB assignment / redirects | Edge (isolate platform), plain JS | Local-state decision, latency-sensitive, tiny CPU |
+| Checkout transaction | Regional service | Multi-statement consistency near the primary DB |
+| Markdown render, syntax highlight | JS first; wasm only if profiled hot | Usually string-boundary-dominated |
+| Crypto beyond WebCrypto primitives | wasm | Constant-time code survives; JS JIT timing is untrustworthy |
+
 ## The toolchain map (verified as of mid-2026)
 
 - **Rust**: the mature path and dominant wasm source language. Browser: `wasm32-unknown-unknown` + `wasm-bindgen` (v0.2.x line, actively maintained) + `wasm-pack`. Server/WASI: `wasm32-wasip1` and `wasm32-wasip2` targets — wasip2 has been tier-2 since Rust 1.82 and builds **components** directly via `cargo build --target wasm32-wasip2`; `cargo-component` is being superseded by that direct path, with `wit-bindgen` for custom interfaces.
@@ -30,6 +43,15 @@ If none of the four: you don't need wasm. "We rewrote our React app's utils in R
 - **JS/TS *inside* wasm**: possible via engines like StarlingMonkey/porffor-class tooling and `jco` for componentizing — used when a wasm host must run JS, not for speed.
 - **Standards state (as of mid-2026)**: **WASI 0.2** (component model-based) is the stable baseline with an ecosystem around it; **WASI 0.3.0 shipped June 2026**, adding native async to the component model (`async func`, `stream<T>`, `future<T>`; `wasi:io` absorbed into the canonical ABI), supported in Wasmtime 43+ and jco — new server-side designs should plan for 0.3-style async but can ship on 0.2 today. The old non-component `wasip1` remains what much deployed tooling emits; know which world you're in, because "WASI support" claims differ by a whole ABI. Browser-side, wasm GC and threads/SIMD are broadly available in modern engines; the component model is a *server-side* story so far.
 - **Runtimes**: Wasmtime (reference-quality, component-model-first), WasmEdge/Wasmer (alternatives), workerd (Cloudflare's runtime, V8-based — runs wasm *via* V8).
+- **What the component model buys you** (and when to care): typed, language-neutral interfaces (WIT) between separately compiled modules — a Rust parser composed with a Go policy engine composed with a JS host, no hand-written FFI glue or shared linear memory hacks. Care when building plugin ecosystems or polyglot pipelines; don't care (yet) for a single browser module, where `wasm-bindgen`'s bespoke glue remains the practical path.
+
+## Browser delivery and memory mechanics
+
+- **Ship it like the asset it is**: serve with `application/wasm` so `WebAssembly.instantiateStreaming` works (compilation overlaps download); long-cache with content hashing; run `wasm-opt -O` (Binaryen) on release builds — size reductions of 10–30% are routine on unoptimized output. For Rust, `panic = "abort"` and avoiding `format!` in hot paths keep the panic/formatting machinery (often 100+ KB) out of the binary; `twiggy`/`wasm-objdump` tell you what's actually inside when the size surprises you.
+- **Load off the critical path**: a 2 MB wasm module on the first-paint path erases years of frontend performance work. Lazy-instantiate on first use of the feature; keep a JS fallback or a loading state for the gap.
+- **Linear memory grows and never shrinks** (for practical purposes): a spike that grows memory to 500 MB keeps the `WebAssembly.Memory` there for the instance's lifetime. Corrections: process large inputs in chunks; recycle a pre-sized scratch buffer instead of per-call allocation; for worst cases, tear down and re-instantiate the module to release memory.
+- **Threads and SIMD**: wasm SIMD is broadly available and often a free 2–4× on the kernels wasm is good at (enable the target feature; verify the autovectorizer used it). Threads require `SharedArrayBuffer`, which requires cross-origin isolation headers (`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp`) — a *deployment* decision that breaks third-party embeds, so decide it before architecting around multithreaded wasm, not after.
+- Run heavy wasm in a **Web Worker** regardless of threads: even fast compute janks the main thread, and the worker boundary forces the batch-shaped message-passing interface you wanted anyway.
 
 ## Edge platform landscape and architecture judgment
 
@@ -74,6 +96,9 @@ SaaS resizes/re-encodes user images (p50 800 KB) in a regional Node service; tea
 - **Global in-memory state in a Worker as if it were a server**: isolates are per-POP, many-instanced, and evicted at will — an in-memory cache "works" in dev (one instance) and is incoherent in prod. Correction: in-memory only as best-effort per-isolate cache; correctness state goes to KV/DO/D1 per the consistency table.
 - **Blowing CPU budget on payload transforms**: streaming a response through `JSON.parse`/`JSON.stringify` of MB-scale bodies on a 10 ms budget. Correction: stream bytes untouched when possible (`resp.body` passthrough); transform at origin; upgrade tier consciously if transform-at-edge is genuinely required.
 - **Local-dev overconfidence**: `wrangler dev`-class simulators (workerd locally) are good but not identical — production propagation delays (KV), colo-dependent behavior, and real limits don't reproduce locally. Correction: staging on the real platform; test eventual-consistency windows explicitly; load-test CPU limits with production-shaped payloads, because local machines won't enforce the budget the platform will.
+- **One Durable Object as a global singleton** ("the rate limiter object"): a single-placement actor serializing *all* traffic is a worldwide bottleneck with one region's latency. Correction: shard by natural key (per-user, per-tenant, per-resource); a DO per key is the design, a DO for everything is an accident.
+- **Node-API assumptions in edge code**: isolates are not Node — no `fs`, no raw TCP (platform-specific escape hatches aside), limited `Buffer`/crypto shims, WebCrypto instead of `node:crypto` idioms. Libraries that "just need a small polyfill" often drag in half of Node. Correction: prefer WinterCG-style web-standard APIs (fetch, WebCrypto, streams); vet dependencies for edge-runtime support before building on them.
+- **Forgetting egress/architecture asymmetry in cost math**: edge invocations are cheap; the origin fetches they trigger are not free, and neither is DB connection churn from thousands of POPs. Correction: connection pooling gateways for DB access from edge; count origin round trips per edge request in review — the target is ≤1.
 
 ## Worked micro-example: batch-oriented JS↔wasm boundary (Rust)
 

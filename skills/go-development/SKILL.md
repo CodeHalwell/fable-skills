@@ -154,6 +154,38 @@ func TestParse(t *testing.T) {
 }
 ```
 
+**HTTP server with the timeouts that don't default (and a shutdown path):**
+```go
+func main() {
+    srv := &http.Server{
+        Addr:              ":8080",
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second,   // zero value = slowloris-vulnerable
+        ReadTimeout:       10 * time.Second,
+        WriteTimeout:      30 * time.Second,
+        IdleTimeout:       120 * time.Second, // keep-alive reaping
+    }
+    go func() {
+        if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf("serve: %v", err)
+        }
+    }()
+
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+    defer stop()
+    <-ctx.Done()                              // block until shutdown signal
+
+    shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(shutCtx); err != nil { // drains in-flight requests
+        log.Printf("forced shutdown: %v", err)
+    }
+}
+// Same rule client-side: never use http.DefaultClient in production —
+// it has NO timeout; construct &http.Client{Timeout: 10 * time.Second} or use
+// per-request contexts with http.NewRequestWithContext.
+```
+
 ## Verification and stopping rule
 
 Before presenting Go code or advice:

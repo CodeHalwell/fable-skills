@@ -50,6 +50,10 @@ description: Loads expert TypeScript judgment for designing types, debugging typ
 - `noPropertyAccessFromIndexSignature` — makes index-signature access visibly dynamic (`obj["key"]`).
 - Not worth debating: `noImplicitReturns`, `noFallthroughCasesInSwitch` — cheap, enable and move on.
 
+**"Overloads or conditional types?"** Both express input-dependent return types. Choose overloads when: there are ≤4 distinct shapes, the mapping is arbitrary (no structural rule connects input to output), or call-site error quality matters most (overload errors list candidate signatures; conditional-type errors dump the unevaluated conditional). Choose a conditional type when the mapping *is* a rule (`T extends string ? A : B` applied uniformly) or the input space is open-ended. Hybrid escape hatch: implement with a single permissive signature, expose precise overloads — the implementation signature is invisible to callers and checked only loosely, so keep it honest.
+
+**"How strict should this codebase be?"** Greenfield: `strict` + `noUncheckedIndexedAccess` + `verbatimModuleSyntax` + `exactOptionalPropertyTypes` on day one — each is nearly free at line 0 and expensive at line 100k. Legacy migration: enable `strict` sub-flags one at a time in order of payoff/pain: `strictNullChecks` first (most bugs found), then `noImplicitAny`, then the rest; use `// @ts-expect-error` (never `@ts-ignore` — expect-error self-cleans by erroring when the underlying error is fixed) as the migration marker and burn the count down in CI.
+
 ## How an expert thinks through it: "my narrowing disappeared"
 
 Scenario: `if (config.mode === 'batch') { items.forEach(i => process(config.batchSize, i)) }` — error inside the callback: `config.batchSize` is possibly `undefined`.
@@ -145,6 +149,17 @@ declare const a: Actual; const _check: Expected = a;
 // 3. Unit-test types in CI:
 import { expectTypeOf } from 'expect-type';
 expectTypeOf(parseRoute('/users/:id')).toEqualTypeOf<{ id: string }>();
+```
+
+**Module augmentation done right (the checklist in code):**
+```ts
+// file: src/types/express.d.ts — included via tsconfig "include"
+import 'express';                        // 1. top-level import => this is a MODULE, not a script
+declare module 'express-serve-static-core' { // 2. augment the package that DECLARES Request
+  interface Request {
+    user?: { id: string; roles: string[] }; // 3. optional: middleware may not have run yet
+  }
+}
 ```
 
 ## Verification and stopping rule

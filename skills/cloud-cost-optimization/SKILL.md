@@ -21,6 +21,15 @@ description: Load when analyzing or reducing cloud spend — bill investigation,
 4. **Commitment discounts** — see next section. Financial engineering, zero code, but do it *after* rungs 1–3 or you'll commit to waste.
 5. **Architectural change:** NAT → gateway endpoints, straight-S3 serving → CloudFront, chatty cross-AZ services → zone-aware routing, per-request FaaS → containers at sustained load (or the reverse at low duty cycle), Snowflake/BigQuery query hygiene, log-ingestion diets. Highest ceiling, but cost it like any project — engineering time is also money, and a $200/mo saving rarely justifies a quarter of platform work.
 
+## Tagging and allocation — the unglamorous prerequisite
+
+- Minimum viable schema, enforced not suggested: `owner` (team, not person), `service`, `env`, `cost-center` — four keys, controlled vocabularies. More keys at the start means more drift; add later from need.
+- Enforcement is structural: tag policies + SCPs on AWS (deny `RunInstances` without required tags), Azure Policy `deny`/`modify` effects (inherit tags from resource group). A wiki standard without a deny rule achieves ~60% coverage decaying toward 40%.
+- Activate cost-allocation tags in the billing console the same week (AWS tags don't appear in Cost Explorer until activated — a months-of-lost-data classic).
+- Shared costs (NAT, support plans, observability, clusters) need an explicit split rule — proportional to direct spend is defensible and simple; per-request attribution is rarely worth its plumbing. What matters is that the rule is written down so teams stop litigating it.
+- Kubernetes/multi-tenant platforms break resource-level allocation: adopt namespace/label-based cost tooling (OpenCost/Kubecost-style) and treat *requests*, not usage, as the allocated quantity — teams pay for what they reserve, which creates the right-sizing incentive exactly where the knowledge lives.
+- The output that makes it real: a monthly per-team, per-service unit-cost report that a team lead can act on without asking FinOps to interpret it. Allocation nobody reads is compliance, not FinOps.
+
 ## Commitment strategy (verified current as of 2026)
 
 - **Instruments (AWS):** Compute Savings Plans (up to ~66% off, applies across EC2 families/regions/Fargate/Lambda), EC2 Instance Savings Plans (up to ~72%, locked to family+region), Standard/Convertible RIs (RDS, ElastiCache, OpenSearch, Redshift still need RIs — Savings Plans don't cover them). Azure: reservations (VMs, SQL, Cosmos) + Azure savings plan for compute + Hybrid Benefit (bring your Windows/SQL licenses — often the largest single Azure discount). GCP: committed use discounts; sustained-use discounts apply automatically.
@@ -41,6 +50,20 @@ description: Load when analyzing or reducing cloud spend — bill investigation,
 - Intelligent-Tiering (AWS) as default for unknown patterns; it caps the downside of nobody-ever-audits-this.
 - Snapshots: orphaned EBS/disk snapshot chains from deleted volumes are the classic ratchet — automate retention (Data Lifecycle Manager / Azure Backup policies).
 - Data transfer checklist for any bill review: NAT gateway processing (add S3/DynamoDB gateway endpoints — free — and interface endpoints where volume justifies), cross-AZ chatter (co-locate chatty pairs, topology-aware routing, single-AZ for dev), internet egress (CloudFront/CDN in front — origin-to-CDN is free on AWS), cross-region replication you forgot about, and per-GB log ingestion (CloudWatch $0.50/GB, Log Analytics similar order — sample debug logs, set retention; "never expire" is the default and it is a trap).
+
+## Guardrails and anomaly detection — savings that persist
+
+- **Budgets with actions, not just emails:** per-team/per-account budget alerts at 80/100/forecast-120%, and for sandboxes, automated response (notify → freeze new resource creation) — a human reading a budget email three weeks later is not a control.
+- **Anomaly detection on by default** (AWS Cost Anomaly Detection, Azure Cost Management anomaly alerts): they catch the recursive Lambda loop and the DEBUG logger the day it ships, not at month-end. Route alerts to the owning team's channel via the tag, not to a central FinOps inbox.
+- **Deny the expensive mistakes structurally:** SCP/Azure Policy blocking GPU/metal SKUs and exotic regions in general-purpose accounts, quota caps on sandbox accounts, TTL-based auto-teardown for ephemeral environments (tag `expiry` + a reaper job).
+- **Weekly cost review cadence, 15 minutes:** top-5 movers vs last week, anomalies triaged, one action item. Monthly deep reviews die; a short weekly loop with the delta view survives.
+- Treat the monthly bill diff like a code diff: every unexplained line item gets an owner or a ticket. "Unexplained but small" compounds into "unexplainable and large."
+
+## Kubernetes and container-platform cost specifics
+
+- The waste hierarchy in clusters: (1) requests set far above usage (the dominant term — right-size requests before anything), (2) poor bin-packing from oversized/mismatched node shapes, (3) idle system overhead per node (fewer, larger nodes amortize daemonsets), (4) missing autoscaler + spot mix on stateless pools.
+- Right-size requests from VPA/actual-usage percentiles, then let cluster autoscaler/Karpenter consolidate nodes; doing node optimization before request optimization compresses garbage efficiently.
+- Charge teams by *requests × node unit price*, publish it per namespace — the only mechanism that makes request inflation self-correcting.
 
 ## LLM / GPU cost (fast-moving — researched mid-2026)
 
@@ -72,6 +95,18 @@ Running total ≈ $21.5k (30% hit) *without commitments yet*. Now, on the cleane
 - **Spot without interruption handling:** works in the pilot, then a capacity reclaim wave kills 60% of the fleet in one AZ-pool and the queue backs up into an SLA breach. Diversify pools + on-demand floor + drain hooks, or don't use spot.
 - **GPU reservations sized to peak research demand** → 30% utilization forever. Reserve the floor, burst to on-demand/neocloud, idle-kill notebooks.
 - **Optimizing the interesting 5%:** a week of Lambda memory-tuning saving $80/mo while 14 zombie environments burn $6k. Always rank by absolute dollars first; the Pareto in cloud bills is brutal and boring.
+- **Unit-cost metric gamed by the denominator:** switching from cost-per-customer to cost-per-request mid-quarter to make a trend look good. Fix the denominator per service in writing; change it only with a restated history.
+- **Auto-scaling as a cost strategy without a floor audit:** the fleet scales beautifully from a minimum of 20 instances that nobody ever justified. Scaling *minimums* are commitments in disguise — review them like reservations.
+- **Cross-charging shared platforms at 100%** → product teams build shadow infrastructure to dodge the allocation, costing more in total. Subsidize platforms partially; the goal of allocation is behavior, not accounting purity.
+- **Ignoring the free-tier cliff in forecasts:** the PoC that cost $0 on free tiers linearly forecast to production is off by the entire bill. Re-price at production volumes explicitly.
+
+## Worked micro-example — commitment sizing from the hourly floor
+
+90 days of hourly compute spend shows: overnight floor $41/hr, business-day plateau $68/hr, month-end peak $95/hr, and a planned migration that will move ~15% of EC2 to Fargate next quarter.
+- Commit target: 75% of the *floor* → $31/hr of Compute Savings Plan (not EC2 Instance SP — the Fargate migration would strand family-locked commitments; flexibility beats the extra discount points here, and Compute SPs follow the workload to Fargate).
+- Expected coverage: $31 of every hour discounted ≈ 55–75% coverage depending on time of day — inside the healthy band; the plateau/peak stays on-demand+spot by design.
+- Buy in two tranches (now, +6 weeks) to ladder expiries; re-measure the floor after the migration lands before tranche three.
+- Review loop: utilization alarm <95%, coverage reviewed quarterly. If utilization ever dips, the fix is *waiting* (growth catches up) or exchanging — never buying more to "average it out."
 
 ## Worked micro-example — the NAT tax, quantified
 

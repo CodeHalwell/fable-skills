@@ -75,6 +75,26 @@ What changed? Deploy log: checkout service shipped 13:40. Errors started 14:02. 
 - **Action items: owner, deadline, tracked in the real work system** (Jira/Linear, not the postmortem doc), and few. Ten action items are a wish list; three that ship are a changed system. Prefer items that remove failure modes (validate config at generation; make the migration tool refuse table locks) over items that ask humans to be more careful ("add a checklist step" decays in weeks). Review outstanding postmortem items monthly — an unreviewed action-item backlog is where reliability goes to die quietly.
 - **Mine near-misses.** The incident where the canary caught it, where one replica survived, where someone happened to notice — same causal structure as a disaster, minus the harm, minus the political heat. Teams that postmortem near-misses learn at a discount. If your incident count is low, near-misses are most of your training data.
 - Timeline first, analysis second. Write the minute-by-minute from the channel log before anyone theorizes; the timeline usually falsifies the story people remember.
+- A skeleton that forces the right analysis (adapt, don't bloat):
+
+```markdown
+# INC-2231: Elevated checkout failures — 2026-07-03
+Impact: 8–12% of checkout attempts failed, 14:02–14:16 UTC (~3,400 users, ~$41k delayed GMV)
+Detection: symptom alert at 14:07 (5 min after onset — why not sooner? see CF-4)
+## Timeline (from channel log, not memory)
+13:58 payments-routing flag 5%→50% | 14:02 error rate departs baseline | 14:07 page ...
+## Contributing factors (not "root cause")
+CF-1 Trigger: new payment path saturates provider connection limit above ~20% traffic
+CF-2 The 5% soak could not have caught a >20% capacity cliff (rollout design)
+CF-3 Flag changes bypassed canary analysis that deploys get (control gap)
+CF-4 Detection lagged: alert window 5m; a 1m fast-burn window was missing
+## What went well / near misses
+Flag revert path worked in seconds; second responder paged early
+## Action items (owner, ticket, due)
+AI-1 Provider connection-limit headroom alarm — @maya, PAY-812, Jul 17
+AI-2 Flag rollouts >10% require metric gate — @sam, PLAT-455, Jul 31
+AI-3 Add 1m burn-rate window to checkout SLO alerts — @dana, OBS-203, Jul 10
+```
 
 ## Alert fatigue: the silent incident-response killer
 
@@ -98,6 +118,9 @@ What changed? Deploy log: checkout service shipped 13:40. Errors started 14:02. 
 - **Status updates only when there's news.** Silence reads as abandonment; stakeholders escalate into the response channel and responders start context-switching to reassure VPs. Clock-based cadence, always naming the next update time.
 - **Fixing the symptom you can see instead of the saturation you can't**: scaling web tier when the DB is the bottleneck (more workers = more DB pressure = worse), or adding capacity into a retry storm (feeds it). Before adding resources, ask "what is actually saturated?" and "will the added capacity increase load on the saturated thing?"
 - **Two mitigations at once.** Flag revert and deploy rollback simultaneously is fine (both are safe reverts to known-good). But two *novel* changes at once (config edit + failover) means when things improve — or worsen — you can't attribute it, and you may have created a second incident. Novel changes: one at a time, announced, with an expected effect.
+- **Too many responders.** Sev-1 gets declared and fifteen people join, each poking at prod "to help" — change attribution dies and the IC spends the incident moderating. The IC's tool is explicit assignment: named owners for 2–3 workstreams, everyone else observes silently or leaves. More hands ≠ more progress past about four active responders.
+- **Declaring victory on a masked symptom.** Error rate dropped because the cache refilled / traffic dipped at lunch / retries are absorbing it — not because the fix worked. Before standing down, tie recovery causally to your action (timing matches, mechanism explains it) and confirm on the *user-facing* metric, not an internal proxy.
+- **The "watch and see" non-decision.** "Let's give it 10 more minutes" repeated four times is a 40-minute decision to do nothing, made without ever being made. The IC forces the framing: what specifically are we waiting to learn, and what will we do at each outcome? If there's no answer, act now.
 - **Sev classification by internal drama.** A scary-looking master-failover with zero user impact gets sev-1 while a 3%-of-checkouts silent failure ambles along as sev-3 for six hours. Classify on user impact and trajectory; a low-and-climbing symptom outranks a big-but-recovered one.
 - **Postmortem action item: "be more careful during deploys."** Not falsifiable, not owned, decays instantly. Rewrite every human-vigilance item as a system change or delete it.
 - **The runbook that describes the old architecture.** Mid-incident is when you discover the failover procedure references a cluster decommissioned last quarter. Runbooks rot on the same clock as infrastructure; the tabletop game day (above) is the cheapest rot detector, and every real incident should end with a "was the runbook right?" line item in the postmortem.

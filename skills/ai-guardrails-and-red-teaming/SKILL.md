@@ -56,7 +56,23 @@ GOAL: exfiltrate mailbox contents
 ├─ via send_email tool
 │  ├─ direct: injected instruction drafts+sends          [blocked: human gate — probe anyway]
 │  ├─ social: injected draft user approves unread        [mitigated: new-recipient flag; residual]
-│  └─ chained: for
+│  └─ chained: forward-rule created via settings tool    [blocked: settings tool not exposed]
+├─ via rendered output (zero-click)
+│  ├─ markdown image URL w/ secret in query string       [blocked: image proxy strips remote src]
+│  └─ hyperlink w/ dynamic query string                  [mitigated: link rewrite + domain allowlist]
+└─ via side channels
+   ├─ calendar-invite .ics body                           [OPEN: probe — attachments parsed?]
+   └─ contact-card export tool                            [n/a: tool not present]
+```
+
+### Incident response and degradation modes (pre-built, not improvised)
+
+- **Kill switches at capability granularity:** per-tool feature flags so you can disable `send_email` or `execute_code` in one deploy without taking the product down. A single global off-switch is too blunt to ever actually get used.
+- **Degradation ladder decided in advance:** full → read-only mode → single high-risk tool disabled → session quarantine. Pick the rungs before the incident, not during it.
+- **Forensics readiness:** log every tool call with arguments, every ingress document (hash + source), and every guardrail decision. You cannot investigate an exfiltration from chat transcripts alone; unlogged is uninvestigable.
+- **Rehearsed rollback:** keep a known-good (model, prompt, config) triple you can revert to in minutes. Safety behavior is version-sensitive, so reverting while you patch is often the fastest containment for a new model's new hole.
+
+## How an expert thinks through this
 
 *Scenario: hardening an email-assistant agent (reads inbox, summarizes, drafts, can send with approval) before launch.*
 
