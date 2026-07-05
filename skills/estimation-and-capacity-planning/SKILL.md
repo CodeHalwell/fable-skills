@@ -128,6 +128,14 @@ Inbox writes: 8M inserts in 10 min ≈ 13k rows/s. *This* is the actual hard par
 
 Downstream limits check: FCM/APNS rate limits and connection guidance at 13k/s — read the current quotas before promising the 10-minute window; if the platform caps us lower, the window stretches and *that's a product conversation, not an engineering one*. Sanity check by second path: 8M pushes ÷ 13 workers ÷ 50 concurrent ÷ (1/0.05s) ≈ 10.2 min ✓ consistent. Deliverables: the three load numbers, the breakpoint list ("2×: fine; 5×: inbox write path → fan-out-on-read; 10×: push-provider quotas"), and runway alerts on queue drain rate and partition disk.
 
+## Presenting an estimate so it survives contact with stakeholders
+
+- Lead with the decision, not the arithmetic: "one Postgres primary is sufficient through ~10× current traffic" — then show the two lines of math that support it.
+- Give ranges with the driver named: "2.7–11TB/yr *depending on retention policy*" turns a scary interval into a decision the audience can make.
+- Separate the three numbers (avg / daily peak / event peak) visually; executives anchor on whichever single number you show them, so never show one.
+- State the first breakpoint and its lead time: "this design needs revisiting at ~4× traffic; the fix (read replicas) takes two weeks" — that sentence is the difference between capacity *planning* and capacity *reporting*.
+- Attach the assumptions as bullets someone can falsify ("20 req/user/day — from analytics, March"), because a wrong assumption caught in review costs nothing and the same assumption caught in production costs the migration.
+
 ## Failure modes & pitfalls
 
 - **Sizing to the average.** 280/s average vs 13k/s event peak above — a 46× error. Always produce avg / daily-peak / event-peak; designs that quote one number are hiding the ratio.
