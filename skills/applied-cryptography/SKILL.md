@@ -58,48 +58,12 @@ description: Load when writing or reviewing code that encrypts, hashes, signs, s
 
 ## Worked micro-examples
 
-**1. Correct password-based file encryption (Python).**
-```python
-import os
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from argon2.low_level import hash_secret_raw, Type
+The correct password-file-encryption envelope (argon2id from the password → per-message random 12-byte nonce → `AESGCM(key).encrypt(nonce, pt, purpose)` with the purpose bound as AAD → serialize `version‖salt‖nonce‖ct+tag`) is a construction a strong model reproduces cold; what it under-emphasizes and this skill enforces:
+- **The AAD parameter is not optional decoration.** Its job is to bind the ciphertext to its context (`b"user:42:role"`) so an attacker cannot cut-and-paste an encrypted `role` blob from an admin row into their row. If you are calling an AEAD and passing no associated data, ask out loud what cross-record/cross-protocol swap that permits.
+- **A version byte is the whole rotation story.** `b"v1"‖…` (or `MultiFernet`) is what lets you add key N+1, decrypt with any, encrypt with newest — retrofitting this after a compromise is the miserable path. "No rotation story" is a finding, not a footnote.
+- **One exception type for all failures** (argon2id-mismatch, bad tag, wrong version) so failure paths stay indistinguishable — timing and message.
 
-def encrypt(password: str, plaintext: bytes, purpose: bytes) -> bytes:
-    salt = os.urandom(16)
-    key = hash_secret_raw(password.encode(), salt, time_cost=3,
-                          memory_cost=64*1024, parallelism=4,
-                          hash_len=32, type=Type.ID)   # argon2id → 256-bit key
-    nonce = os.urandom(12)                             # random 96-bit, per message
-    ct = AESGCM(key).encrypt(nonce, plaintext, purpose)  # purpose bound as AAD
-    return b"v1" + salt + nonce + ct                   # version || salt || nonce || ct+tag
-
-def decrypt(password: str, blob: bytes, purpose: bytes) -> bytes:
-    assert blob[:2] == b"v1"
-    salt, nonce, ct = blob[2:18], blob[18:30], blob[30:]
-    key = hash_secret_raw(password.encode(), salt, time_cost=3,
-                          memory_cost=64*1024, parallelism=4,
-                          hash_len=32, type=Type.ID)
-    return AESGCM(key).decrypt(nonce, ct, purpose)     # raises InvalidTag on ANY tamper
-```
-Every design point is deliberate: argon2id (not HKDF) because input is a password; fresh salt and nonce per encryption; version byte for rotation; AAD binds ciphertext to its purpose; salt/nonce are not secret and travel with the blob; one exception type for all failures.
-
-**2. Spotting the composed-hash forgery.**
-Reviewing: `token = sha256(SECRET + user_id).hexdigest()`. SHA-256 is Merkle–Damgård: given `H(SECRET ‖ m)` and `len(SECRET‖m)`, an attacker computes `H(SECRET ‖ m ‖ pad ‖ suffix)` *without knowing SECRET* — so from the token for `user_id="5"` they mint a valid token for `"5" + pad + "&admin=true"`. Whether exploitable depends on the parser, but the construction is forgeable by design. Fix is one line: `hmac.new(SECRET, user_id.encode(), "sha256")`. Rule fired: secret + hash composed by hand → assume broken, name the attack (length extension), replace with HMAC.
-
-**3. JWT verification done right (PyJWT).**
-```python
-import jwt
-claims = jwt.decode(
-    token,
-    public_key,                      # Ed25519 public key
-    algorithms=["EdDSA"],            # pinned; header's alg claim is untrusted input
-    audience="payments-api",         # reject tokens minted for other services
-    issuer="https://auth.example",
-    options={"require": ["exp", "aud", "iss"]},
-    leeway=30,                       # small clock skew only
-)
-```
-The threat each line kills: missing `algorithms` → alg confusion/none; missing `audience` → cross-service replay; missing `require` → tokens without expiry live forever.
+Not probed, and a common miss: **compressing attacker-influenced + secret data in one stream before encrypting leaks secrets via ciphertext length** (CRIME/BREACH). Segregate or disable compression when both co-reside.
 
 ## Verification / self-check
 
@@ -110,3 +74,8 @@ Before presenting crypto code or review conclusions:
 4. **Failure-path uniformity:** do all decrypt/auth failures produce indistinguishable errors and similar timing?
 5. **Key lifecycle:** where is the key stored, who can read it, how does rotation work, is there a version byte in the ciphertext format? "No rotation story" is a finding, not a footnote.
 6. **Did I invent anything?** If the design contains any construction you can't name in a textbook/RFC (encrypt-then-MAC, HKDF-expand, envelope encryption), replace it with one you can.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~9 baseline (compressed), ~1 partial. This skill is ≥90% BASELINE — Opus 4.8 cold correctly produced AES-256-GCM/XChaCha for data-at-rest, the ~2³² birthday bound with AES-GCM-SIV/XChaCha alternatives, length-extension→HMAC, Argon2id with current OWASP params, HKDF-vs-Argon2 for high-entropy-vs-password inputs, the full JWT verify checklist (alg pinning, alg-confusion, exp/aud/iss), `compare_digest`, GCM-nonce-reuse leaking BOTH plaintext XOR and the GHASH forgery key, and `secrets` vs Mersenne-Twister.
+- The residual value is a checklist/discipline: the two things Opus under-weighted are (a) using the AEAD **AAD** parameter to stop cut-and-paste swaps, and (b) baking a **key-version byte** in from day one for rotation. CRIME/BREACH (compress-then-encrypt) is the one unprompted fact worth keeping.
+- Worked examples collapsed to prose anchors; the code was boilerplate any strong model emits.

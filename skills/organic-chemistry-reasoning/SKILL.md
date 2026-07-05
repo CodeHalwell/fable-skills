@@ -58,12 +58,7 @@ description: Load when predicting organic reaction products or mechanisms, choos
 
 ## Worked micro-examples
 
-**1. Full decision-matrix run.** (2R)-2-bromobutane + NaSMe in DMSO, rt.
-Substrate: 2° → SN2 and E2 both possible. Nu: MeS⁻ — excellent Nu (polarizable), weak base (MeSH pKa ≈ 10.3, far below alkoxide) → substitution wins. Solvent: DMSO, polar aprotic → SN2 accelerated. T: rt, no elimination push. Verdict: SN2, backside attack at C2, inversion: product is (2S)-2-(methylthio)butane, single enantiomer. Swap NaSMe for KOt-Bu: bulky strong base → E2, and t-BuO⁻ prefers the less hindered β-H → Hofmann product 1-butene major (with some cis/trans-2-butene).
-
-**2. Rearrangement catch.** 3,3-dimethyl-1-butene + HBr. Protonation gives the 2° cation at C2 (Markovnikov). Adjacent C3 is quaternary-bearing: a 1,2-methyl shift converts 2° → 3° cation at C3. Br⁻ traps the 3° cation: major product 2-bromo-2,3-dimethylbutane, not the "expected" 2-bromo-3,3-dimethylbutane. Rule: after forming any cation, always ask "does a hydride/alkyl shift from the neighbor give a more stable cation?" before drawing the nucleophile's attack.
-
-**3. Retrosynthesis with an umpolung step.** Target: 1-phenyl-2-butanone? No — take 4-hydroxy-4-phenylbutan-2-one (PhCH(OH)CH₂COCH₃). 1,3-relationship of OH and C=O ⇒ aldol disconnect at the C–C between carbinol C and α-C: synthons = PhCHO (acceptor) + ⁻CH₂COCH₃ (donor = acetone enolate). Forward: acetone enolate (excess acetone or preformed) + benzaldehyde (no α-H on PhCHO ⇒ clean crossed aldol), no dehydration (stop at aldol: mild base, low T). Contrast: if the target were PhCOCH₂CH₂CH₃ disconnected as PhC(=O)⁻ + ⁺CH₂CH₂CH₃, the acyl *anion* synthon has unnatural polarity ⇒ real equivalent: 2-phenyl-1,3-dithiane, deprotonate (n-BuLi), alkylate with n-PrBr, hydrolyze (HgCl₂/H₂O).
+A strong model runs these cold: (2R)-2-bromobutane + NaSMe/DMSO → SN2 inversion to (2S)-2-(methylthio)butane; 3,3-dimethyl-1-butene + HBr → 1,2-methyl shift → 2-bromo-2,3-dimethylbutane; 4-hydroxy-4-phenylbutan-2-one → aldol of acetone enolate + PhCHO. The single habit that prevents the most wrong answers: **after drawing ANY carbocation, before the nucleophile attacks, ask "does a 1,2-hydride or alkyl shift reach a more stable cation?"** — the reflex answer skips the shift and gives the wrong regiochemistry. The umpolung cue is worth keeping explicit: an acyl-anion synthon (unnatural polarity) maps to a 2-substituted-1,3-dithiane (n-BuLi, alkylate, HgCl₂/H₂O), not to any direct reagent.
 
 ## Verification / self-check
 
@@ -73,3 +68,8 @@ Substrate: 2° → SN2 and E2 both possible. Nu: MeS⁻ — excellent Nu (polari
 4. **pKa sanity:** every proton transfer goes from stronger acid to give weaker acid; no species coexists with something that would instantly quench it (RMgX + ROH, LDA + ketone solvent, H₃O⁺ steps under basic conditions).
 5. **Mass/atom balance:** count carbons and heteroatoms in target vs starting materials + reagents; leftover or missing atoms mean a forgotten byproduct or a wrong disconnection.
 6. **Reagent scope check:** for each named reagent confirm the transformation is inside its scope table (e.g., NaBH₄ won't touch the ester you're hoping it reduces).
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Opus 4.8 cold solved every probe correctly — the SN1/SN2/E1/E2 decision run with inversion stereochem, the 3,3-dimethyl-1-butene methyl-shift rearrangement, menthyl-vs-neomenthyl anti-periplanar E2, the pKa anchor ladder, anilinium meta-direction + acetylation fix, DIBAL/LiAlH4/NaBH4 ester scope, the crossed-aldol retrosynthesis — and it *exceeded* the pitfalls list (added Bredt's rule, neighboring-group participation, ring expansion).
+- No knowledge delta found; mechanistic organic is a native Opus strength. Skill retained as a *forcing checklist*: the rearrangement scan after every cation, the anti-periplanar chair check, and atom/pKa balance — steps a fast solver can skip, not facts it lacks.
+- Worked examples compressed to the one habit (cation → shift scan) plus the umpolung cue.

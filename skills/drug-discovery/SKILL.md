@@ -54,17 +54,7 @@ description: Use for medicinal chemistry and pharmacology reasoning — target v
 
 ## Worked micro-examples
 
-**1. Cheng-Prusoff.** A competitive inhibitor gives IC50 = 100 nM in an assay run at [S] = 4·Km. True Ki = 100/(1 + 4) = 20 nM. If a second lab runs the same compound at [S] = Km, they'd measure IC50 = Ki·(1+1) = 40 nM — a 2× "discrepancy" that is really perfect agreement. Always normalize to Ki.
-
-**2. LLE guiding a decision.** Analog A: IC50 = 100 nM (pIC50 = 7.0), logD = 4.5 → LLE = 2.5. Analog B: IC50 = 300 nM (pIC50 = 6.5), logD = 2.0 → LLE = 4.5. B is "less potent" but far better positioned: lower lipophilicity means better solubility, lower clearance and hERG risk, and the higher LLE says the binding is driven by specific interactions, not grease. Prefer B as the series lead.
-
-**3. Half-life reasoning.** Two compounds both have t₁/₂ = 12 h. Compound X: CL low, Vd normal → clearance-limited, expect dose-proportional exposure, manageable. Compound Y: CL high, Vd very large → long t₁/₂ from deep tissue distribution; high total dose needed, potential tissue accumulation/tox. Same t₁/₂, different development risk.
-
-**4. Magic methyl SAR.** Adding an ortho-methyl to a biaryl raises potency 20× and improves metabolic stability. Interpretation: the methyl enforces a twisted, bioactive conformation (restricting rotation to the bound geometry) and blocks a metabolic soft spot — a classic conformational + metabolic double win, not just added bulk.
-
-**5. Bioavailability arithmetic.** A drug is 90% absorbed from the gut but has a hepatic extraction ratio of 0.7. Oral F ≈ F_abs × (1 − E_H) = 0.90 × 0.30 = 0.27. Even near-complete absorption yields only 27% bioavailability because first-pass hepatic metabolism removes 70% on the way through. Improving absorption further is futile; the fix is reducing hepatic extraction (metabolic stability).
-
-**6. Aggregation triage.** A screening hit shows IC50 = 5 µM, Hill slope 3.5, flat SAR across 8 analogs, and activity that vanishes when 0.01% Triton X-100 is added to the assay. Verdict: colloidal aggregator, not a real inhibitor. Do not start a medchem campaign; the detergent-sensitivity and steep slope are decisive.
+A strong model runs all of these cold — Cheng-Prusoff (IC50 100 nM at [S]=4Km → Ki 20 nM); LLE picking the "less potent" low-logD analog as the better lead; same t½ = 12 h splitting into low-CL vs high-Vd risk profiles; magic-methyl as conformational-lock + metabolic-block; oral F = 0.9 × (1−0.7) = 0.27; and the steep-Hill/flat-SAR/detergent-sensitive aggregator verdict. The retained value is the *reflex to run the artifact checklist before optimizing* and to *convert every potency to Ki and pair it with LE/LLE before calling an analog "better"* — the discipline, since the arithmetic and interpretations are not the gap.
 
 ## Verification and self-check
 
@@ -74,3 +64,8 @@ description: Use for medicinal chemistry and pharmacology reasoning — target v
 - **Run the artifact checklist** (dose-response shape, Hill slope, detergent sensitivity, PAINS/reactive alerts, SAR presence) before trusting a hit.
 - **Reason in free drug and exposure over time**, not single in-vitro numbers, for any in-vivo claim; check that free Cmax/Cmin brackets the target Ki.
 - **Confirm selectivity breadth** and note species/translation caveats before asserting a compound is clean.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Opus 4.8 cold produced Cheng-Prusoff, the aggregator triage (steep Hill + flat SAR + detergent sensitivity), LE/LLE formulas and the prefer-higher-LLE logic, t½ = 0.693·Vd/CL decomposition, F = fabs·(1−EH), magic-methyl mechanisms, the IC50/EC50/Kd/Ki distinctions with receptor-reserve nuance, Ro5-as-soft-filter, and a broad bioisostere list (it exceeded the skill on carboxylic-acid replacements).
+- No knowledge delta. The skill functions as a triage discipline: run the artifact checklist before starting chemistry, normalize to Ki with assay context, and judge on LE/LLE plus free-drug exposure rather than raw potency.
+- Worked examples compressed to the disciplines; the calculations were reproducible.

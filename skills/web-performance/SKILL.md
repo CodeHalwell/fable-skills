@@ -5,176 +5,63 @@ description: Load when optimizing web page speed or Core Web Vitals (LCP, INP, C
 
 # Web Performance
 
-## Core mental model
+## Core mental model (anchors)
 
-1. **Optimize the user-centric metrics, in field data, at p75.** Core Web Vitals (as of 2026, unchanged canonical thresholds): **LCP ≤ 2.5s** (loading), **INP ≤ 200ms** (interactivity; replaced FID in March 2024), **CLS ≤ 0.1** (stability) — each at the 75th percentile of real users. Lab scores (Lighthouse) are a debugging tool, not the target; a Lighthouse 100 with failing CrUX is still failing. Ignore SEO-blog claims of changed thresholds unless web.dev/Chrome announces them.
-2. **The load is a dependency waterfall.** Every resource has a discovery time (when the browser learns it exists) and a priority. Most LCP problems are *discovery* problems (image behind CSS background / JS render / client-side fetch chain), not bandwidth problems. Draw the chain: HTML → CSS/JS → (fetch → JSON) → image. Each arrow you remove is usually worth more than compressing any node.
-3. **JavaScript's cost is paid three times**: download, parse/compile, execute — and then a fourth, forever: every byte of framework component code is re-executed as hydration and re-render cost. Bundle size is a proxy; main-thread blocking time is the real currency of INP.
-4. **The fastest resource is one already decided.** Reserve space (no layout shift), preload what's critical, cache immutably, and precompute (SSR/SSG) what doesn't need the client. Most wins are *removals and reorderings*, not clever code.
-5. **Third parties are unbounded liabilities.** A tag manager is an arbitrary-code-execution platform for the marketing team. Contain, defer, or facade them — you cannot optimize what you don't control.
+1. Optimize field p75 CWV: LCP ≤ 2.5s, INP ≤ 200ms, CLS ≤ 0.1 (thresholds unchanged as of 2026 — ignore SEO-blog claims otherwise). Lab is diagnosis; CrUX is the verdict; INP work is RUM-mandatory because lab barely has interactions.
+2. Most LCP problems are *discovery* problems in the dependency waterfall, not bandwidth problems — each removed arrow beats compressing any node.
+3. JS is paid four times: download, parse, execute, then forever as hydration/re-render. Main-thread blocking is INP's currency; bundle size is a proxy.
+4. The fastest resource is one already decided: reserve space, cache immutably, precompute on the server. Most wins are removals and reorderings.
+5. Third parties are unbounded liabilities; a tag manager is an arbitrary-code-execution platform for the marketing team.
 
-## The metric → cause → fix decision chains
+## Decision chains (kept as checklists; cold answers reproduce the mechanisms)
 
-**LCP** (usually the hero image or heading). Decompose into its four parts (TTFB → resource load delay → resource load time → render delay); the fix differs per part:
-- TTFB slow (>800ms) → server/edge problem: cache the HTML, move rendering closer (edge/ISR), fix backend. No frontend trick beats a slow first byte.
-- Load *delay* dominant (most common) → discovery problem: LCP image must be in the initial HTML as `<img>` (not CSS background, not client-rendered), with `fetchpriority="high"`; add `<link rel="preload" as="image">` only if it can't be in early HTML. Never lazy-load the LCP image — `loading="lazy"` on it is the single most common self-inflicted LCP wound.
-- Load *time* dominant → size/format problem: AVIF/WebP, correct `srcset` sizing, CDN.
-- Render delay → blocking CSS/JS or client-side rendering: inline critical CSS, remove render-blocking scripts, SSR the hero.
+**LCP by sub-part**: TTFB >800ms → server/edge, no frontend trick beats it; load *delay* dominant (most common) → LCP image in initial HTML as `<img fetchpriority="high">`, never CSS-background/client-rendered/lazy; load *time* → AVIF/WebP + `srcset`/`sizes` (wrong `sizes` silently downloads desktop images — the browser picks before layout); render delay → blocking CSS/JS, SSR the hero.
 
-**INP** (worst interaction latency, full page lifetime). Decompose: input delay → processing → presentation delay.
-- Input delay → main thread busy when the user clicked: long tasks from hydration, third parties, or rendering. Break up long tasks (`scheduler.yield()` in Chromium with a `setTimeout` fallback, or `await`-chunked loops); code-split so less runs at all.
-- Processing → your handler is slow: do the minimum synchronously, paint, then continue (update state, `startTransition` for non-urgent React updates, move pure computation to a worker).
-- Presentation delay → the re-render after the handler is huge: too much DOM updated per interaction (virtualize lists, narrow re-renders — see `frontend-architecture`), or synchronous layout thrash (interleaved reads/writes of `offsetHeight` etc.).
-- Prior: on framework apps the top INP offenders are hydration bursts, giant list re-renders, and third-party scripts — in that order of tractability.
+**INP by sub-part**: input delay (long tasks — `scheduler.yield()` + `setTimeout` fallback, chunk ~every 50ms); processing (minimum sync work, then paint); presentation (too much DOM per interaction — virtualize; layout thrash). Framework-app offenders in tractability order: hydration bursts, giant list re-renders, third parties.
 
-**CLS** — almost always one of four: (1) images/embeds without reserved space → set `width`/`height` attributes or `aspect-ratio`; (2) web font swap reflow → see fonts below; (3) late-injected banners/ads → reserve slots with fixed `min-height`; (4) animating layout properties → animate only `transform`/`opacity`. Note CLS counts shifts across the whole lifetime, session-windowed — a "stable load" can still fail from an accordion pushing content on scroll.
+**CLS**: unreserved images/embeds (`width`/`height` or `aspect-ratio`), font swap, late banners (reserve `min-height`), layout-property animation. Session-windowed across page lifetime — an accordion on scroll can fail a "stable" load. Skeletons sized differently from real content convert a perceived-speed win into CLS.
 
-## The waterfall toolbox (what actually reorders loading)
+**Caching**: hashed assets `public, max-age=31536000, immutable`; HTML `no-cache` (never `no-store` — kills bfcache; never long-cache un-hashed HTML); SSG/ISR `s-maxage` + `stale-while-revalidate` at CDN; personalized `private`. Service worker only for offline/installability — a mis-scoped cache-first SW serves year-old bundles.
 
-- `<link rel="preload">` — "you'll need this soon but won't discover it": fonts referenced in CSS, LCP background image. Misuse is common: preloading things the preload-scanner already finds just steals bandwidth; every preload competes with HTML-discovered resources. Rule: add one, verify the waterfall improved, else remove.
-- `fetchpriority="high|low"` — reprioritize within discovered resources: high on the LCP image, low on carousel images 2..n.
-- `rel=preconnect` — only for origins critical in the first seconds (font CDN, image CDN); each costs a socket.
-- `rel=prefetch` / Speculation Rules API (Chromium) — next-navigation warmup; `<script type="speculationrules">` with `"eagerness": "moderate"` prefetches/prerenders links on hover/pointerdown. Verify current cross-browser status before relying on it beyond Chromium; treat as progressive enhancement.
-- `defer` for all classic scripts (ordered, after parse), `async` only for truly independent ones (analytics); module scripts defer by default. A synchronous `<script src>` in `<head>` blocks parsing — this is still found in the wild, still the first thing to check.
-- CSS blocks *rendering*, not parsing; JS after CSS blocks on the CSS (it might read styles). Keep head CSS lean; split non-critical CSS via `media="print"` tricks only with measurement, prefer just shipping less.
+**Fonts**: self-host WOFF2, `font-display: swap`/`optional`, preload needs `crossorigin` even same-origin (else double-download), metric-matched fallback via `size-adjust`/`ascent-override` (fontaine, `next/font`). >2 families×weights → variable font or fewer.
 
-## JS cost strategy
+**Third parties, escalation ladder**: remove (audit quarterly — zombie tags are real) → facade (lite-youtube-embed pattern) → defer to interaction → Partytown → at minimum async + preconnect + a named owner per tag. Anti-flicker A/B snippets set your LCP floor to their timeout (2–4s) — push for server/edge experimentation.
 
-- **Split by route first** (framework default), then by *interaction* (modal, editor, chart loaded on intent — `import()` on hover/click). Splitting below ~10–20KB chunks adds request overhead for nothing.
-- **Tree-shaking failure taxonomy**: barrel files (`index.ts` re-exporting 200 modules pulls a large graph into every importer — import from the concrete module or use `optimizeDeps`/`modularizeImports`-style config); packages without `"sideEffects": false`; CommonJS deps (opaque to the bundler — prefer ESM builds); accidental top-level side effects (`const x = registerThing()`). Verify with a bundle analyzer (`rollup-plugin-visualizer`, `next build --analyze` variants, or `bundlephobia`/`pkg-size` per-dep) — never assert shaking worked without looking.
-- **Hydration cost is real**: SSR HTML is fast to *show* and slow to *awaken*; a huge hydrating page produces long tasks that eat INP right when users first interact. Mitigations, in preference order: ship less JS at all (Server Components — zero client JS for non-interactive parts), islands (Astro's model: hydrate only interactive widgets, `client:visible` to defer offscreen ones), progressive/lazy hydration, `<Activity>`/deferred rendering for hidden UI.
-- Selective replacement: heavy dependency on a light page (moment→`Intl`/date-fns, lodash→es-toolkit or native, charting lib → server-rendered SVG) is often the single biggest bundle win. Check the analyzer before assuming.
+## Sharpened numbers and judgment
 
-## Images
+- Splitting below ~10–20KB chunks adds request overhead for nothing; split by route, then by interaction (`import()` on hover/click).
+- Tree-shaking failures: barrel files, missing `"sideEffects": false`, CJS deps, top-level side effects — verify with an analyzer, never assert shaking worked without looking. Selective dependency replacement (moment→`Intl`, lodash→es-toolkit) is often the single biggest bundle win.
+- Preload is a scalpel: 1–2 resources, each verified to improve the waterfall, else removed. Five preloads demote each other and the HTML-discovered critical path.
+- Lazy-load policy: never the LCP image; *near*-fold images eager too (IntersectionObserver gating hurts perceived speed); offscreen iframes lazy. Cap DPR at 2x — 3x is invisible-difference bandwidth.
+- Budgets only exist as CI gates (Lighthouse CI assertions, `size-limit` per entry): ~100–200KB gz JS/route, ≤50KB critical CSS, ≤2 font files, LCP resource ≤150KB, third-party blocking ≈ 0; any PR adding >10KB to a route states a reason. Unenforced budgets decay in one quarter.
+- Field-data lag: tell stakeholders upfront that CrUX confirmation takes up to ~28 days after the fix ships.
 
-Decision chain, in order:
-1. **Right asset type**: SVG for icons/diagrams/logos; raster only for photos. Icon fonts are dead; inline or sprite the SVGs.
-2. **Format**: AVIF first, WebP fallback, via `<picture>` or an image CDN that content-negotiates on `Accept` (both universally supported as of 2026). JPEG remains the safe base `src`.
-3. **Responsive sizing**: `srcset` + `sizes`. Wrong `sizes` silently downloads desktop images on mobile — the browser picks before layout, using `sizes` as gospel. Audit with DevTools' rendered-vs-intrinsic size overlay; >2x intrinsic is waste.
-4. **Loading policy**: LCP/above-fold → eager + `fetchpriority="high"`. Deep below-fold → `loading="lazy"`. *Near*-fold → eager: lazy-loading just-below-fold images gates them behind IntersectionObserver and hurts perceived speed. Lazy-load offscreen `<iframe>`s too (`loading="lazy"` works on them).
-5. **CLS insurance**: always `width`/`height` attributes or CSS `aspect-ratio`.
-6. Don't cargo-cult `decoding="async"`; it's near-default behavior. Do cap DPR at 2x for photos on high-density screens (3x is invisible-difference bandwidth).
+## Pitfalls checklist (one-liners)
 
-## Fonts
+bfcache breakers (`unload` handlers — use `pagehide`; `no-store` HTML) silently double real page loads — check `notRestoredReasons` in RUM; CSS `@import` chains invisible to the preload scanner — bundle them; `document.write` ad tags — refuse or sandbox; measuring dev builds overstates JS cost multiples — profile production with source maps and honest throttling (4x CPU, slow 4G); giant DOM — `content-visibility: auto` + `contain-intrinsic-size` for long offscreen sections; compression audit (Brotli for text at the CDN, zstd increasingly supported; never recompress images/woff2) — five minutes, regularly finds uncompressed JSON APIs; `decoding="async"` is cargo cult; Speculation Rules (`"eagerness": "moderate"`) is Chromium-only progressive enhancement; the `load` event is not a UX moment — report CWV to stakeholders.
 
-- Self-host WOFF2 with `font-display: swap` (or `optional` for truly cosmetic fonts — no swap-shift at all), `<link rel="preload" as="font" type="font/woff2" crossorigin>` for the 1–2 critical faces (crossorigin required even same-origin — fonts are CORS-fetched; omitting it double-downloads).
-- Kill swap-CLS by metric-matching the fallback: `@font-face { font-family: "Inter-fallback"; src: local("Arial"); size-adjust: 107%; ascent-override: 90%; ... }` — tools like `fontaine` or Next.js `next/font` compute these automatically (and `next/font` self-hosts Google fonts, removing the third-party hop).
-- Subset aggressively (unicode-range, variable font with only needed axes). Four weights of a family is a smell; variable font or fewer weights.
-
-## Caching per asset class
-
-- **Hashed immutable assets** (JS/CSS/images with content-hash filenames): `Cache-Control: public, max-age=31536000, immutable`.
-- **HTML**: `no-cache` (revalidate every time; ETag) or short `s-maxage` + `stale-while-revalidate` at the CDN for SSG/ISR. Never long-cache un-hashed HTML — you'll strand users on old asset references.
-- **API responses**: per-endpoint; `stale-while-revalidate` where eventual freshness is fine; `private` for personalized.
-- **Fonts**: immutable (hashed or versioned path).
-- Service worker: powerful, but a mis-scoped cache-first SW is how sites serve year-old bundles; use Workbox recipes, version caches, and have a kill switch. Don't add one for "performance" alone — add it for offline/installability.
-
-Reference header set:
-
-```text
-/assets/app.3f9c2b.js      Cache-Control: public, max-age=31536000, immutable
-/index.html                Cache-Control: no-cache            # + ETag; or at CDN:
-/products/* (SSG/ISR HTML) Cache-Control: public, s-maxage=300, stale-while-revalidate=86400
-/api/catalog               Cache-Control: private, max-age=0, must-revalidate  # or SWR if safe
-/fonts/inter-var.woff2     Cache-Control: public, max-age=31536000, immutable
-```
-
-## Failure modes & pitfalls
-
-- **`loading="lazy"` on the LCP image** — delays the most important resource behind layout + IntersectionObserver. Also common: lazy-loading everything, so just-below-fold images pop in late during the first scroll.
-- **bfcache broken**: an `unload` handler or `Cache-Control: no-store` on the HTML disables back/forward cache — every back navigation becomes a full reload, silently doubling real-user page loads. Use `pagehide` instead of `unload`, avoid `no-store` unless truly required, and check `performance.getEntriesByType('navigation')[0].notRestoredReasons` in RUM.
-- **CSS `@import` inside stylesheets** — serial request chains invisible to the preload scanner (HTML → CSS → imported CSS before render). Bundle at build time.
-- **Anti-flicker snippets from A/B tools** — `opacity: 0` on `<body>` until the experiment script loads sets your effective LCP floor to their timeout (often 2–4s). Server-side or edge experimentation, or drastically shorten the timeout.
-- **Measuring dev builds**: React/Vue development mode is multiples slower than production; any profile taken on `npm run dev` overstates JS cost. Profile production builds with source maps.
-- **Preload hoarding**: five `<link rel="preload">` tags demote each other and the HTML-discovered critical path. Preload is a scalpel — one or two resources, verified in the waterfall.
-- **`document.write`-injected third-party scripts** — block parsing entirely; still shipped by some ad tags. Refuse or sandbox them.
-- **Skeleton screens that shift**: skeletons sized differently from the real content convert a perceived-speed win into CLS. Match dimensions exactly (same `aspect-ratio`/`min-height`).
-- **Giant DOM**: tens of thousands of nodes make every style recalc and layout slow regardless of JS discipline. Virtualize long lists; apply `content-visibility: auto` + `contain-intrinsic-size` to long offscreen sections (huge render-cost win for long articles/feeds).
-- **Compression misconfiguration**: text assets (HTML/JS/CSS/SVG/JSON) should be Brotli at the CDN (zstd increasingly supported — check your CDN); already-compressed formats (images, woff2, video) should not be recompressed. A `Content-Encoding` audit takes five minutes and regularly finds uncompressed JSON APIs.
-- **Trusting `onLoad` timing as UX**: the `load` event fires long after (or before) the user-visible moment that matters; report CWV, not load time, to stakeholders.
-
-## Measuring correctly
-
-- **Field (RUM)**: CrUX (BigQuery / CrUX API / PageSpeed Insights "field" section) for Chrome-population p75; your own RUM (`web-vitals` library posting to analytics) for all browsers, per-page, per-segment, with attribution (`onINP(({attribution}) => ...)` tells you *which element*). Field data is the verdict.
-- **Lab**: Lighthouse/DevTools traces to reproduce and diagnose what field data flagged. Throttle honestly (mobile CPU 4x, slow 4G) — your M-series laptop is a lie machine.
-- The classic mismatch: lab LCP fine, field LCP bad → real users hit cold caches, slower devices, longer RTTs, or a different page state (logged-in, ads). Lab INP barely exists — INP needs real interactions, so RUM is mandatory for INP work.
-- **Performance budget discipline**: budgets only work as CI gates, not aspirations — e.g., Lighthouse CI assertions or `size-limit` per-entry-point (fail PRs over e.g. 200KB gz route JS). Budget the *deltas* conversation: any PR adding >10KB to a route needs a stated reason. Without enforcement, budgets decay in one quarter. Reasonable starting budgets for a content/commerce site: ≤ 100–200KB gz JS per route, ≤ 50KB critical CSS, ≤ 2 font files, LCP resource ≤ 150KB, third-party blocking time ≈ 0. Adjust to your CrUX reality, but write numbers down — "fast" is not a budget.
-
-```yaml
-# lighthouserc excerpt — CI assertion style
-assertions:
-  largest-contentful-paint: ["error", { maxNumericValue: 2500 }]
-  total-blocking-time: ["error", { maxNumericValue: 300 }]
-  cumulative-layout-shift: ["error", { maxNumericValue: 0.1 }]
-  resource-summary:script:size: ["error", { maxNumericValue: 200000 }]
-```
-
-## Third-party containment
-
-Priors: tag managers, chat widgets, A/B testing scripts, and session replay are the usual INP/LCP top offenders. Strategy ladder: (1) remove — audit quarterly, most orgs run zombie tags; (2) facade — load a static placeholder, real widget on interaction (`react-live-chat-loader` pattern for chat, lite-youtube-embed for video); (3) defer — load after `load` event or first interaction; (4) isolate — Partytown (runs scripts in a worker) where compatible; (5) at minimum `async` + `preconnect` and a documented owner per tag. A/B scripts that anti-flicker-hide the page cap your LCP at their timeout — push for server-side experimentation.
-
-## How an expert thinks through this
-
-*Scenario: "PageSpeed says our product page LCP is 4.1s (field). Team wants to buy a faster CDN."*
-
-Before spending: which part of LCP? Pull the p75 breakdown from RUM attribution. TTFB is 600ms — fine, so the CDN pitch is treating the wrong term; park it. Load delay is 2.4s — discovery problem, dominant term. Look at the page: the hero is a client-rendered `<img>` inside a React carousel, so the browser can't see it until the bundle downloads, hydrates, and renders — the image starts at ~3s. Considered `rel=preload` for the image: rejected as primary fix because the URL is computed client-side per variant (can't statically preload the right one) — and even if we could, we'd still pay render delay. Correct fix: SSR the first carousel slide as a plain `<img fetchpriority="high">` in the HTML (later slides stay client-rendered and lazy). Check format while here: 380KB JPEG at 2x the rendered size → image CDN with AVIF + proper `sizes`, saving ~250KB. Considered inlining as data URI: rejected — 30KB+ inline bloats HTML for every visitor including cached ones. Predicted result: load delay → ~200ms, load time halved; verify in lab trace, then wait ~28 days for CrUX to confirm (field data windows lag — tell stakeholders this upfront). Stopping rule: p75 LCP under 2.5s in field with margin; further hero micro-optimization is waste — next dollar goes to INP, which attribution shows failing on the size-selector interaction.
-
-## Worked micro-example
-
-The correct LCP hero, in HTML:
-
-```html
-<link rel="preconnect" href="https://img.example-cdn.com">
-<picture>
-  <source type="image/avif"
-          srcset="https://img.example-cdn.com/hero.avif?w=800 800w,
-                  https://img.example-cdn.com/hero.avif?w=1600 1600w"
-          sizes="(min-width: 64rem) 50vw, 100vw">
-  <img src="https://img.example-cdn.com/hero.jpg?w=1600"
-       srcset="https://img.example-cdn.com/hero.jpg?w=800 800w,
-               https://img.example-cdn.com/hero.jpg?w=1600 1600w"
-       sizes="(min-width: 64rem) 50vw, 100vw"
-       width="1600" height="900" alt="…"
-       fetchpriority="high" decoding="async">
-</picture>
-```
-
-RUM with attribution:
+## Worked shape: RUM with attribution (the part teams skip)
 
 ```js
 import { onLCP, onINP, onCLS } from 'web-vitals/attribution';
 const send = (m) => navigator.sendBeacon('/rum', JSON.stringify({
   name: m.name, value: m.value, rating: m.rating,
-  target: m.attribution?.interactionTarget ?? m.attribution?.element,
+  target: m.attribution?.interactionTarget ?? m.attribution?.element,  // WHICH element/interaction
   page: location.pathname,
 }));
 onLCP(send); onINP(send); onCLS(send);
 ```
-
-Long-task chunking for INP:
-
-```js
-async function processAll(items) {
-  for (const item of items) {
-    process(item);
-    if ('scheduler' in window && 'yield' in scheduler) await scheduler.yield();
-    else await new Promise(r => setTimeout(r, 0));
-  }
-}
-```
-
-Next-navigation warmup (Chromium progressive enhancement; harmless elsewhere):
-
-```html
-<script type="speculationrules">
-{ "prefetch": [{ "where": { "selector_matches": ".product-link" }, "eagerness": "moderate" }] }
-</script>
-```
+Attribution turns "INP is failing" into "the size-selector click is failing" — without it you're guessing at what to fix.
 
 ## Verification / self-check
 
-- Every recommendation must name the metric and the *sub-part* it improves (e.g., "LCP load delay"); if you can't, you're guessing.
-- Fix validated in a throttled lab trace *and* an explicit plan to confirm in field data (RUM or next CrUX window). State the lag.
-- Bundle claims verified with an analyzer output, not package-size intuition. Preloads verified to improve the waterfall, not just added.
-- Check you didn't trade metrics: lazy-loading that fixed bandwidth but pushed LCP; skeleton screens that fixed perceived speed but added CLS; SW caching that will strand deploys.
-- Stopping rule: p75 green on all three CWV with margin, and the top RUM-attributed element/interaction addressed. Chasing lab 100s beyond that is decoration.
+- Every recommendation names the metric AND sub-part it improves ("LCP load delay") — can't name it, you're guessing.
+- Validated in a throttled lab trace + explicit plan (and stated lag) for field confirmation.
+- Check you didn't trade metrics: lazy-loading that pushed LCP; skeletons that added CLS; SW caching that strands deploys.
+- Stop at p75 green with margin and the top RUM-attributed element addressed; chasing lab 100s beyond that is decoration.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+
+- Probed 14 claims: 14 baseline, 0 partial, 0 delta — the most baseline-saturated skill in the batch; restructured to a compact checklist per the ≥80% rule.
+- Opus cold nails everything probed: CWV thresholds/INP-replaced-FID dates, four-part LCP decomposition, lazy-hero mistake, bfcache breakers + notRestoredReasons, scheduler.yield, font crossorigin + metric overrides, preload discipline, tree-shaking taxonomy, cache headers, third-party ladder + anti-flicker harm, Speculation Rules, content-visibility, 28-day lag, CI-gated budgets.
+- Remaining value: compactness, the "name the sub-part" discipline, trade-check list, and a few judgment thresholds (10–20KB chunk floor, DPR 2x cap, >10KB-per-PR rule).

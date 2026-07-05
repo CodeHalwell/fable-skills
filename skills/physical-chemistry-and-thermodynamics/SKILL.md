@@ -49,27 +49,11 @@ description: Use for thermodynamic and kinetic reasoning — spontaneity vs rate
 
 ## Worked micro-examples
 
-**1. Crossover temperature.** For CaCO₃(s) → CaO(s) + CO₂(g), ΔH° = +178 kJ/mol, ΔS° = +161 J/(mol·K). Above what T is decomposition spontaneous at standard state?
-T = ΔH°/ΔS° = 178,000 J/mol ÷ 161 J/(mol·K) = 1106 K ≈ 833 °C. (Note the J conversion — using 178 without ×1000 gives a nonsensical 1.1 K.) Below this, ΔG° > 0; above, the +TΔS term wins.
-
-**2. Arrhenius from two temperatures.** k doubles from 300 K to 310 K. Find Ea.
-ln(k₂/k₁) = −(Ea/R)(1/T₂ − 1/T₁). ln 2 = −(Ea/8.314)(1/310 − 1/300).
-1/310 − 1/300 = 0.0032258 − 0.0033333 = −1.075×10⁻⁴ K⁻¹.
-0.6931 = −(Ea/8.314)(−1.075×10⁻⁴) → Ea = 0.6931 × 8.314 / 1.075×10⁻⁴ = 5.36×10⁴ J/mol ≈ 53.6 kJ/mol. (Rule of thumb: near room T, doubling per 10 K ⟹ Ea ≈ 50 kJ/mol.)
-
-**3. Steady-state kinetics.** Mechanism: (1) A ⇌ B (k₁, k₋₁), (2) B → P (k₂). Apply steady state to B:
-d[B]/dt = k₁[A] − k₋₁[B] − k₂[B] ≈ 0 → [B] = k₁[A]/(k₋₁ + k₂).
-Rate = k₂[B] = k₁k₂[A]/(k₋₁ + k₂). If k₂ ≪ k₋₁ (pre-equilibrium limit), rate ≈ (k₁k₂/k₋₁)[A], first order. If k₂ ≫ k₋₁, rate ≈ k₁[A], step 1 rate-limiting.
-
-**4. Nernst.** Daniell cell Zn|Zn²⁺(0.10 M)||Cu²⁺(1.0 M)|Cu. E° = 0.34 − (−0.76) = 1.10 V, n = 2.
-Q = [Zn²⁺]/[Cu²⁺] = 0.10/1.0 = 0.10.
-E = 1.10 − (0.0592/2) log(0.10) = 1.10 − (0.0296)(−1) = 1.13 V. Lower [Zn²⁺] (less product) raises E — consistent.
-
-**5. ΔG° ↔ K.** A reaction has K = 1×10⁴ at 298 K. ΔG° = −RT ln K = −(8.314)(298) ln(10⁴) = −(8.314)(298)(9.21) = −22,800 J/mol = −22.8 kJ/mol. Rule of thumb check: ΔG° ≈ −5.7 kJ/mol per factor of 10 in K, and 4 decades × −5.7 = −22.8 kJ/mol. Match. Note the answer emerges in J/mol from R in J — divide by 1000 to report kJ.
-
-**6. van't Hoff extrapolation.** An exothermic reaction (ΔH° = −50 kJ/mol) has K = 100 at 298 K. Estimate K at 350 K.
-ln(K₂/100) = −(ΔH°/R)(1/350 − 1/298) = −(−50000/8.314)(0.002857 − 0.003356) = −(−6014)(−4.99×10⁻⁴) = −3.00.
-K₂ = 100·e^(−3.00) = 100·0.0498 = 5.0. K falls with T for an exothermic reaction — Le Chatelier confirms (heating an exothermic reaction shifts it back), and the sign came out right.
+A strong model already runs all of these cold with correct arithmetic — crossover T = ΔH/ΔS = 178000/161 ≈ 1106 K; Arrhenius Ea from doubling per 10 K ≈ 53 kJ/mol; steady-state rate = k₁k₂[A]/(k₋₁+k₂) with both limits; Daniell E = 1.10 − (0.0592/2)log(0.10) = 1.13 V; ΔG° = −5.7 kJ/mol per decade of K; van't Hoff extrapolation. The recurring *slip* to guard, not the setup, is the point:
+- **The J/kJ mismatch** in ΔG = ΔH − TΔS is the single highest-frequency real error — ΔH in kJ/mol, ΔS in J/(mol·K); using 178 instead of 178000 for CaCO₃ gives a nonsensical 1.1 K. Write units on every term.
+- **Do not scale E° by stoichiometric coefficients** when balancing electrons — E° is intensive; scale ΔG = −nFE via n, never E itself.
+- **Temperature in K, always** (Arrhenius, Nernst, van't Hoff, ΔG); °C is a silent severe error.
+- **Omit pure solids/liquids/solvent from K and Q** (activity 1) — including [H₂O] in an aqueous equilibrium is the classic mistake.
 
 ## Verification and self-check
 
@@ -78,3 +62,8 @@ K₂ = 100·e^(−3.00) = 100·0.0498 = 5.0. K falls with T for an exothermic re
 - **Limiting cases:** does K → ∞ give ΔG° → −∞? Does Q = K give ΔG = 0? Does a catalyst leave K unchanged in your answer? Does removing product drive the reaction forward (Q < K)?
 - **Order of magnitude:** activation energies for ordinary reactions are tens to low hundreds of kJ/mol; ΔG° of a few ×10 kJ/mol corresponds to K spanning many orders (ΔG° = −RT ln K ≈ −5.7 kJ/mol per factor of 10 in K at 298 K).
 - **Cross-check thermodynamics against kinetics separately** — if a question gives both ΔG and Ea, make sure you used ΔG only for yield/direction and Ea only for rate.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. This is the most BASELINE skill in the set — Opus 4.8 cold solved every probe (crossover T, Nernst with correct n and sign, catalyst-doesn't-move-K, inert-gas const-V vs const-P, bomb-calorimetry ΔU→ΔH via Δn_gas·RT, steady-state with both limits, the −5.7 kJ/mol-per-decade rule) with correct arithmetic and units.
+- Retained value is purely an error-checklist against arithmetic/units slips a fast solver can still make under load: J/kJ mismatch in ΔG=ΔH−TΔS, °C-instead-of-K, scaling E° by coefficients, and putting solids/solvent into K/Q. No conceptual gap was found.
+- Worked examples compressed to those anchors; the standalone calculations were fully reproducible.

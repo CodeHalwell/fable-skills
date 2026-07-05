@@ -5,172 +5,70 @@ description: Load when production is broken or degraded — triaging an outage, 
 
 # Incident Response
 
-## Core mental model
+## The standard playbook, one line each
 
-- **Mitigate first, diagnose later.** The prime directive. During an incident your job is to stop user pain, not to understand the failure — understanding is the postmortem's job. Most mitigations (rollback, failover, feature-kill, restart, shed load, add capacity) work *without* knowing the root cause. Every minute spent building a beautiful theory while a rollback button sits unpressed is user pain you chose. The correction for smart engineers especially: curiosity is the enemy in the first 15 minutes — the interesting bug will still be interesting tomorrow; capture forensics (grab a heap dump, snapshot dashboards, note the timeline) *if cheap*, then mitigate.
-- **The what-changed prior.** Most production incidents are triggered by a change someone made: a deploy, a config push, a feature-flag flip, a cert rotation, a dependency's deploy, a scheduled job, a traffic shift. Systems that were stable an hour ago rarely spontaneously fail. So the first diagnostic question is never "what's broken?" — it's "what changed?" Check the deploy log, flag audit log, config history, and infra change feed for the window before symptom onset, including *adjacent* teams' changes. If something changed and the timing fits, revert it on suspicion — you don't need proof, you need correlation plus reversibility.
-- **Incidents are managed, not just solved.** Past trivial severity, the constraint isn't technical skill, it's coordination: who's doing what, what's been tried, who's telling the stakeholders. An explicit structure (roles, a single channel, a running timeline) is what prevents the two classic coordination failures: five people silently making conflicting changes, and zero people doing the obvious thing because each assumed another was.
-- **Severity buys resources and permission.** Classifying severity isn't bureaucracy — it decides who gets paged, whether you may take risky mitigations (serving stale data, disabling a feature for everyone), and how often you must communicate. Classify by *user impact and trajectory*, not by how alarming the internals look. When uncertain, classify high and downgrade: over-paging costs minutes of attention; under-paging costs hours of unmanaged outage. Downgrading feels good; upgrading late feels like a cover-up.
-- **The postmortem is the product.** The incident itself is sunk cost; the only return on it is what changes afterward. A postmortem that produces a root-cause sentence and no system changes converted user pain into paperwork.
+A strong model already knows this discipline cold; it's listed only so the corrections below have anchors. Mitigate first, diagnose in the postmortem — most mitigations (rollback, failover, kill-switch, degrade, shed load) need no root cause. First question is "what changed?" (deploys, flags, config, certs, crons, *adjacent teams*' changes), and you revert on correlation + reversibility, never on proof. Declare mechanically: symptom alert + plausible user impact → declare; solo-debugging >15 min without mitigation, or blast radius past one customer → declare. IC coordinates and never debugs (the player-coach collapse is the #1 structural failure); responders narrate what they try; comms go out on a fixed clock (30 min for high-sev) always naming the next update time. Severity = breadth × depth × trajectory — a climbing symptom classifies one level above its current impact — and never internal drama or embarrassment. Page only on symptoms (multiwindow error-budget burn: 14.4× fast / 6× slow), single-digit pages per week, every page actionable with a runbook. Postmortems: blameless, contributing factors not a single root cause, ≤5 action items with owner + ticket + date, at least one attacking detection/mitigation speed.
 
-## Declaring: the cheapest decision you'll make all incident
+## Corrections to the trained instinct
 
-- Declare early and cheaply. The cost of declaring an incident that fizzles is ten minutes of two people's time; the cost of *not* declaring is 40 minutes of one engineer quietly drowning while stakeholders discover the outage from customers. Set the bar mechanically: symptom alert fired + user impact plausible → declare, open the channel, name an IC. You can always close it as "false alarm" — closed-as-nothing incidents are evidence of a healthy trigger finger, not waste.
-- Solo-debugging thresholds: if you've been investigating alone for 15 minutes without mitigation, or the blast radius exceeds one customer, declare. The failure mode this prevents has a name in every postmortem: "the on-call knew at 13:45 but the incident was declared at 14:40."
-- Declaring is also what starts the clock on everything else in this skill — roles, comms cadence, timeline capture. None of it happens retroactively.
+Where the playbook a strong engineer (or model) produces cold is subtly wrong:
 
-## The first five minutes: the mitigation decision tree
+- **Parallel reverts are fine; the "one change at a time" rule is for novel changes only.** The reflex is to serialize everything: revert the flag, wait, then maybe roll back the deploy. Over-general. Two *reverts to known-good* (flag revert + deploy rollback) can go simultaneously — both are safe, and you do not need to know which was guilty before acting; attribution is postmortem work, and waiting between near-free reverts is user pain spent on curiosity. What must be serialized — one at a time, announced, with a stated expected effect — is *novel* changes: config edits, failovers, capacity moves. Blanket serialization slows mitigation; blanket parallelism destroys attribution. Split by revert-vs-novel.
+- **The author's veto.** "It can't be my change, it's a one-liner" reliably delays the guilty revert. Authors systematically underrate blast radius and are anchored on having tested it. Timelines and reverts adjudicate, not authors — and the one-line "safe" change is over-represented in triggers precisely because it skipped scrutiny. If the flag revert fixes it, the deploy is exonerated by evidence instead of by its author.
+- **Keep a specimen; don't just "capture forensics first."** The standard advice (heap dump, then restart) loses the live state. The stronger move: pull one sick instance out of the LB and leave it *running* as a specimen while restarting the rest. Mitigation and forensics are compatible if you think for ten seconds; a fleet-wide restart both masks the bug for 6 hours and deletes the evidence.
+- **Recheck "what changed" twice.** People miss the flag flip on the first pass; the IC re-runs the change sweep with fresh eyes ~15 minutes in. Also: if the graphs say errors started at 14:02 and the suspect deploy landed 14:20, the deploy is innocent regardless of how suspicious it looks — but a deploy 22 minutes *before* onset stays a suspect (gradual rollouts and caches delay onsets).
+- **Declaring victory on a masked symptom.** Error rate fell because the cache refilled, traffic dipped at lunch, or retries are absorbing it — not because your fix worked. Before standing down: tie recovery causally to your action (timing matches, mechanism explains it) and confirm on the *user-facing* metric. And if the revert fixed it but you don't know why (5% was fine, 50% wasn't — smells like a capacity cliff), the incident is mitigated but the risk is live: pin the change off, file the investigation *before* standing down; re-rolling without the answer schedules a rerun.
+- **The "watch and see" non-decision.** "Give it 10 more minutes" repeated four times is a 40-minute decision to do nothing, never actually made. IC forces the framing: what specifically are we waiting to learn, and what do we do at each outcome? No answer → act now.
+- **Handoffs have a physiology.** After ~2–4 hours of high-sev response, effectiveness craters and risk appetite goes weird. The IC schedules relief before that point; handoff means the incoming person reads the timeline and states the situation back — not "you're up, good luck."
+- **Sub-severity blips get a tracking issue.** The weird self-recovering blip is a near-miss: same causal structure as a disaster, minus the harm and the politics. Three identical blips are an incident announcing itself in installments. If your incident count is low, near-misses are most of your training data — postmortem them at a discount.
+- **Game days: purpose-rank before injecting chaos.** (1) Rehearse *response* — people, roles, rollback under a clock; (2) validate *recovery mechanisms* — does failover fail over, does the kill switch work, do backups restore; (3) discover unknown failure modes. Most teams buy lesson 3 before mastering 1–2; injecting novel chaos into a system whose *known* recovery paths are untested is paying for advanced lessons before the basics. Cheapest high-value version: re-run a recent real incident as a tabletop — it finds runbook rot, stale credentials, and "who can actually approve a region failover?" every single time, and every real incident should end with a "was the runbook right?" line item.
+- **Nobody writes anything down during the incident** → the postmortem timeline gets reconstructed from memory three days later and the 14:07–14:20 wrong turn is invisible. The IC's running log (or a bot capturing the channel, with timestamps on graph screenshots *including time ranges*) is the raw data for every lesson; write the minute-by-minute timeline *before* anyone theorizes — it usually falsifies the story people remember.
+- **Retry storms invert the capacity fix.** Load-shaped symptoms (queues growing, saturation) get "add capacity" — but capacity added into a retry storm feeds it. Before scaling anything, ask: what is actually saturated, and does added capacity increase load on the saturated thing (more web workers = more DB pressure)? Shed load / reduce retry aggression first.
 
-Run this in order. It's a decision tree, not a checklist — take the first exit that applies.
+## The first five minutes (take the first exit that applies)
 
-1. **Confirm real user impact** (30 seconds, not 10 minutes): is a user-facing symptom metric moving — error rate, latency, key business metric? A cause-alert (CPU, disk) with no symptom movement is not (yet) an incident; downgrade urgency.
-2. **Did we change something?** Deploy/flag/config in the correlation window → **revert it now**, on suspicion. Reverting a healthy change costs a re-deploy; not reverting the guilty one costs the whole outage. Do not wait to be sure. Do not let the change's author talk you into "it can't be my change" — authors systematically underrate their changes' blast radius (and are anchored on having tested it).
-3. **No candidate change, or revert didn't help — is impact isolated?** One region/AZ/instance/shard → **fail over / drain it**. You can autopsy the sick node later; that's the point of having redundancy.
-4. **Is a specific feature or dependency implicated?** → **kill-switch it or degrade gracefully** (serve cached/stale, disable the recommendation panel, queue writes). A degraded product beats a down product.
-5. **Load-shaped?** (queues growing, saturation, retry storms) → **shed load and add capacity**: rate-limit the biggest or least-critical traffic source, scale out, turn off expensive background work. Beware: if you suspect a retry storm, adding capacity alone often just feeds it — reduce retry aggression too.
-6. **None of the above** → now you're in genuine diagnosis mode (below), but re-run this tree every ~15 minutes as evidence arrives; mitigations that weren't available at T+2 become available once you've localized the fault.
+1. Confirm real user impact (30 s): a cause alert (CPU, disk) with no symptom movement is not yet an incident.
+2. Something changed in the window? → revert now, on suspicion. Both candidates revertible → revert both (see above).
+3. Impact isolated to a region/AZ/shard? → fail over / drain; autopsy the sick node later.
+4. A feature or dependency implicated? → kill-switch or degrade (stale cache beats down).
+5. Load-shaped? → shed load + reduce retries, then capacity.
+6. None → genuine diagnosis: explicit hypotheses stated with predictions *before* looking; bisecting questions first (one service or all? one region? reads or writes? one customer?); timebox each theory ~15 min and assign a second responder to a *different* hypothesis rather than piling on; re-run this tree every ~15 min.
 
-The rollback-vs-fix-forward rule under pressure: rollback is rehearsed and mechanical; a live-written fix is an unreviewed change deployed to a system you demonstrably don't understand (it's broken and you don't know why). Roll back unless rollback is impossible (irreversible data written, the change is days old with dependents stacked on it) or the fix is genuinely trivial *and* faster than the rollback path. "The fix is obvious" at 3am has a humbling failure rate — and a failed fix-forward costs you the diagnosis time *plus* a now-more-confusing system state.
+## Severity ladder (pre-agree per product; the rightmost columns are the point)
 
-## Roles and comms discipline
+| Sev | Definition (user terms) | What it buys/demands |
+|---|---|---|
+| 1 | Critical path down or data loss, many users | Page IC + responders + exec note; risky mitigations pre-authorized; 30-min comms + status page |
+| 2 | Critical path degraded, or secondary feature down | Page on-call, IC assigned, change discipline suspended for reverts; 60-min comms |
+| 3 | Minor, workaround exists, not worsening | Ticket, business hours, no page |
 
-- **Incident Commander (IC) does not touch keyboards.** The IC's job is state management: maintain the timeline, decide priorities, assign work, ensure exactly one owner per action, and make the risky-mitigation calls. The moment the IC starts debugging, nobody is running the incident — this is the single most common structural failure. In a two-person incident, one person still explicitly takes IC; in a one-person incident, your first action is deciding whether to page a second so one of you can be IC.
-- **Ops/subject-matter responders** do hands-on work, and narrate it in the channel: "trying X, expect Y, will report by :45." Silent debugging is invisible debugging — the IC can't coordinate what they can't see.
-- **Comms lead** (IC does it if unstaffed): status updates *on a clock* — every 30 minutes for high-sev, even when the update is "no change, still investigating, next update 15:30." Updates on a clock, not on progress: stakeholders who don't hear anything escalate, ping responders directly, and start shadow incidents. A predictable cadence is what buys responders silence to work in. Template: impact (user terms), current hypothesis or "unknown," actions in flight, next update time. Never speculate about cause in external comms.
-- One channel per incident, timestamps on everything (screenshots of graphs *with time ranges*), decisions logged as they're made. The channel log is the postmortem's raw material and the 2am-handoff document.
-- **Handoffs are explicit.** Long incidents kill people via fatigue; after ~2–4 hours of high-sev response, effectiveness craters and risk appetite goes weird. The IC schedules relief, and handoff means the incoming person reads the timeline and states the situation back — not "you're up, good luck."
+Trajectory rule: anything climbing classifies one level up. Upgrades announce immediately; downgrades wait for sustained evidence, not one good minute on a graph.
 
-## Severity classification reasoning
-
-- Classify on three inputs, in this order: **breadth** (what fraction of users/requests/revenue), **depth** (hard failure vs degraded vs cosmetic; any data loss or security dimension jumps a level automatically), **trajectory** (stable, recovering, or climbing — a climbing symptom classifies one level above its current impact, because you're classifying where it will be in 20 minutes, not where it is).
-- Ignore two tempting inputs: how dramatic the internals look (a scary failover with zero user impact is low-sev), and how embarrassing the cause is (severity measures impact, not blame — mixing them teaches people to lowball).
-- Severity is a *live* variable: the IC re-evaluates at every status update. Upgrades are announced immediately (they change who's involved and what's authorized); downgrades wait for sustained evidence, not one good minute on a graph.
-- Pre-agree the definitions per product (the table in the examples below) so the 3am classification is a lookup, not a negotiation. The worst time to design a severity scheme is during the incident that needed it.
-- Sub-severity but nonzero events (the "weird blip" that self-recovered) get a lightweight tracking issue anyway — they're your near-miss inventory (see postmortems), and three identical blips are an incident announcing itself in installments.
-
-## Diagnosis under pressure
-
-When you must actually diagnose (tree exhausted, or mitigation needs a target):
-
-- **Form explicit hypotheses and say them out loud.** "I think it's connection-pool exhaustion in the payments service; if so, `pg_stat_activity` should show saturation." Stating the prediction *before* looking is what keeps a check honest — otherwise every graph confirms whatever you already believe.
-- **Cheap tests first, information-dense tests first.** Order checks by (probability × cheapness): recent changes (again — check twice, people miss the flag flip), dashboards that bisect the system (is it one service or all? one region or all? reads or writes? one customer or all?), then logs, then the expensive stuff (heap dumps, packet captures). The bisecting questions are the highest-value moves in all of incident response: each one halves the search space.
-- **Beware anchoring.** The classic trap: the first plausible theory absorbs all attention for 40 minutes. Antidotes: the IC keeps a visible list of open hypotheses; timebox each line of investigation ("15 minutes on the DB theory, then we re-review"); assign a second responder to a *different* hypothesis in parallel rather than piling everyone onto the leading one; and periodically ask the disconfirming question — "what evidence do we have that it's *not* the DB?"
-- **Trust symptoms over stories.** If the graphs say the errors started at 14:02 and the suspect deploy finished at 14:20, the deploy is innocent no matter how suspicious it looks. Timeline discipline eliminates suspects faster than anything else.
-- Correlated multi-service weirdness → look *down* the stack (shared infra: DNS, service mesh, database, cloud provider — check the provider status page and your own change feed) or *out* (a shared dependency's incident). Single-service weirdness → look at that service's changes and its direct dependencies.
-
-## How an expert thinks through it
-
-*14:07 — pages: checkout error rate 0.5% → 8% and climbing.*
-
-Confirm impact: checkout success rate dropping on the business dashboard. Real. Trajectory is worsening → treat as high-sev now, downgrade later if wrong. Declare, open channel, take IC, page one more responder — I will not debug and command simultaneously.
-
-What changed? Deploy log: checkout service shipped 13:40. Errors started 14:02. Twenty-two minutes of gap makes it non-obvious — but rollouts are gradual and caches mask onsets, so it stays suspect #1. Flag log: a payments-routing flag went 5%→50% at 13:58. *That* timing is a bullseye. Two candidates; both are cheap to revert. Decision: revert the flag first (13:58→14:02 beats 13:40→14:02, and a flag revert is seconds), and if no recovery in 5 minutes, roll back the deploy too — I do NOT need to know which is guilty before acting; both reverts are near-free. Rejected: "investigate which one is really the cause first" — that's diagnosis before mitigation, and it buys nothing since reverting both is safe. Also rejected: the deploy author's "my change only touched logging" — noted, not trusted; if the flag revert fixes it, their change is exonerated by evidence instead.
-
-14:11 — flag reverted. Error rate falling. 14:16 — back to baseline. Mitigated. Comms: "User impact: elevated checkout failures 14:02–14:16, now recovered. Trigger: payments-routing rollout, reverted. Monitoring." Now — and only now — the interesting question: *why* did 50% break when 5% was fine? Smells like a capacity cliff at the new payment path (connection pool? rate limit at the provider?). That investigation happens calmly, today, with the flag pinned off — and it goes in the postmortem, because "revert fixed it" is a mitigation, not an understanding, and re-rolling the flag without the answer just schedules a rerun of the incident.
-
-## Blameless postmortems that change things
-
-- **Blameless is an accuracy technology, not a kindness.** The instant someone might be punished for what they say, you stop getting true timelines — people sand off the details ("I skipped the canary because we were behind") that contain all the learning. "Blameless" doesn't mean consequence-free for negligence; it means the analysis assumes people acted reasonably on the information they had, and asks why the *system* made the wrong action easy and the right one hard.
-- **Contributing factors over root cause.** "Root cause: engineer pushed bad config" is where analysis goes to die. Real incidents are conjunctions: the config was malformed *and* the validator didn't check size *and* it propagated globally with no canary *and* the consumer crashed instead of rejecting *and* the alert took 20 minutes. Each factor is an independent fix opportunity; the singular "root cause" framing hides four of the five. Ask "what had to be true for this to happen?" until you hit organizational choices, and separately ask what made *detection* and *mitigation* slow — MTTR factors are usually more fixable than trigger factors.
-- **Action items: owner, deadline, tracked in the real work system** (Jira/Linear, not the postmortem doc), and few. Ten action items are a wish list; three that ship are a changed system. Prefer items that remove failure modes (validate config at generation; make the migration tool refuse table locks) over items that ask humans to be more careful ("add a checklist step" decays in weeks). Review outstanding postmortem items monthly — an unreviewed action-item backlog is where reliability goes to die quietly.
-- **Mine near-misses.** The incident where the canary caught it, where one replica survived, where someone happened to notice — same causal structure as a disaster, minus the harm, minus the political heat. Teams that postmortem near-misses learn at a discount. If your incident count is low, near-misses are most of your training data.
-- Timeline first, analysis second. Write the minute-by-minute from the channel log before anyone theorizes; the timeline usually falsifies the story people remember.
-- A skeleton that forces the right analysis (adapt, don't bloat):
+## Postmortem skeleton (forces the analysis that matters)
 
 ```markdown
 # INC-2231: Elevated checkout failures — 2026-07-03
-Impact: 8–12% of checkout attempts failed, 14:02–14:16 UTC (~3,400 users, ~$41k delayed GMV)
-Detection: symptom alert at 14:07 (5 min after onset — why not sooner? see CF-4)
+Impact: 8–12% of checkouts failed 14:02–14:16 UTC (~3,400 users, ~$41k delayed GMV)
+Detection: alert at 14:07 — 5 min after onset; why not sooner? → CF-4
 ## Timeline (from channel log, not memory)
-13:58 payments-routing flag 5%→50% | 14:02 error rate departs baseline | 14:07 page ...
 ## Contributing factors (not "root cause")
-CF-1 Trigger: new payment path saturates provider connection limit above ~20% traffic
+CF-1 Trigger: new payment path saturates provider conn limit above ~20% traffic
 CF-2 The 5% soak could not have caught a >20% capacity cliff (rollout design)
-CF-3 Flag changes bypassed canary analysis that deploys get (control gap)
-CF-4 Detection lagged: alert window 5m; a 1m fast-burn window was missing
+CF-3 Flag changes bypassed the canary analysis deploys get (control gap)
+CF-4 Detection lagged: 5m alert window; 1m fast-burn window missing
 ## What went well / near misses
-Flag revert path worked in seconds; second responder paged early
-## Action items (owner, ticket, due)
-AI-1 Provider connection-limit headroom alarm — @maya, PAY-812, Jul 17
-AI-2 Flag rollouts >10% require metric gate — @sam, PLAT-455, Jul 31
-AI-3 Add 1m burn-rate window to checkout SLO alerts — @dana, OBS-203, Jul 10
+## Action items (owner, ticket, due) — each a system change, none "be more careful"
 ```
 
-## Alert fatigue: the silent incident-response killer
-
-- Fatigue is the failure mode that defeats everything above: a team paged 20× a week acks-and-snoozes by reflex, and the real page dies in the noise. Fatigued responders also mis-triage — the 47th "queue depth high" page gets 30 seconds of attention even when this time it's real.
-- **Page only on symptoms needing a human now** (user-facing impact or imminent-and-automated-response-impossible). Everything else is a ticket or a dashboard. Every page must be *actionable*: if the correct response to an alert is "watch it," it's not a page.
-- Track and enforce: pages per on-call shift (single digits per week is a healthy target; more than a couple per *night* is an emergency of its own), fraction of pages that were actionable, and fraction that got a real response vs. an ack-snooze. Review the noisiest alerts monthly and delete or demote them — deleting a bad alert is a reliability improvement, and it takes managerial cover to do, so say that out loud.
-- Every page needs a linked runbook or at least a "what this means, what to check first" note. A page with no next action converts directly into fatigue.
-
-## Game days and chaos engineering judgment
-
-- Purpose-rank: (1) rehearse *response* — people, roles, runbooks, rollback under a clock; (2) validate *recovery mechanisms* — does failover actually fail over, does the kill switch work, do backups restore; (3) discover unknown failure modes. Most teams should master 1 and 2 before touching 3 — injecting novel chaos into a system whose *known* recovery paths are untested is paying for advanced lessons before the basics.
-- Earn production chaos: start in staging, define the expected outcome and abort criteria *before* injecting ("we kill one Kafka broker; expectation: consumers rebalance <30s, zero message loss; abort if consumer lag exceeds X"), inject during business hours with the owning team watching, blast-radius-limited. A chaos experiment without a written expected outcome is just vandalism with a dashboard.
-- The cheapest high-value game day: pick a recent real incident and re-run it as a tabletop — same pages, people state what they'd check and do, facilitator reveals what they'd see. Costs an hour, finds runbook rot, stale credentials, "wait, who can actually approve a region failover?" gaps every single time.
-
-## Failure modes & pitfalls
-
-- **Diagnosing past an available rollback.** The team spends 50 minutes root-causing while the 13:40 deploy sits unreverted "because we're not sure it's the cause." Revert on correlation; certainty is for postmortems.
-- **The author's veto.** "It can't be my change, it's a one-liner" delays the revert. Timelines and reverts adjudicate, not authors. (Corollary: the one-line "safe" change is over-represented in incident triggers precisely because it skips scrutiny.)
-- **IC diving into logs.** Ten minutes later two responders are restarting the same service from opposite ends and nobody has updated stakeholders in 40 minutes. If the IC has domain expertise the incident needs, the IC *hands off command* first, explicitly.
-- **Restart-as-diagnosis destroying evidence *and* masking the bug.** Rebooting the leaking process clears the symptom for 6 hours and deletes the heap. If you must restart, take one instance out of the LB and keep it as a specimen — mitigation and forensics are compatible if you think for ten seconds.
-- **Status updates only when there's news.** Silence reads as abandonment; stakeholders escalate into the response channel and responders start context-switching to reassure VPs. Clock-based cadence, always naming the next update time.
-- **Fixing the symptom you can see instead of the saturation you can't**: scaling web tier when the DB is the bottleneck (more workers = more DB pressure = worse), or adding capacity into a retry storm (feeds it). Before adding resources, ask "what is actually saturated?" and "will the added capacity increase load on the saturated thing?"
-- **Two mitigations at once.** Flag revert and deploy rollback simultaneously is fine (both are safe reverts to known-good). But two *novel* changes at once (config edit + failover) means when things improve — or worsen — you can't attribute it, and you may have created a second incident. Novel changes: one at a time, announced, with an expected effect.
-- **Too many responders.** Sev-1 gets declared and fifteen people join, each poking at prod "to help" — change attribution dies and the IC spends the incident moderating. The IC's tool is explicit assignment: named owners for 2–3 workstreams, everyone else observes silently or leaves. More hands ≠ more progress past about four active responders.
-- **Declaring victory on a masked symptom.** Error rate dropped because the cache refilled / traffic dipped at lunch / retries are absorbing it — not because the fix worked. Before standing down, tie recovery causally to your action (timing matches, mechanism explains it) and confirm on the *user-facing* metric, not an internal proxy.
-- **The "watch and see" non-decision.** "Let's give it 10 more minutes" repeated four times is a 40-minute decision to do nothing, made without ever being made. The IC forces the framing: what specifically are we waiting to learn, and what will we do at each outcome? If there's no answer, act now.
-- **Sev classification by internal drama.** A scary-looking master-failover with zero user impact gets sev-1 while a 3%-of-checkouts silent failure ambles along as sev-3 for six hours. Classify on user impact and trajectory; a low-and-climbing symptom outranks a big-but-recovered one.
-- **Postmortem action item: "be more careful during deploys."** Not falsifiable, not owned, decays instantly. Rewrite every human-vigilance item as a system change or delete it.
-- **The runbook that describes the old architecture.** Mid-incident is when you discover the failover procedure references a cluster decommissioned last quarter. Runbooks rot on the same clock as infrastructure; the tabletop game day (above) is the cheapest rot detector, and every real incident should end with a "was the runbook right?" line item in the postmortem.
-- **Nobody writes anything down during the incident** — then the postmortem timeline is reconstructed from fallible memory three days later, and the 14:07–14:20 gap where the crucial wrong turn happened is invisible. The IC's running log (or an incident bot capturing the channel) is not bureaucracy; it's the raw data for every lesson you'll extract.
-- **Alert thresholds tuned once, in 2023.** Traffic doubled; the "queue depth > 10k" page now fires nightly and means nothing. Alerts need the same lifecycle as flags: owner, review date, deletion path.
-
-## Worked micro-examples
-
-**1. A severity ladder that makes decisions, not paperwork.** The columns that matter are the rightmost two — what the level *buys* and *demands*:
-
-| Sev | Definition (user terms) | Response | Comms cadence |
-|---|---|---|---|
-| 1 | Critical path down or data loss occurring for many users | Page IC + responders now, exec notification, risky mitigations pre-authorized (fail over region, kill features) | Every 30 min, plus public status page |
-| 2 | Critical path degraded (elevated errors/latency) or full outage of a secondary feature | Page on-call, IC assigned, normal-change discipline suspended for reverts | Every 60 min, internal |
-| 3 | Minor degradation, workaround exists, not worsening | Ticket + business-hours fix; no page | On resolution |
-
-Plus the trajectory rule: anything *climbing* gets classified one level above its current impact.
-
-**2. Status update template (fill-in, 60 seconds to write):**
-
-```text
-[SEV2] Checkout errors — update 14:30
-Impact: ~8% of checkout attempts failing since 14:02 (was 12% at peak).
-Cause: suspected payments-routing flag rollout; flag reverted 14:11.
-Actions: monitoring recovery; payments team checking pool saturation on new path.
-Next update: 15:00 or on material change. IC: @dana  Channel: #inc-2231
-```
-
-Impact in user terms, hypothesis labeled as suspected, named next-update time. No speculation about blame, no internal jargon in anything customer-facing.
-
-**3. Page on symptoms via error-budget burn rate (Prometheus), not on causes.** The multiwindow burn-rate alert — fast window catches cliffs, slow window confirms it's not a blip:
-
-```yaml
-- alert: CheckoutAvailabilityBurn
-  expr: |
-    ( sum(rate(http_requests_total{job="checkout",code=~"5.."}[5m]))
-      / sum(rate(http_requests_total{job="checkout"}[5m])) ) > (14.4 * 0.001)
-    and
-    ( sum(rate(http_requests_total{job="checkout",code=~"5.."}[1h]))
-      / sum(rate(http_requests_total{job="checkout"}[1h])) ) > (14.4 * 0.001)
-  labels: {severity: page}
-  annotations:
-    runbook: https://runbooks/checkout-availability
-```
-
-14.4× burn of a 99.9% SLO ≈ exhausting a 30-day error budget in ~2 days — fast enough to page, slow enough to be real. The `queue_depth > 10k` and `cpu > 90%` alerts this replaces become dashboard panels you consult *after* this pages.
+The quality gate: minute-level timeline from logs; ≥3 contributing factors with at least one detection/mitigation-speed factor; and the test — would these items have prevented *or materially shortened* this incident? If no item shortens MTTR, you analyzed the trigger and ignored the response.
 
 ## Verification / self-check
 
-- Mid-incident sanity loop (IC runs it every ~15 min): Is user impact still occurring — says who/which metric? What mitigation is in flight, who owns it, when do we expect effect? What's the next-best mitigation if it fails? When is the next stakeholder update? Have we re-checked "what changed" with fresh eyes?
-- Before closing an incident: symptom metric at baseline *and* you can articulate why (mitigation → effect), not just "graphs look better." If you mitigated without understanding (revert fixed it, cause unknown), the incident is mitigated but the risk is live — file the follow-up investigation before standing down, and pin the reverted change off until it's answered.
-- Postmortem quality gate: minute-level timeline from logs (not memory); ≥3 contributing factors including at least one detection/mitigation-speed factor; action items each with owner + ticket + date; and the test — *would these changes have prevented or materially shortened this incident?* If no item shortens MTTR, you analyzed the trigger and ignored the response.
-- Stopping rule for the response itself: users healthy, regression risk pinned (flag off, deploy pinned), forensics captured, follow-ups filed, timeline snapshotted. Root-causing beyond what mitigation requires is postmortem work — go to bed.
+- IC loop every ~15 min: impact still occurring per which metric? Mitigation in flight, owner, expected effect by when? Next-best mitigation if it fails? Next stakeholder update? "What changed" rechecked?
+- Before closing: symptom at baseline *and* you can say why (mechanism, timing); reverted-but-unexplained changes pinned off with a follow-up filed.
+- Stopping rule: users healthy, regression risk pinned, specimen/forensics captured, follow-ups filed, timeline snapshotted. Root-causing beyond what mitigation requires is postmortem work — go to bed.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 12 claims: 10 baseline (cut/compressed — IC discipline, declaration thresholds, comms cadence, severity inputs, burn-rate alerting incl. exact 14.4×/dual-window constants, action-item hygiene, contributing-factors framing, alert-fatigue rules, 15-responder coordination), 2 partial (sharpened), 0 hard deltas among probed claims.
+- Biggest baseline gaps: Opus over-serializes mitigation ("one change at a time" blanket rule) — missing the safe-reverts-in-parallel vs novel-changes-serial split; game-day guidance lacked the response>recovery>discovery purpose ranking; "capture forensics then restart" instead of keeping a live specimen out of the LB.
+- This file is deliberately a correction sheet: the playbook itself is baseline knowledge; only the anti-instinct corrections and lookup artifacts (ladder, skeleton) are kept at full weight.

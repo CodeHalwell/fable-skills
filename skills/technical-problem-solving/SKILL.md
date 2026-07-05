@@ -56,17 +56,7 @@ description: Use for general expert problem-solving heuristics — restating a p
 
 ## Worked micro-examples
 
-**1. Re-representation collapses a sum.** "Sum 1 + 2 + … + n." Forward grind is fine, but the *representation* insight — pair first and last (1+n), there are n/2 pairs each summing n+1 — gives n(n+1)/2 instantly and generalizes (Gauss). The geometric view (two triangles form an n×(n+1) rectangle) is the same idea, and shows why it's exact for all parities.
-
-**2. Dimensional analysis fixes a form.** Period of a pendulum: guess it depends on length L, gravity g, mass m. [T] = time. Only √(L/g) has dimension of time ([L]/[L/T²])^{1/2} = [T²]^{1/2} = T; mass can't appear (no other mass to cancel [M]). So T = C·√(L/g) with C dimensionless — and indeed C = 2π. Dimensional analysis got the entire functional form from nothing, and correctly predicts mass-independence.
-
-**3. Fermi estimate with a check.** Piano tuners in Chicago: ~3M people ÷ ~3 per household ≈ 1M households; ~1 in 20 owns a piano → 50,000 pianos; tuned ~once/year; a tuner does ~4/day × ~250 days ≈ 1000/year → ~50 tuners. Sanity check: order of magnitude tens-to-hundreds, not thousands — plausible for a service profession. The decomposition, not the final guess, is the skill.
-
-**4. Invariant kills a "reachability" question.** "A 8×8 board with two opposite corners removed — can 31 dominoes tile it?" Color like a checkerboard: each domino covers one black + one white. Opposite corners share a color, so 30 of one color and 32 of the other remain — the invariant (equal counts) is violated. No tiling exists, proven in one line by choosing the right representation (coloring/invariant) instead of enumerating placements.
-
-**5. Work backward on a construction.** "Make 24 from 3, 3, 8, 8 using +−×÷." Forward search is huge. Backward: 24 = 8 × 3, or 24 = 8 ÷ (something small). Try 8/(3 − 8/3): 8/3 = 2.667, 3 − 2.667 = 0.333, 8/0.333 = 24. Goal-directed factoring (what pairs multiply/divide to 24?) prunes the search to almost nothing.
-
-**6. Limiting case catches an error.** You derive that the resistance of two resistors in parallel is R₁ + R₂. Test the limit R₂ → 0 (a short): physically the combination should → 0, but the formula gives R₁. Contradiction — the formula is wrong. The correct R₁R₂/(R₁+R₂) → 0 as R₂ → 0. The limiting case exposed the mistake in seconds without re-checking the algebra.
+These illustrate the moves but are all solvable cold by a strong model (pendulum mass-independence from dimensions; mutilated-chessboard by checkerboard-coloring invariant; make-24 as 8/(3−8/3) by backward factoring; parallel-resistor error caught by the R₂→0 limit; piano-tuner Fermi ≈ 50). The load-bearing habit, not the answers: **when the work is getting *more* complicated instead of less, stop and re-represent** — that is the signal most solvers push through, and it is the single highest-value intervention in this skill.
 
 ## Verification and self-check
 
@@ -77,3 +67,8 @@ description: Use for general expert problem-solving heuristics — restating a p
 - **Sign and monotonicity** point the right way (answer moves correctly as inputs change).
 - **No circularity** — the derivation never assumed the conclusion; known vs goal stayed distinct.
 - **If only one fragile derivation exists**, re-derived it a second way before trusting it.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Near-zero knowledge delta — these are Opus 4.8's native strengths; it produced the pendulum dimensional argument, the chessboard invariant, backward-search for make-24, the parallel-resistor limiting-case catch, the piano-tuner Fermi decomposition, and comprehensive stuck-moves / sanity-check / master-move lists cold.
+- The skill's only real function is *behavioral triggering*: forcing the re-represent-when-it-gets-harder reflex, the separate adversarial verification pass, and the order-of-magnitude check on every number — habits a model has but does not always *invoke* under momentum. Kept as a checklist, not a knowledge source.
+- Worked examples cut to one-line pointers; full derivations were redundant.

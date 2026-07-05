@@ -52,17 +52,9 @@ description: Use for designing experiments that yield decisions — defining the
 
 ## Worked micro-examples
 
-**1. Sizing from the decision.** Baseline conversion 5%, you'll only ship if absolute lift ≥ 0.5pp (relative +10%). For a proportion, n per arm ≈ 16·p(1−p)/Δ² = 16·(0.05·0.95)/(0.005)² = 16·0.0475/0.000025 ≈ 30,400 per arm at 80% power, α=0.05. If instead you'd act on a 0.25pp lift, Δ halves and n quadruples to ~122,000/arm. The decision threshold, not statistics, set the scale.
-
-**2. Collider bias made concrete.** Estimating effect of a scholarship (treatment) on later income (outcome). Someone suggests "control for whether they graduated." But graduation is a *mediator* (scholarship → graduate → income) and partly a collider with ability. Controlling it removes the pathway you care about and opens a spurious ability path. Correct: adjust only for pre-treatment confounders (family income, prior grades); leave graduation out of the adjustment set.
-
-**3. Peeking cost.** With a fixed-n test, false-positive rate is 5%. Checking significance after every 10% of data (10 looks) and stopping at first hit pushes the actual false-positive rate above ~20%. Fix by pre-committing n or using O'Brien-Fleming boundaries so the early looks require much smaller p-values.
-
-**4. Matched-compute ablation.** Claim: "component C adds +2 BLEU." Proper test: train with and without C at identical data, steps, and a *separately tuned* learning rate for each config, across 3 seeds. If the +2 lies within the ±1.5 seed spread, it's noise. Report mean ± std, not the best run.
-
-**5. Simpson's paradox.** A hospital reports 30-day mortality of 3% for surgery vs 2% for medical management — surgery looks worse. But stratifying by severity: among severe cases surgery is 10% vs medical 15%; among mild cases surgery is 1% vs medical 1.5%. Surgery is better in *both* strata; the pooled number reverses only because sicker patients were preferentially sent to surgery (confounding by severity). Trust the within-stratum (adjusted) estimate.
-
-**6. Interference in a marketplace.** Testing a feature that boosts a seller's ranking, randomized by user. Treated users buy more from boosted sellers — but that inventory/attention is finite, so *control* users see fewer of those sellers and buy less. The user-level contrast overstates the true effect because control was contaminated. Fix: randomize by market/geo or use switchback (time-based) randomization so treatment and control don't share the same supply pool.
+All reproducible cold by a strong model (n≈30k/arm from 16·p(1−p)/Δ²; graduation as mediator+collider → leave out; ~20% false-positive rate at 10 looks; matched-compute multi-seed ablation; marketplace interference → switchback). Two sharpenings worth keeping because the model's *default* phrasing is looser than the correct rule:
+- **Simpson's paradox has no purely statistical answer — the DAG decides.** Trust the *stratified* estimate only when the stratifier is a confounder (the usual textbook severity case); trust the *pooled* estimate when the stratifier is a collider or post-treatment mediator. "Always trust the subgroups" is wrong.
+- **Sizing scales as 1/Δ²:** halving the effect you'll act on quadruples n. The decision threshold, not the statistics, sets the scale — so pin the decision first.
 
 ## Verification and self-check
 
@@ -73,3 +65,8 @@ description: Use for designing experiments that yield decisions — defining the
 - **Check for interference** (does treating one unit affect another?) and randomize at the right cluster level; use intention-to-treat against attrition.
 - **For ML:** one variable per ablation, matched compute/data/tuning, multiple seeds, variance reported.
 - **Ask what would make this result wrong** — novelty decay, confounded time periods, survivorship — and confirm the design rules each out.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Opus 4.8 cold produced the sample-size formula (~31k/arm), the mediator/collider adjustment rule via the backdoor criterion, ~20% peeking inflation, marketplace SUTVA + switchback fix, post-hoc-power-is-circular → report CI/TOST, matched-compute multi-seed ablation with bootstrap testing, and non-inferiority/TOST — and it *exceeded* the skill on Simpson (correctly making it DAG-dependent) and on A/B pitfalls (added SRM and Twyman's law unprompted).
+- No knowledge delta. The skill was slightly *behind* Opus on Simpson's paradox; that section was tightened to the DAG-dependent rule so the skill no longer under-teaches relative to the base model.
+- Worked examples compressed to the two rule-sharpenings; the arithmetic was reproducible.

@@ -7,171 +7,83 @@ description: Load when sizing a system before building it or scaling it — back
 
 ## Core mental model
 
-- **Estimate before you architect; the envelope decides the architecture.** 100 requests/sec fits on two boring VMs with Postgres — most "scalability" designs for it are waste. 100k req/s is a genuinely different system. The 15-minute back-of-envelope is what tells you which problem you actually have, and half the time it dissolves the hard problem entirely.
-- **Little's Law is the workhorse:** `L = λ × W` — concurrency = throughput × latency. It's exact, assumption-free at steady state, and applies at every layer: in-flight requests, DB connections, queue depth, thread pools, GPU batch slots. Almost every capacity question reduces to applying it at the right layer.
-- **Utilization and latency are enemies.** Queueing theory's one non-negotiable lesson: as utilization ρ → 1, wait time grows like 1/(1−ρ). At 50% busy, queues are negligible; at 80% they're noticeable; at 90–95% latency has exploded and small load ripples become outages. This hockey stick is why nothing latency-sensitive should be provisioned to run "efficiently" at 95%.
-- **Provision for the peak, pay attention to the ratio.** Diurnal peak/trough of 2–5× is typical for consumer traffic; seasonal/event peaks (launch, Black Friday, viral moment) add another multiple. Capacity is bought for the p99 *day*; the peak-to-average ratio is what determines whether autoscaling/serverless (high ratio) or steady reserved capacity (low ratio) is economical.
-- **Order of magnitude is the deliverable.** The goal of estimation is to distinguish 10 from 100 from 1000 — not 240 from 260. Round aggressively (1 day ≈ 10⁵ s, 1 month ≈ 2.6×10⁶ s ≈ 2.5M s), state assumptions inline, and sanity-check by computing the same quantity two independent ways.
+- **Estimate before you architect; the envelope decides the architecture.** Half the time the 15-minute envelope dissolves the hard problem ("one Postgres, no distributed anything") — that conclusion is the deliverable, and it's worth stating as the deliverable.
+- **Little's Law (`L = λ × W`) at every pooled resource** — in-flight requests, DB connections, worker slots, queue drain ETAs. No pool sized by folklore.
+- **Utilization and latency are enemies** (M/M/1 wait ≈ service × ρ/(1−ρ): 1× at 50%, 4× at 80%, 9× at 90%, 19× at 95%). Latency tiers target 60–75% at peak; batch tiers 85–95%. The table is the *optimistic* bound — burstiness and heavy-tailed service times push real queues above it.
+- **Produce three numbers, always:** average / daily peak (×3–5 for consumer diurnal) / event peak. Designs quoting one number are hiding the ratio — the classic 46× error is sizing to the average.
+- **Order of magnitude is the goal.** Round hard (1 day ≈ 10⁵ s; 1M/day ≈ 11.6/s; 1KB × 1M/day ≈ 1GB/day ≈ 365GB/yr, ×2–3 overhead; telemetry dwarfs business data ~10:1 — estimate it separately or the storage number is fiction). Cross-check every estimate by a second independent path; disagreements are where the findings live.
 
-## The numbers an architect carries (stable ballparks)
+## Hard limits an envelope must check
 
-- **Latency hierarchy:** RAM reference ~100ns; SSD random read ~50–150µs; datacenter round-trip ~0.5ms; disk-backed DB query (indexed) ~1–10ms; same-continent WAN RTT ~20–80ms; cross-ocean ~100–200ms. Consequence: anything doing N sequential cross-service calls has a latency floor of N × RTT — chattiness, not CPU, is the usual latency budget-killer.
-- **Throughput per core:** a well-written stateless HTTP service does ~1k–10k simple req/s per core (JSON in/out, no I/O wait); with a DB call per request, effective per-core throughput is set by *downstream latency and connection limits*, not CPU. Nginx/Envoy proxying: tens of thousands req/s/core. Interpreted-language app servers: hundreds to low-thousands req/s/core. Use 1k req/s/core as the pessimistic default for envelope math and refine by measurement.
-- **Databases:** single beefy Postgres/MySQL primary handles ~5k–20k simple transactions/s and low-hundreds of GB working set comfortably; default `max_connections` is ~100–500 and each Postgres connection is a process — **connection count, not QPS, is the first limit apps hit**. Redis: ~100k+ ops/s single-threaded. Kafka: hundreds of MB/s per broker, ordered per partition.
-- **Storage arithmetic:** 1M events/day × 1KB ≈ 1GB/day ≈ 365GB/yr raw — ×2–3 for indexes+replication+overhead. Logs/telemetry usually dwarf business data 10:1; estimate them separately or the storage estimate is fiction.
-- **People-scale anchors:** 1M DAU with 20 requests/user/day ≈ 20M req/day ≈ 230 req/s average ≈ ~700–1200 req/s at diurnal peak. Memorize this shape: *DAU → daily requests → ÷86,400 → ×3–5 for peak*.
-
-**Arithmetic anchors that make envelopes fast:**
-- 1 day ≈ 86,400 s ≈ 10⁵ s; 1 month ≈ 2.6M s; 1 year ≈ 31.5M s ≈ π×10⁷ s.
-- 1M/day ≈ 11.6/s; 100M/day ≈ 1,160/s; 1/s ≈ 86k/day ≈ 2.6M/month.
-- 1KB × 1M/day ≈ 1GB/day ≈ 30GB/month ≈ 365GB/year.
-- 1 Gbps ≈ 125 MB/s ≈ 10.8 TB/day; a 4G/5G user video stream ≈ 3–8 Mbps.
-- 8 bits/byte trips someone in every bandwidth meeting — say "bytes" or "bits" out loud.
-
-**Hard limits an envelope must check before declaring victory** (defaults; all raisable but each raise is a project or a ticket):
-
-| Limit | Typical default scale | Where it bites |
+| Limit | Typical default | Where it bites |
 |---|---|---|
-| Postgres/MySQL connections | ~100–500 | First thing serverless/high-instance-count apps hit |
-| File descriptors per process | 1k–65k (config) | Proxies and WebSocket servers at scale |
-| Ports per (src IP, dst) tuple | ~64k ephemeral | NAT/SNAT exhaustion on outbound-heavy services |
-| ALB/API-gateway integration timeout | ~29–60s | Long requests must become async |
-| Cloud API rate limits & instance quotas | per-account | Scale-out during the event you planned for |
-| Kafka/Kinesis per-partition throughput | ~1–10s of MB/s | Ordered streams don't scale past the partition |
-| Single-node RAM/NIC | fixed | Caches go bandwidth-bound; working sets fall out of memory |
+| Postgres/MySQL connections | ~100–500 | The *first* limit apps hit — before QPS or CPU |
+| File descriptors / process | 1k–65k | Proxies, WebSocket servers |
+| Ephemeral ports per (src,dst) | ~64k | NAT/SNAT-heavy outbound services |
+| LB/gateway integration timeout | ~29–60s | Long requests must become async |
+| Cloud quotas (instances, Lambda concurrency, API rates) | per-account | Discovered during the event you planned for — audit when the plan is written, raised in days |
+| Kafka/Kinesis per-partition throughput | ~1–10s MB/s | Ordered streams don't scale past the partition |
 
-## Latency budgets — the other half of sizing
+## Latency budgets
 
-Capacity says "enough servers"; the latency budget says "fast enough path." Decompose the SLO top-down: 200ms p99 target = client TLS+RTT (~40ms floor if same-continent) + LB/gateway (~1–5ms) + service compute + N × (downstream RTT + downstream p99) + serialization. Two expert habits: budget with the *p99s of dependencies, not their p50s* (tails compound — a request touching 5 dependencies each fine at p99 will breach far more than 1% of the time; this is why fan-out architectures need hedging or tighter per-dependency budgets), and count sequential round-trips first — collapsing 4 sequential calls to 2, or batching N item-lookups into one, routinely beats any compute optimization by an order of magnitude.
+Budget with dependencies' **p99s, not p50s** — a parallel fan-out completes at the max of N draws, so overall p95 across 5 dependencies needs each at ~p99 (0.95^(1/5) ≈ 0.99); sum for sequential, max for parallel. Count sequential round-trips first: collapsing 4 calls to 2 or batching N lookups beats any compute optimization by an order of magnitude.
 
-## Little's Law, worked
+## Reading a running system in ten minutes
 
-`L = λ × W`. Three directions, all useful:
-1. **How many concurrent workers/connections?** API at 2,000 req/s, p50 latency 120ms → average concurrency = 2000 × 0.12 = **240 in-flight requests**. If each holds a DB connection for 40ms of that → 2000 × 0.04 = **80 concurrent DB connections** — over Postgres's comfortable default; you need a pooler (PgBouncer/RDS Proxy) *by arithmetic, before any incident*.
-2. **What throughput can this fixed pool sustain?** 32 worker threads, each job takes 250ms → λ = L/W = 32/0.25 = **128 jobs/s max** — at *100% utilization*; apply the headroom rule and plan on ~90–100 jobs/s.
-3. **How bad is the backlog?** Queue draining at 500 msg/s with 900k backlog → 30 minutes to drain *if* arrival stops; with arrivals at 400/s, net drain 100/s → 2.5 hours. Little's Law turns incident guesswork into an ETA.
-Corollary: latency degradation *silently eats capacity* — if downstream latency doubles, the same worker pool sustains half the throughput. Systems fail sideways like this: a slow dependency turns into "we're out of threads" upstream.
+When the system exists, estimate from telemetry, not first principles: peak ratio from 30-day max-of-1-min ÷ average; concurrency from RPS × p50 vs pool sizes; working set from the cache-hit-rate plateau; growth from 90-day fits *checking the second derivative*; failure headroom from yesterday's deploy or AZ rebalance as a natural experiment.
 
-## Reading the numbers off a running system in ten minutes
+## Growth and runway
 
-When the system already exists, estimate from telemetry, not first principles — first principles is for greenfield:
-- Peak and ratio: LB/gateway request metrics, max-of-1-minute over 30 days ÷ average — that quotient is your provisioning multiplier.
-- True concurrency: in-flight requests from the LB, or derive λ×W from RPS × p50; compare against thread/connection pool sizes for the margin.
-- Working set: cache hit rate vs cache size (grow the cache until hit rate plateaus — the plateau's knee is the working set), or DB buffer-cache hit ratio.
-- Growth: storage bytes and row counts over 90 days, fit on the recent window, check second derivative.
-- Failure headroom: yesterday's deploy or AZ rebalance is a natural experiment — what did utilization do when 1/3 of capacity briefly left?
-Ten minutes of dashboard archaeology beats an afternoon of assumed constants, and disagreements between the two are where the real findings live.
+Viral/consumer growth plans in doublings: "what breaks at 2×/4×/8×?" — each answer usually differs (2×: connections; 4×: write IOPS; 8×: the single-region design). That breakpoint list *is* the capacity plan. Alert on **projected time-to-exhaustion** (< 2× the lead time of the fix), never percent-full — 40%-full growing 5%/week is an incident in six weeks; 80%-full growing 1%/yr is fine. Check growth for compounding: 95GB/mo accelerating 10%/mo turns a naive 22-month runway into 14.
 
-## Peak-to-average and growth modeling
+## Headroom policy
 
-- Compute three numbers for any workload: **average rate, daily-peak rate (p99 hour), event-peak rate** (launch/marketing/viral). Provision baseline for daily peak + headroom; have a plan (autoscaling, pre-warming, load shedding, queueing) for event peak rather than owning it 24/7.
-- **Linear growth** (sales-driven B2B): extrapolate with a safety factor; revisit quarterly. **Viral/compounding growth** (consumer): plan in doublings — the question is "what breaks at 2×, 4×, 8×?" and each answer usually differs (2×: DB connections; 4×: primary write IOPS; 8×: the single-region architecture). Write the breakpoints down; that list *is* the capacity plan.
-- **Runway alerts:** for every hard limit (disk, connection cap, IP space, partition count, quota), alert on *projected time-to-exhaustion* (e.g., <90 days at trailing-30-day growth rate), not on percent-full. 80%-full disk growing 1%/year is fine; 40%-full growing 5%/week is an incident in six weeks.
-- Cloud quotas are capacity limits too: on-demand instance quotas, Lambda concurrency, API rate limits, EIP counts. The p99-day plan that ignores a default quota gets to discover it during the event.
-
-Runway worked example: DB disk at 1.9TB of 4TB, trailing-30-day growth 95GB/mo but *accelerating* ~10%/mo. Naive runway = 2.1TB ÷ 95GB ≈ 22 months; compounding runway solves 95 × (1.1ⁿ−1)/0.1 ≥ 2100 → n ≈ 14 months. The habit: fit growth on the *recent* window, check for acceleration, and alert on projected exhaustion < 2× the lead time of the fix (disk resize: days → alert at 90 days; sharding project: 2 quarters → alert at a year). Runway math is cheap; discovering it during the incident is not.
-
-## Queueing intuition — the hockey stick, numerically
-
-For a single-server queue with random arrivals (M/M/1), mean wait ≈ service_time × ρ/(1−ρ):
-
-| Utilization ρ | Queue wait (multiples of service time) |
-|---|---|
-| 50% | 1× |
-| 70% | 2.3× |
-| 80% | 4× |
-| 90% | 9× |
-| 95% | 19× |
-| 99% | 99× |
-
-Three consequences worth internalizing:
-- The curve is why "we have 20% headroom" is not conservative — it's the edge of the elbow. Load variance of ±15% around an 80% target routinely visits 95%, where latency is 5× worse.
-- **Variance makes it worse than the table:** bursty arrivals and heavy-tailed service times (that one 2-second query) push real queues above M/M/1 predictions. The table is the *optimistic* bound.
-- Pooling helps: one queue feeding N servers beats N separate queues (idle servers can't help the neighbor's backlog) — prefer shared worker pools over per-partition workers until ordering forces partitioning.
-The practical use is not computing exact waits — it's recognizing that between 80% and 95% utilization lies a 5× latency cliff, and pricing headroom accordingly.
-
-## Headroom policy — why 70–80%, not 95%
-
-The utilization target debate resolves on four grounds:
-1. **Queueing:** M/M/1 wait scales ~ρ/(1−ρ). Going 70%→90% utilization multiplies queue delay ~4×; 90%→95% doubles it again. Latency-SLO services should target **60–75%** at daily peak; batch/throughput systems can run **85–95%** because they optimize for utilization, not wait time.
-2. **Failure absorption:** N+1/N+2 across zones means surviving instances absorb the dead zone's share. Three AZs at 66% each = 100% on two after one dies — i.e., *already saturated during the failure*. Target per-zone utilization ≤ (N−1)/N × latency-safe-target.
-3. **Autoscaling lag:** scaling takes 1–5 min (VM boot, image pull, warmup); headroom is the buffer that pays for that lag. Faster spike-onset → more headroom or pre-scaling.
-4. **Variance:** the 70% is 70% at *peak*, measured p95 — a system averaging 70% with bursty arrivals is intermittently at 100 (bursts hide inside minute-averaged metrics).
-State the policy per tier: e.g., "stateless API: scale-out at 65% CPU; DB: alert at 60% because scaling it is a project, not an event."
+State it per tier with the reason: queueing (the 80→95% region is a 5× latency cliff), zone loss (N zones at 80% = 120% on N−1; target ≤ (N−1)/N × latency-safe), autoscaling lag (headroom buys the 1–5 min), and variance (70% must be p95-at-peak of fine-grained samples — minute-averages hide 10-second saturation bursts). **Autoscaling arithmetic before HPA/ASG configs:** absorbable spike = headroom ÷ (slope × lag); if traffic doubles in 2 min and lag is 4 min, no reactive policy works — the options are permanent headroom, pre-scaling on schedule/signal, or admission control converting the spike into delay. Budget the retry storm riding on top of event peak (~2×), with load shedding and jittered backoff in the overload plan.
 
 ## Load testing that predicts reality
 
-- **Coordinated omission is the classic invalidator:** closed-loop tools that wait for each response before sending the next slow *down* during server stalls, silently dropping the very samples that show the stall — reported p99 can be off by orders of magnitude. Use **open-loop** (constant-arrival-rate) tools or corrected modes: wrk2, Vegeta, k6 (arrival-rate executors), Gatling (open injection profiles). If the tool's request rate droops when the server slows, its tail latencies are fiction.
-- **Test the shapes that break systems, not just the plateau:** ramp (find the knee where latency departs linearity — that knee is your true capacity, not the point of first errors), **spike** (0→peak in seconds: tests autoscaling lag and cold paths), **soak** (hours at realistic load: finds leaks, log-disk fill, connection-pool decay, GC drift — soak failures are invisible in 10-minute runs), and **overload** (past capacity: does it degrade — shed load, queue, backpressure — or collapse?).
-- Realism requirements: production-like *data volume* (a 100-row table lies about a 100M-row table's query plans), cache-realistic key distribution (Zipf, not uniform — uniform underestimates hot-key contention and overestimates cache hit rate), think-times and session mixes for user-facing flows, and TLS/network paths matching production.
-- Deliverable of a load test is a sentence like: "knee at 3,200 req/s on 4×c7g.xlarge with p99 180ms; linear to that point; overload sheds gracefully to 2,800" — plus the graph. A test reporting only "handled 5k req/s" without tail latency at that rate reports nothing.
+- **Coordinated omission invalidates closed-loop tools** (fixed-thread JMeter-style): the tool slows down during the stall, dropping exactly the samples that show it — reported p99 can be off by 10–1000×. Open-loop constant-arrival tools (wrk2, Vegeta, k6 arrival-rate, Gatling open profiles) or corrected modes only.
+- Test the four shapes: ramp (the knee where latency departs linearity *is* your capacity — not first-error, and never extrapolate linearly through it), spike (autoscaling lag, cold paths), soak (hours: leaks, fd exhaustion, log fill, pool decay — every "passed load test, died Saturday" is a missing soak), overload (shed or collapse?).
+- Realism: production-scale data (100 rows lie about 100M-row query plans), Zipf keys (uniform overestimates hit rate and underestimates hot-key contention), warmed steady state, and the production entry path (CDN+WAF+LB+TLS) — not a generator inside the VPC hitting the service directly.
+- The deliverable is a sentence: "knee at 3,200 req/s on 4×c7g.xlarge, p99 180ms, linear to the knee, sheds gracefully to 2,800" — "handled 5k req/s" without tail latency reports nothing.
 
-## Database sizing specifics
+## Database sizing
 
-- Size by four axes independently — the binding constraint is usually not the one people discuss: **working set vs RAM** (if hot data + hot indexes fit in memory, reads are cheap; the cliff when they stop fitting is brutal — estimate working set, not total data), **write IOPS** (every write hits WAL + data + each index; replication multiplies it), **connections** (Little's Law from app concurrency; pooler mandatory beyond a few hundred), **storage growth** (with index+bloat multiplier ~2–3× raw).
-- Read scaling: cache first (a 90% hit rate cuts DB read load 10×), then read replicas (mind replication lag for read-your-writes flows), then sharding — sharding is a last resort priced in engineer-years, and the envelope math frequently shows you're a decade from needing it.
-- Quick envelope: 5M-DAU app, 20 reads + 2 writes per user-day → ~1,150 reads/s and ~115 writes/s average; ~400/s writes at peak. One well-tuned Postgres primary with a cache handles this with room — the correct design conclusion is "no exotic database required," which is the estimate's whole value.
+Four independent axes — the binding one is usually not the one being discussed: working set vs RAM (the falls-out-of-memory cliff is brutal; estimate hot set, not total), write IOPS (WAL + data + every index, × replication), **connections** (Little's Law from app concurrency; pooler mandatory beyond a few hundred — each Postgres connection is a process), storage growth (×2–3). Read scaling order: cache → replicas (mind read-your-writes lag) → sharding last, priced in engineer-years; the envelope usually shows you're a decade from needing it.
 
-**Cache sizing math:** cache size follows from hit-rate target and the access distribution, not from "give it 16GB." With Zipf-like access (typical), the top ~1% of keys often serve ~50–70% of traffic, the top 10% serve ~90% — so estimate: (keys needed for target hit rate) × (value size + ~100B overhead/key + serialization slack). 100M items, 2KB each, 90% hit target under Zipf → cache the hot ~10% ≈ 10M × ~2.1KB ≈ 21GB → one large Redis node or a small cluster. Then check the *bandwidth*: 20k reads/s × 2KB = 40MB/s ≈ 320Mbps — fine, but the same math at 20KB objects saturates a 10Gbps NIC before CPU matters; caches are bandwidth-bound long before memory-bound at large value sizes.
-
-**Autoscaling math:** reactive scaling adds capacity after lag T (metric period + decision + boot + warm), so the spike you can absorb without SLO breach = headroom ÷ (spike slope × T). If traffic can double in 2 minutes and total scaling lag is 4 minutes, no reactive policy saves you — the options are permanent headroom for the spike, pre-scaling on schedule/signal, or an admission-control/queue layer that converts the spike into acceptable delay. Compute which regime you're in before writing HPA/ASG configs; the config can't fix the arithmetic.
+**Cache sizing from the distribution, not vibes:** under Zipf, top ~1% of keys ≈ 50–70% of traffic, top ~10% ≈ 90% — so 100M × 2KB items at a 90% target ≈ cache ~10M × ~2.1KB ≈ 21GB. Then check the *other two* constraints: **bandwidth** (20k/s × 20KB objects saturates a 10Gbps NIC long before memory matters — caches go bandwidth-bound at large values) and **miss-path capacity** (10% miss QPS at steady state, 100% at cold start — stampede protection or the first cache restart is an outage).
 
 ## How an expert thinks through this
 
-*"We're launching a notification service: 8M users, average 3 notifications/user/day, mobile push + in-app inbox, 'must handle a Super Bowl ad moment.' Size it."*
+*"Notification service: 8M users × 3/day, push + inbox, must handle a Super Bowl moment."*
 
-Baseline: 24M notifications/day ≈ 280/s average, ~1k/s diurnal peak. Tiny. The interesting number is the ad moment: marketing wants a blast to all 8M users "at once." Sending 8M pushes in, say, 10 minutes = ~13k sends/s — that's the real design load, 13× the daily peak. First insight: this is a *batch* disguised as a spike — nobody perceives a push arriving 4 minutes into the window, so the queue absorbs it. Reject "provision the fleet for 13k/s always" — 13× capacity for a monthly event is exactly what queues are for.
+Baseline ≈ 280/s avg, ~1k/s peak — tiny. The blast is the design load: 8M in 10 min ≈ 13k/s — but it's a *batch disguised as a spike*; nobody perceives a push 4 minutes into the window, so the queue absorbs it — reject 13× standing capacity. Workers by Little's Law: 13k × 0.05s = 650 concurrent ÷ 50/worker ≈ 13, run 20; pre-scale before scheduled blasts (spike onset in seconds, scale-out in minutes — the arithmetic says reactive loses). The *actual* hard part is 13k inbox rows/s on the primary: batched inserts (10–50× cheaper/row) + daily partitions (retention = partition drop), fan-out-on-read noted as the 5× escape hatch. Storage forces retention policy at launch (~11TB/yr raw×2.5 → 90 days caps at 2.7TB). Check the platform quota: if FCM/APNS caps below 13k/s, the window stretches — a product conversation, not an engineering one. Sanity-check by a second path (8M ÷ 13 workers ÷ 50 ÷ 20/s ≈ 10.2 min ✓). Deliver: three load numbers, breakpoint list, runway alerts.
 
-Workers: each send is an APNS/FCM call, ~50ms with batching. Little's Law: 13k/s × 0.05s = 650 concurrent sends → at 50 concurrent per worker (async I/O), ~13 workers; run 20 (headroom + zone loss). These scale from the normal-load 2–3 on queue depth — check autoscaling lag against the blast ramp; pre-scale before scheduled blasts instead of trusting reactive scaling (spike-onset seconds, scale-out minutes — the arithmetic says pre-scale).
+## Presenting an estimate
 
-Inbox writes: 8M inserts in 10 min ≈ 13k rows/s. *This* is the actual hard part — that's real write IOPS on the primary plus index maintenance. Options: batch inserts (COPY/multi-row, 10–50× cheaper per row), partition by day (also makes retention = partition drop, not DELETE), or fan-out-on-read for the blast case (store the blast once, materialize per-user on inbox open) — take batched inserts + daily partitions now, note fan-out-on-read as the 5× growth escape hatch. Storage: 24M/day × ~500B ≈ 12GB/day raw ≈ ×2.5 → ~11TB/yr — so retention policy is a launch requirement, not a later problem; 90-day retention caps it at ~2.7TB. Fine.
+Lead with the decision ("one Postgres through ~10×"), then the two lines of math. Ranges with the driver named ("2.7–11TB/yr *depending on retention*") turn scary intervals into decisions the audience owns. Never show one load number (executives anchor on it). State the first breakpoint and its fix lead time — that sentence is capacity *planning* vs capacity reporting. Attach falsifiable assumptions ("20 req/user/day — analytics, March").
 
-Downstream limits check: FCM/APNS rate limits and connection guidance at 13k/s — read the current quotas before promising the 10-minute window; if the platform caps us lower, the window stretches and *that's a product conversation, not an engineering one*. Sanity check by second path: 8M pushes ÷ 13 workers ÷ 50 concurrent ÷ (1/0.05s) ≈ 10.2 min ✓ consistent. Deliverables: the three load numbers, the breakpoint list ("2×: fine; 5×: inbox write path → fan-out-on-read; 10×: push-provider quotas"), and runway alerts on queue drain rate and partition disk.
+## Failure modes (checklist)
 
-## Presenting an estimate so it survives contact with stakeholders
-
-- Lead with the decision, not the arithmetic: "one Postgres primary is sufficient through ~10× current traffic" — then show the two lines of math that support it.
-- Give ranges with the driver named: "2.7–11TB/yr *depending on retention policy*" turns a scary interval into a decision the audience can make.
-- Separate the three numbers (avg / daily peak / event peak) visually; executives anchor on whichever single number you show them, so never show one.
-- State the first breakpoint and its lead time: "this design needs revisiting at ~4× traffic; the fix (read replicas) takes two weeks" — that sentence is the difference between capacity *planning* and capacity *reporting*.
-- Attach the assumptions as bullets someone can falsify ("20 req/user/day — from analytics, March"), because a wrong assumption caught in review costs nothing and the same assumption caught in production costs the migration.
-
-## Failure modes & pitfalls
-
-- **Sizing to the average.** 280/s average vs 13k/s event peak above — a 46× error. Always produce avg / daily-peak / event-peak; designs that quote one number are hiding the ratio.
-- **Coordinated omission in the load-test report:** JMeter-style closed loop at fixed thread count showing p99=40ms while production shows 900ms stalls. Re-run open-loop at fixed arrival rate before believing any tail number.
-- **Averages hiding saturation:** 60%-CPU minute-averages over 10-second 100% bursts; p99 latency already degraded. Look at max/p95 of fine-grained samples for anything with an SLO.
-- **Connection math skipped:** 400 app instances × pool size 20 = 8,000 connections aimed at a Postgres set to 500. Little's Law on the DB-holding time first, pooler second, `max_connections` bump *last* (each connection costs server memory).
-- **Load-testing with cold caches and toy data** → either wildly pessimistic (no cache warm) or wildly optimistic (everything fits in RAM). Production-scale data, Zipf keys, warmed steady state — then measure.
-- **The 95%-utilization "efficiency" target on a latency service** — the hockey stick guarantees that normal variance produces timeouts. Efficiency targets belong on batch tiers; SLO tiers buy headroom.
-- **Ignoring the failure-mode capacity:** N zones at 80% each = 120% on N−1. If you can't state utilization *during* a zone loss, the multi-AZ story is decorative.
-- **Percent-full alerts instead of time-to-exhaustion** — the disk that jumps from 40% to full in a fortnight sails under every 80% threshold until it doesn't.
-- **Soak-test allergy:** every "passed load test, died Saturday" story is a leak, fd exhaustion, log-volume fill, or token expiry that only hours-long runs at realistic load reveal. One soak per major release minimum.
-- **Extrapolating linearly through a knee:** "we do 1k/s at 30% CPU, so 3k/s at 90%" — false the moment any queue, lock, or downstream approaches saturation; capacity is the measured knee, not a CPU proportion.
-- **Forgetting retries in peak math:** at the worst moment, clients retry — a 2× retry storm rides on top of event peak. Budget it, and make load shedding + jittered backoff part of the overload plan.
-- **Latency budgets built from dependency p50s:** each of five downstream calls "typically 10ms" → budget says 50ms → production p99 is 400ms because tails compound across fan-out. Budget with p99s, or hedge/parallelize.
-- **Testing through a different path than production:** load generator inside the VPC hitting the service directly while real users traverse CDN + WAF + LB + TLS — the test validates a system users never touch. Match the entry path or annotate the gap.
-- **Capacity plan without a quota audit:** the Super-Bowl plan needs 400 instances; the account quota is 128. Quotas are raised in days, discovered in seconds — audit them when the plan is written.
-- **One envelope, never revisited:** the estimate that justified the architecture at 100k users silently governs at 5M. Re-run the envelope at every order of magnitude; the conclusions flip (cache→shard, single-region→edge, VM→fleet) at predictable thresholds.
-
-## Worked micro-example — sizing a queue-worker fleet with an SLA
-
-Jobs arrive at 40/s daily-peak, each takes 3s ± heavy tail (p99 = 12s); SLA: 95% of jobs start within 30s.
-- Concurrency needed at peak: L = 40 × 3 = 120 workers *at 100% utilization* — target 70% → **~170 worker slots**.
-- Sanity-check the tail: 170 slots at ρ ≈ 0.7 keeps queue wait around 0.7/(1−0.7) ≈ 2.3× mean service ≈ 7s — inside the 30s SLA with room for the p99-job clumping; at 130 slots (ρ ≈ 0.92) predicted wait ≈ 11× ≈ 33s — **over SLA on the average day**, which is the difference the headroom bought.
-- Burst plan: a 3× marketing burst becomes queue depth, not failure — drain math: backlog 20k jobs at (170 slots ÷ 3s) ≈ 57 jobs/s minus arrivals; state the drain ETA in the runbook.
-- The three numbers to alarm on: queue oldest-age (SLA proxy), worker utilization (>80% sustained = capacity action), and per-job duration drift (latency eats capacity silently — 3s→4s is a 25% fleet shrink you didn't schedule).
-
-## Worked micro-example — envelope for a URL-shortener-style read path
-
-Given 50M redirects/day: ≈ 580/s avg → ~2k/s daily peak → assume 5k/s event peak. Latency budget 20ms. Redis lookup ~0.3ms → one modest Redis node (>50k ops/s) covers reads with 10× margin; concurrency at the edge = 5000 × 0.02s = 100 in-flight → 2–3 small app instances *for correctness*, deploy 4 across 2 zones for N+1 (per-zone loss check: 4→2 instances still ≥100 in-flight capacity? 2 × 64-conn ≈ fine). Storage: 50M/day writes? No — writes are link *creations*, maybe 1M/day × 200B ≈ 73GB/yr — trivially one Postgres. Total system: 4 small VMs, 1 cache, 1 small DB. The envelope's conclusion is architectural: **no distributed anything required** — and that conclusion took ten minutes.
+- Sizing to the average; one-number designs.
+- Closed-loop tail latencies believed; averages hiding 10s saturation bursts.
+- Connection math skipped (400 instances × pool 20 = 8,000 vs `max_connections` 500); pooler before `max_connections` bumps.
+- Cold caches / toy data / uniform keys; missing soak; extrapolating through the knee.
+- Utilization "efficiency" targets on latency tiers; no zone-loss utilization story.
+- Percent-full alerts; retries missing from peak math; budgets from p50s; test path ≠ production path; quota audit missing; the founding envelope never re-run at each order of magnitude (conclusions flip at predictable thresholds).
 
 ## Verification / self-check
 
-1. Every estimate shows its arithmetic and states assumptions inline; a reader can re-derive it.
-2. Cross-checked by a second independent path (per-user math vs per-second math should agree within 2–3×).
-3. All three load numbers present (avg / daily peak / event peak) plus the breakpoint list at 2×/4×/8×.
-4. Little's Law applied at each pooled resource (threads, connections, workers) — no pool sized by folklore.
-5. Headroom policy stated per tier with its reason (queueing, zone loss, scaling lag).
-6. Any tail-latency claim traced to an open-loop measurement, not a closed-loop tool default.
-Stopping rule: the envelope is done when the *decision* it feeds is insensitive to your remaining uncertainty (if the answer is "one Postgres" whether it's 300/s or 900/s, stop refining); precision beyond decision-sensitivity is procrastination — go measure the real system instead.
+1. Arithmetic shown, assumptions inline, re-derivable by the reader.
+2. Second independent path agrees within 2–3×.
+3. Three load numbers + breakpoint list at 2×/4×/8×.
+4. Little's Law applied at each pool.
+5. Headroom policy stated per tier with its reason.
+6. Tail-latency claims traced to open-loop measurement.
+Stopping rule: done when the *decision* is insensitive to remaining uncertainty — if the answer is "one Postgres" at 300/s or 900/s, stop refining and go measure the real system.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+
+- Probed 14 claims: 13 baseline (cut/compressed), 1 partial (sharpened), 0 delta.
+- Opus cold nails Little's Law applications, the M/M/1 table, coordinated omission (with the canonical 10–1000× error), N−1 zone math, time-to-exhaustion alerting, autoscaling-lag arithmetic, telemetry-vs-business-data ratios, and p99 fan-out budgeting — all compressed to anchors.
+- The one sharpening: cache sizing's *secondary* constraints — Opus checks miss-path/stampede capacity but not NIC bandwidth saturation at large value sizes; both now stated. This skill's residual value is the worked discipline (three numbers, breakpoint lists, second-path cross-checks) as a review scaffold, not facts Opus lacks.

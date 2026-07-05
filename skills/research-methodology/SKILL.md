@@ -57,15 +57,7 @@ description: Use for conducting rigorous research — formulating answerable que
 
 ## Worked micro-examples
 
-**1. Turning a vague question answerable.** Vague: "Is intermittent fasting good for health?" Answerable: "In adults with obesity, does 16:8 time-restricted eating for 12 weeks reduce body weight by a clinically meaningful ≥3 kg versus an isocaloric standard-eating control, in a randomized trial?" Now the design, control, outcome, and refutation criterion are all specified — and you can search whether it's already answered.
-
-**2. Citation chasing in practice.** You need the state of the art on method M. Step 1: find a 2023 review of M's field → extract the 5 foundational primary papers and the current leading methods. Step 2 (backward): read the foundational papers to understand assumptions. Step 3 (forward): in a citation index, list recent papers citing the leading method → find the critique or successor the review predates. Result: you know both the canonical result and what has since challenged it — impossible from keyword search alone.
-
-**3. Detecting HARKing/p-hacking in a paper.** A study reports a significant effect in "women over 50 with high baseline X" — a specific subgroup not mentioned in the aims. No pre-registration. No correction for the many subgroups implicitly tested. Verdict: exploratory at best; treat as a hypothesis to test elsewhere, not a finding.
-
-**4. Weighing conflicting studies.** Study A (n=40, single site, not pre-registered, in a high-prestige venue) finds a large effect; Study B (n=2,000, pre-registered, multi-site, modest venue) finds a null. The naive move is to trust the prestigious A. The disciplined move: B's design is far stronger (power, pre-registration, replication across sites), so weight B and treat A as likely a false positive or overestimate driven by small-sample variance and publication incentives. The open question becomes whether a moderator explains A's context.
-
-**5. Is it answered or open?** "Does vitamin D supplementation prevent respiratory infections?" A search reveals dozens of RCTs and several meta-analyses with heterogeneous results and a small, dose- and baseline-status-dependent effect. Conclusion: not a clean open question and not fully settled — the productive framing is the *moderator* question (in whom, at what dose, at what baseline level), not the blanket yes/no.
+These are moves a strong model executes cold (PICO-ify "is fasting healthy?"; weight the n=2000 preregistered null over the n=40 prestige-venue large effect via winner's-curse reasoning; flag an unplanned "women over 50 with high baseline X" subgroup as HARKing; reframe vitamin-D-and-infections as a moderator question). The retained discipline is the *action*, not the reasoning: for any load-bearing citation, open the results and read the effect size, n, and interval — never cite from the abstract's framing, which is where the broken-telephone and spin errors enter.
 
 ## Verification and self-check
 
@@ -76,3 +68,8 @@ description: Use for conducting rigorous research — formulating answerable que
 - **Disconfirming search done** — you actively looked for refutation, limitations, and failed replications, not just support.
 - **Reproducibility artifacts exist** — seeds, versions, data provenance, decision log — such that another person could regenerate the result.
 - **Source credibility weighted** by design and power over venue prestige; conflicts of interest noted.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Opus 4.8 cold produced PICO question-forming, winner's-curse weighting of conflicting studies, citation-cartel detection, HARKing/p-hacking tells (including p-curve and registry comparison), the exploratory/confirmatory boundary, the absence-of-evidence trap with TOST, backward/forward citation chasing, and full lit-review and reproducibility checklists.
+- No knowledge delta. Value is behavioral: enforcing the *read-the-result-not-the-abstract* action, the disconfirming-search habit, and a decision log — procedures a model can skip under momentum, not facts it lacks.
+- Worked examples compressed to a single action-anchor.

@@ -64,13 +64,7 @@ description: Use for writing papers and technical reports — structuring by inf
 
 ## Worked micro-examples
 
-**1. Abstract rewrite.** Weak: "Deep learning has revolutionized imaging. We propose a new network that achieves excellent performance on segmentation and could be useful clinically." Strong: "Automated tumor segmentation is limited by scarce labeled data (context+gap). We introduce a semi-supervised network trained on 50 labeled and 2,000 unlabeled scans (approach). It reaches a Dice of 0.89, matching fully-supervised training that needs 10× more labels (result, quantified). This lowers the annotation burden for clinical deployment (implication)." Every clause earns its place; the result carries a number and a comparison.
-
-**2. Caption upgrade.** Weak: "Figure 3. Accuracy of the methods." Strong: "Figure 3. Method C (blue) improves test accuracy by 5–7 points over baselines A and B across all three datasets. Bars show mean of 5 seeds; error bars are 95% CIs; n=5. Higher is better." Now the figure stands alone and states the takeaway.
-
-**3. Claim-evidence audit.** Draft sentence: "Our method is robust to noise." Trace it: which figure? If only one noise level was tested, the claim overreaches → "Our method maintains accuracy within 2 points up to 20% label noise (Fig. 4); behavior beyond 20% was not tested." Precise, bounded, defensible.
-
-**4. Review response tone.** Reviewer: "The baseline is weak." Bad: "The reviewer is mistaken." Good: "We agree a stronger baseline strengthens the comparison. We added method Z (Table 2, rows 4–5); our method still improves by 4 points. Thank you for the suggestion." Concede where fair, show the change, point to the exact new result, stay non-defensive.
+The transformations here (weak abstract → context/gap/approach/quantified-result/implication; bare caption → takeaway + defined error bars + n; "robust to noise" → bounded "within 2 points up to 20% label noise, untested beyond"; defensive review reply → concede + show the exact new result) are ones a strong model produces cold. Retained only as the concrete *bar* to hit, not new knowledge: the non-negotiable is that the abstract's result sentence and every figure caption carry a **number and a comparison**, and every claim names the specific figure/table it traces to.
 
 ## Verification and self-check
 
@@ -82,3 +76,8 @@ description: Use for writing papers and technical reports — structuring by inf
 - **Methods pass the reproduce test:** versions, parameters, seeds, sample sizes, statistical tests and assumptions all present.
 - **Related work positions fairly** without strawmanning; terminology is consistent throughout.
 - **Revision proceeded structure-first**, prose last.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Opus 4.8 cold produced the full abstract formula, self-contained-figure requirements, structure-before-prose revision ordering, the demonstrates/suggests/consistent-with calibration ladder, SD-vs-SEM-vs-CI caption rules, figure/table/text allocation, the point-by-point review-response format, and a thorough reviewer-pitfalls list.
+- No knowledge gap surfaced; the skill functions as a discipline checklist. The one lever worth keeping sharp is the *audit action* — highlight every abstract/discussion claim and draw an arrow to the supporting figure/number — which is a procedure to run, not a fact to know.
+- Worked examples compressed; the before/after rewrites were reproducible.

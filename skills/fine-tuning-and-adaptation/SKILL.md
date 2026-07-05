@@ -5,148 +5,49 @@ description: Load when deciding whether to fine-tune an LLM, designing SFT/LoRA/
 
 # Fine-Tuning and Model Adaptation
 
-## Core mental model
+## Core mental model (anchors — you hold these views; don't trade them away in a review)
 
-- **Fine-tuning teaches form and behavior, not facts.** SFT reliably changes *how* a model responds (format, style, tone, task procedure, output schema, persona) but is a poor and unreliable way to inject *knowledge*. New facts belong in the context window (RAG). Teams that fine-tune "to teach the model our product docs" get a model that confidently hallucinates in their house style.
-- **Data quality dominates everything.** 1,000 excellent, consistent, correct examples beat 100,000 mediocre ones — noisy data doesn't average out, it teaches the noise. Every hour spent on hyperparameter search before the data is clean is wasted. The model becomes the median of your dataset: if 10% of your examples have a subtle format error, the model will produce it far more than 10% of the time, because it also learns your inconsistency as "format is optional."
-- **Fine-tuning is a last resort with a maintenance tax.** Every base-model upgrade forces re-tuning and re-evaluation; the fine-tuned checkpoint freezes you to a model generation. Exhaust cheaper rungs first, and keep the eval set that justified the decision — it's the regression suite forever after.
-- **You can only fine-tune what you can already evaluate.** No eval set → no way to know if the tune helped, hurt, or silently broke adjacent capabilities. Build the eval first (see llm-evaluation skill).
+- Fine-tuning teaches form and behavior, not facts; "tune on our docs" yields fluent hallucination in house style → RAG.
+- Ladder with evidence per rung: prompting → few-shot → RAG → fine-tune, climbing only when the current rung plateaus *on a fixed eval set*. Strongest economic cases: distillation of a big model onto a small one for one narrow task, and folding a mega-prompt into weights at volume.
+- Data quality dominates hyperparameters; the prompted-base-model row is mandatory in every results table (it often scores within noise of the tune, for free).
+- LoRA defaults: r=16, alpha=2r, all linear layers (attention-only q/v targeting is the legacy tutorial mistake and costs real quality), LR 1e-4–2e-4 (~10× full-FT), dropout 0.05 small data. QLoRA = NF4 + bf16 compute, quality within noise, ~1.5–2× slower per step; use only when memory-bound.
+- Forgetting: detect with a general-capability + refusal probe suite before/after; mitigate by training less, mixing 10–30% general instruction data, LoRA over full FT.
+- DPO: SFT first (DPO reshuffles mass among behaviors the model already has); beta 0.1; LR ~10× *lower* than SFT; rejected = plausible near-misses sampled from your own SFT model, never strawmen; watch length hacking.
+- Template mismatch is the #1 silent killer: render train and serve prompts and diff *at the token-ID level*; EOS in the loss or the model never stops; ship the chat template with the artifact; re-eval the exact deployed artifact (merge→quantize→engine shifts numerics).
 
-## The decision ladder — and the evidence that justifies each step
+## The corrections (where the standard answer is incomplete)
 
-Climb only when the current rung has demonstrably failed *on a fixed eval set*:
+**Label noise amplifies; it doesn't average out.** The intuition is that 10% flawed examples cost ~10% quality. Wrong direction: inconsistency is itself a signal — the model learns "this rule is optional" and produces the erroneous variant *more* than 10% of the time. This is why reading 100 random examples yourself and estimating the label-error rate is a gating step, not hygiene: every r% of noise is a floor on your error rate, not a dilution. Cheap filter that works: score every example with a strong LLM against a correctness rubric, drop the bottom 10–20%, spot-check the drops.
 
-1. **Prompting (zero-shot, better instructions).** Exhausted only when you've genuinely iterated: explicit rubrics, decomposed steps, counterexamples in the instructions. Most "we need fine-tuning" conclusions die here.
-2. **Few-shot examples in context.** Evidence to move up: adding 5–10 well-chosen examples plateaus below target. If few-shot examples help a lot, that's evidence fine-tuning *will* work well (the task is learnable from examples) — and often 20–50 in-context examples with prompt caching is cheaper than a tune.
-3. **RAG.** Required (not optional) when failures are missing/stale/private *knowledge*. Evidence to move past it: retrieval is verifiably returning the right context and the model still fails to use it correctly.
-4. **Fine-tuning.** Justified when: (a) failures are behavioral (format, style, procedure) and persist with correct context and good prompts; (b) you need a small/fast/cheap model to match a big model on ONE narrow task (distillation — the strongest economic case: generate targets with the big model, filter for correctness, SFT the small one); (c) prompt length for instructions+examples is a dominant cost at high volume; (d) latency budget can't fit the mega-prompt.
+**Distillation lives or dies on the correctness filter, not the count.** Budget 5k–50k teacher outputs for narrow-task distillation, but the load-bearing step is filtering to *verified-correct* targets (ground truth match, code that runs, teacher-as-judge) — unfiltered teacher outputs distill the teacher's error rate at full fidelity into a model too small to recover. Same trap squared for self-training loops: each generation amplifies the previous model's biases.
 
-**Anti-patterns for jumping to fine-tuning:** "the model doesn't know our data" (→ RAG), "the model reasons badly" (SFT rarely improves general reasoning and often hurts it), "we have data lying around" (data availability is not a use case).
+**Few-shot success is the go signal, not the alternative's failure.** If 5–10 in-context examples move the metric a lot, the task is learnable from examples — that's *evidence fine-tuning will work well*. But run the arithmetic first: 20–50 in-context examples under prompt caching is often cheaper than a tune plus its maintenance tax (re-tune on every base-model upgrade, frozen model generation). 200 examples total → don't SFT yet; use them as few-shot pool + eval set and collect more.
 
-## SFT data curation rules
+**Diversity beats volume at fixed budget.** 1,000 examples covering 1,000 distinct input patterns outperform 10,000 covering 500. Dedup near-duplicates (embedding/MinHash) before counting your dataset — 50k examples that are 5k patterns × 10 paraphrases teach 5k things while your metrics claim 50k, and overweight those patterns.
 
-- Target the *inference-time* distribution: same prompt template, same context format (including retrieved passages if you use RAG at inference), same input lengths. Distribution mismatch between tuning data and serving traffic is the top cause of "trained great, serves badly."
-- Deduplicate near-duplicates (embedding similarity or MinHash). 50k examples that are 5k patterns × 10 paraphrases teach 5k things while telling your metrics you taught 50k, and overweight those patterns.
-- Audit manually: read 100 random examples yourself. Every incorrect label you find at rate r% is being *learned* at rate r%. Cheap filter that works: score every example with a strong LLM against a correctness rubric, drop the bottom 10–20%, spot-check the drops.
-- Include refusal/edge examples: if the model should say "I don't have enough information" sometimes, that behavior must be in the data at a realistic rate, or the tune will erase it.
-- Mask the loss on the prompt tokens (`labels = -100` on the input portion in HF `transformers`) — compute loss on completion tokens only. Training loss on prompts wastes capacity memorizing your inputs and drags metrics.
+**Train on the inference-time distribution, including the boring parts.** Same prompt template, same system prompt, same retrieved-context format if serving uses RAG, realistic input lengths, refusal/"not enough information" examples at a realistic rate (or the tune erases that behavior). Distribution mismatch between tuning data and serving traffic is the top cause of "trained great, serves badly" after template bugs.
 
-## LoRA / QLoRA vs full fine-tuning
+## Compressed operational rules
 
-| Choice | Use when | Notes |
-|---|---|---|
-| LoRA | Default for task adaptation on 7B+ models | Matches full FT on most narrow tasks; adapters are swappable per-task on one base model; far less catastrophic forgetting because 99%+ of weights are frozen. |
-| QLoRA (4-bit base + LoRA) | GPU memory is the constraint | Quality within noise of LoRA for most tasks; ~2–3× slower training than LoRA on the same hardware; use `bnb_4bit_compute_dtype=torch.bfloat16` and NF4 quantization. |
-| Full fine-tuning | Large behavioral shifts (new language, heavy domain shift, pretraining-style continued training), or LoRA at high rank has verifiably plateaued below target | Needs much more data and compute; much higher forgetting risk; only after LoRA has been tried and measured. |
+- Epochs: 1–3 at ≥10k examples; 3–5 only ≤1k with per-epoch generation evals; "more epochs fixed it" = memorized it. Checkpoint per epoch; select by held-out *task metric* + general-probe non-regression, never train loss.
+- Overfit tell for generation tasks: eval loss looks fine while quality collapses — sample on paraphrases of training inputs; verbatim regurgitation = memorized.
+- Loss masked to completion tokens (`assistant_only_loss` in TRL / labels=-100 on prompt); effective batch 16–64 via accumulation.
+- Format lock-in check: ask the tuned model a casual question — if it answers in training format, you over-trained or under-mixed.
+- Serving: LoRA adapters (vLLM `--enable-lora`) for many tasks/tenants; merged weights for single-task simplicity; adapter + base version + data snapshot + eval report travel together, rollback = repoint adapter.
+- Eyeball one fully rendered training sample (`tok.decode(train_dataset[0]["input_ids"])`) for template + EOS before every run; invisible characters (`\r\n`, NBSP, stray leading space) tokenize differently and get learned.
 
-LoRA parameter guidance (defaults that work; tune only with eval evidence):
-- `r=16, lora_alpha=32` (keep alpha ≈ 2×r; alpha/r is effectively a scaling on the adapter — raising alpha at fixed r behaves like raising LR). Raise r (32–64) for harder/broader tasks; r>64 rarely helps and mostly overfits.
-- **Target all linear layers** (`q,k,v,o,gate,up,down` projections), not just `q_proj,v_proj`. Attention-only LoRA is a legacy default from the original paper and measurably underperforms; targeting MLP layers matters more than raising r.
-- `lora_dropout=0.05` for datasets under ~10k examples; 0 for large ones.
-- LR for LoRA is ~10× full-FT LR: start 1e-4–2e-4 (vs 1e-5–2e-5 for full FT), cosine decay, warmup 3–10% of steps.
+## Verification checklist before recommending or shipping a tune
 
-## Catastrophic forgetting — detection and mitigation
+- [ ] Ladder evidence on a fixed eval set; knowledge gaps routed to RAG.
+- [ ] 100 examples human-read; dedup done; label-error rate estimated (it is your error floor).
+- [ ] Token-level train/serve render diff clean; loss masking + EOS verified.
+- [ ] Distillation targets correctness-filtered; refusal behavior present in data at realistic rate.
+- [ ] Before/after: task eval, general probe, refusal probe, format-flexibility check — on the exact deployed artifact in the serving engine.
+- [ ] Tune beats the best *prompted* baseline by more than the eval noise floor; otherwise ship the prompt.
 
-Fine-tuning on a narrow distribution degrades everything outside it: general knowledge, instruction following, safety behavior, other languages, and *format flexibility* (the model starts answering everything in your training format — a tune on JSON extraction will start emitting JSON when asked casual questions).
-
-- **Detect:** run a general-capability probe suite (a few hundred items spanning chat, reasoning, safety refusals, and format variety) before and after the tune. If you only eval the target task, forgetting is invisible until production.
-- **Mitigate, in order of effectiveness:** (1) train less — fewer epochs, lower LR, LoRA instead of full FT; (2) **mix in 10–30% general instruction data** (generic chat/instruct examples) with your task data — the single most effective cheap fix; (3) lower LoRA rank; (4) early-stop on the *general* suite, not just task loss.
-- Safety-behavior regression deserves explicit checking: even benign-task SFT measurably weakens refusal behavior. Include refusal probes in the before/after suite.
-
-## Preference optimization (DPO/RLHF) vs SFT
-
-- **SFT** imitates demonstrations: it can teach the model *what a good answer looks like*. It cannot teach *which of two plausible answers is better*, and it can't push down behaviors (hedging, sycophancy, verbosity) that appear in no training example but emerge anyway — SFT only ever adds positive examples.
-- **DPO/RLHF** optimizes a preference signal: right tool when you have (or can generate) *pairs* — "this answer over that one" — especially for style, harmlessness, conciseness, and stamping out a specific recurring bad behavior (use the bad behavior as the rejected response).
-- **Order matters: SFT first, then DPO.** DPO on a model that can't produce the desired format/behavior at all just reweights garbage. DPO assumes both chosen and rejected are in-distribution outputs.
-- DPO cannot inject knowledge or new skills either — it reshuffles probability mass among behaviors the model already has.
-- DPO practicals: `beta=0.1` default (lower = stronger drift from reference, more reward hacking of the preference data; higher = weaker effect); LR ~10× *lower* than your SFT LR (e.g. 5e-7–5e-6 full FT); rejected responses should be *plausible near-misses* (ideally sampled from the SFT model itself), not strawmen — pairs like "good answer vs. gibberish" teach nothing. Watch for length hacking: if preference data even slightly favors longer answers, DPO amplifies it and outputs balloon.
-
-## Hyperparameters that actually matter (small-data SFT)
-
-Priority order: **data quality ≫ LR > epochs > everything else.** Batch size, scheduler shape, and optimizer choice are second-order at this scale.
-
-- **LR:** the one knob that ruins runs. Too high → loss spike then a permanently degraded model (or NaN); slightly too high → model trains but comes out subtly dumber. When unsure, go lower and train slightly longer.
-- **Epochs:** 1–3 for datasets ≥ ~10k; 3–5 only for very small (≤1k) sets, with heavy eval monitoring. More epochs on small data = memorization: the model reproduces training completions verbatim on near-match inputs and degrades on everything else.
-- **Overfit detection on small data:** hold out 10% *before* training, no exceptions. The signal is eval loss rising while train loss falls — but for generation tasks eval *loss* can look fine while generation quality collapses, so run actual generation evals (task metric on held-out prompts) at each epoch boundary and checkpoint each epoch. Pick the checkpoint by task metric, not by train loss. A telltale: sample the tuned model on a paraphrase of a training input — verbatim regurgitation of a training completion means it memorized.
-- Effective batch: 16–64 sequences via gradient accumulation; below ~8 gradients get noisy, above ~128 with small data you get too few optimizer steps per epoch to learn.
-
-## Data formatting / template traps (a leading cause of "fine-tune made it worse")
-
-- **Chat-template mismatch is the #1 silent killer.** Training with template A (or raw concatenated text) and serving with template B — different special tokens, role markers, whitespace — makes the model measurably worse than baseline. Always format training data with the *exact* serving template: use `tokenizer.apply_chat_template(...)` for both, never hand-rolled f-strings.
-- EOS handling: the training collator must include the EOS token at the end of each completion with loss computed on it, or the tuned model never learns to stop and generates until max_tokens.
-- System prompt consistency: if training examples have no system prompt but serving does (or a different one), you've created train/serve skew. Bake the serving system prompt into training data, or vary it deliberately across examples to teach robustness.
-- Invisible characters: mixed `\r\n` vs `\n`, non-breaking spaces, or a stray leading space before completions each tokenize differently and the model learns them. Diff a fully-rendered training string against a fully-rendered serving prompt **at the token-ID level** before any run.
-
-## Serving the tuned model
-
-- Two deployment shapes: **adapter serving** (base model + LoRA weights loaded per request/tenant — e.g. vLLM `--enable-lora`; near-zero marginal memory per task, small latency overhead) vs **merged weights** (`model.merge_and_unload()` → a standalone checkpoint; simplest ops, but one full model copy per task).
-- Merge-then-quantize is not the same model as train-time QLoRA: the adapter was trained against the *4-bit* base, and merging into fp16 then re-quantizing (GPTQ/AWQ/GGUF) shifts numerics. Always rerun the task eval on the exact artifact you deploy, in the exact serving engine — engine-level differences (KV-cache precision, sampler implementations) are small but your tune's margin may be small too.
-- Pin the serving-side chat template with the model artifact (ship `tokenizer_config.json` together); a serving engine falling back to its default template silently reintroduces the template-mismatch bug in production only.
-- Version tunes like models in any ML system: adapter/checkpoint + base model version + training data snapshot + eval report travel together; rollback is repointing to the previous adapter.
-
-## How much data do you actually need?
-
-- Format/style/schema adaptation: 500–2,000 examples is usually enough; beyond ~5k you get diminishing returns unless task diversity is genuinely high.
-- Narrow task distillation (small model imitating a large one): 5k–50k *filtered-correct* teacher outputs; the filter (verify against ground truth, run the code, judge with the teacher) matters more than the count — unfiltered teacher outputs distill the teacher's errors at full fidelity.
-- Broad behavioral change (new language, domain register): 50k+ and you should question whether fine-tuning is the right layer at all.
-- If you have 200 examples: don't SFT yet. Use them as few-shot pool + eval set; collect more from production before tuning. A tune on 200 examples overfits before it generalizes for most tasks.
-- Diversity beats volume at fixed budget: 1,000 examples covering 1,000 distinct input patterns outperform 10,000 examples covering 500 patterns.
-
-## Failure modes & pitfalls
-
-- **Tuning to teach facts.** The model answers training-set questions correctly and hallucinates fluently on everything adjacent, now with more confidence. Correction: facts go in context (RAG); tune only if the *behavior around* the facts is wrong.
-- **Skipping the prompted baseline.** Teams report "tuned model scores 84%" with no number for the best-effort prompted base model — which often scores 82% for free. Correction: the baseline is a mandatory row in every results table, prompted as hard as you'd prompt in production.
-- **Template mismatch between training and serving** (detailed above) — restated because it's the most frequent real-world cause of a tune underperforming its own base model. Token-level diff or it didn't happen.
-- **Evaluating with training-set-like inputs only.** The tuned model looks great on inputs drawn from the same distribution it memorized. Correction: eval set must include out-of-distribution-but-in-scope inputs and paraphrases of training inputs (verbatim-output detection).
-- **DPO on strawman pairs.** Chosen = good answer, rejected = obviously terrible answer → near-zero learning signal where it matters (the margin between decent and great). Correction: rejected responses sampled from your own SFT model's real mistakes.
-- **Training on model-generated data without a correctness filter**, including your own model's outputs (self-training loops amplify the model's existing biases and errors each generation).
-- **"More epochs fixed it" on a small dataset.** It fixed the training metric by memorizing. Correction: if 3 epochs isn't enough, the problem is data quality or task fit, not epochs.
-- **Ignoring the serving stack**: tuning a model your inference provider can't serve with adapters, or merging LoRA weights and discovering quantized serving degrades the merged model differently than the base. Verify the *deployment* path (merge → quantize → serve) end-to-end on the eval set, not just the training-time checkpoint.
-- **One mega-tune for many tasks** when per-task LoRA adapters on a shared base would be independently updatable, testable, and rollback-able. Multi-task tunes entangle regressions across tasks.
-
-## Worked micro-example: QLoRA SFT that avoids the classic traps
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig
-from trl import SFTTrainer, SFTConfig
-import torch
-
-tok = AutoTokenizer.from_pretrained(BASE)
-model = AutoModelForCausalLM.from_pretrained(
-    BASE,
-    quantization_config=BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16),
-)
-peft_cfg = LoraConfig(
-    r=16, lora_alpha=32, lora_dropout=0.05, task_type="CAUSAL_LM",
-    target_modules=["q_proj","k_proj","v_proj","o_proj",
-                    "gate_proj","up_proj","down_proj"],  # all linear, not just q/v
-)
-# dataset rows: {"messages":[{"role":"system",...},{"role":"user",...},{"role":"assistant",...}]}
-# -> SFTTrainer applies tok.apply_chat_template; verify one rendered sample token-by-token
-args = SFTConfig(
-    num_train_epochs=2, learning_rate=2e-4, lr_scheduler_type="cosine",
-    warmup_ratio=0.05, per_device_train_batch_size=4,
-    gradient_accumulation_steps=8,            # effective batch 32
-    bf16=True, eval_strategy="epoch", save_strategy="epoch",
-    assistant_only_loss=True,                 # loss on completions only
-)
-trainer = SFTTrainer(model=model, args=args, peft_config=peft_cfg,
-                     train_dataset=train_ds, eval_dataset=val_ds)
-print(tok.decode(trainer.train_dataset[0]["input_ids"]))  # EYEBALL the rendered template + EOS
-trainer.train()
-```
-
-Checkpoint selection afterward: run the task eval **and** the general-capability probe on each epoch checkpoint; take the best task score whose general score hasn't dropped more than your tolerance.
-
-## Verification checklist before recommending or shipping a fine-tune
-
-- [ ] Ladder evidence: prompting and few-shot demonstrably plateaued on a fixed eval set; knowledge gaps routed to RAG, not the tune.
-- [ ] 100 training examples read by a human; near-duplicates removed; label error rate estimated.
-- [ ] Rendered training prompt == rendered serving prompt at the token level (template, system prompt, EOS).
-- [ ] Loss masked to completion tokens.
-- [ ] Held-out split created before training; checkpoint chosen by held-out *task metric*, not train loss.
-- [ ] Before/after comparison on: task eval, general-capability probe, refusal/safety probe, and output-format flexibility (ask it a casual question — does it answer in training format?).
-- [ ] Tuned model beats the best prompted baseline **on the same eval**, by a margin exceeding the eval's noise floor — otherwise recommend shipping the prompt.
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 14 claims: 12 baseline (cut/compressed), 2 partial (sharpened), 0 delta.
+- Biggest baseline gaps found:
+  - Opus treats label noise as proportional dilution; misses the amplification mechanism (inconsistency teaches "rule is optional" → error rate exceeds noise rate).
+  - Distillation sizing low (1k–10k, no filter emphasis); the correctness filter as the load-bearing step and self-training amplification absent.
+  - "Few-shot works → fine-tune will work" inference and the in-context-examples-plus-caching-vs-tune cost comparison not surfaced; diversity-beats-volume quantification absent.

@@ -5,99 +5,41 @@ description: Engineering agents that write code — harness design (Claude Agent
 
 # Building Coding Agents
 
-## Core mental model
+Frontier models already know the loop (gather → act → verify), the minimal tool set, truncation, compaction, sandbox axes, and the classic failure modes. This sheet keeps the anchors, the harness-side specifics, and the calibration a cold model gets wrong.
 
-1. **The loop is gather context → act → verify → repeat, and verify is the product.** Anyone can wire an LLM to bash and get a demo. What separates a working agent is the verify step: after every mutation, something structural (tests, typechecker, linter, a build, a rendered screenshot) tells the agent whether reality moved the way it claimed. An agent without feedback loops doesn't fail loudly — it hallucinates success quietly, which is worse.
-2. **bash + file-edit + search is nearly sufficient; resist tool sprawl.** A coding agent with a shell can do almost anything — the marginal tools that earn their place are the ones that beat bash on *reliability or context economics*: a string-replace edit tool (line-precise, verifiable, cheaper than heredoc rewrites), ripgrep/glob search (structured results, permission-gated), and file read with offsets. Every additional bespoke tool is another description to maintain and another wrong choice available. When tempted to add a tool, first ask: can the agent already do this with bash, and is the failure I'm fixing actually a *prompt or output-shaping* problem?
-3. **Context is the scarce resource; the main thread is for decisions.** Long tasks die by context pollution: stale file dumps, repeated directory listings, 500-line test logs. The architecture answer is layered — truncate tool results at the harness, compact the transcript when near budget, push read-heavy exploration into subagents that return only conclusions, and persist plans/findings to files that survive compaction. Spend main-context tokens on decisions, not raw observations.
-4. **Permissions are blast-radius engineering, not a yes/no dialog.** Classify every capability on four axes — read, write, execute, network — and scope each independently. Reads inside the repo: free. Writes: confined to workspace/worktree. Execution: sandboxed (as of 2026 the standard OS-level primitives are bubblewrap on Linux and Seatbelt/sandbox-exec on macOS — the Claude Agent SDK ships both; containers/microVMs like Docker/E2B for stronger isolation). Network: default-deny with a domain allowlist, because network egress is the exfiltration channel if the agent ingests hostile content. Security lives *below* the agent — the sandbox not permitting the action beats the prompt forbidding it.
-5. **The agent's report is a claim, not evidence.** Harness-level rule: completion requires artifacts (test output, diff, exit codes) that the harness or a human can check. Models are strongly biased toward declaring victory; every affordance you build should make false success harder to state than true success.
+## Anchors (compressed — the parts to hold, not re-derive)
 
-## Decision frameworks
+1. **Verify is the product.** After every mutation something structural (typecheck, targeted test, build, screenshot) tells the agent the truth; an agent without feedback hallucinates success quietly. Verifier quality is the ceiling on agent quality — a mediocre model with a tight loop beats a frontier model flying blind.
+2. **bash + string-replace edit + read + grep/glob is nearly sufficient.** A new tool earns its place only by beating bash on reliability or context economics (structured/truncated output, a distinct permission gate, high frequency × error rate).
+3. **Truncation: head+tail, always** (~first 20 + last 80 lines, `[... N omitted ...]` marker), and **preserve counts** ("2,113 passed, 3 failed") — models reason correctly from summaries but wrongly from silent truncation.
+4. **Context ladder:** per-result truncation → compaction at >30–50 steps (summary must carry decisions *with reasons* and dead ends *with evidence*; test by cold-resuming — if the resumed agent retries a ruled-out fix, the template is broken) → plan file (`TODO.md`) → subagent fan-out for read-heavy phases → file-based memory across sessions.
+5. **Permissions = blast-radius grid** (read/write/execute/network scoped independently): reads in repo free; writes workspace/worktree-only; execution inside an OS sandbox — **bubblewrap on Linux, Seatbelt/sandbox-exec on macOS are what the Claude Agent SDK ships**; containers/microVMs (Docker, E2B, Firecracker/gVisor) for untrusted-origin code; network default-deny with domain allowlist. Secrets never enter the sandbox — the harness performs privileged actions (push, PR) *outside*, from artifacts the sandbox produced. Once the agent reads untrusted content, treat its subsequent tool calls as potentially attacker-directed.
+6. **Error math:** 5%/step ≈ 40% failure over 10 dependent steps. Strongest model in the decision loop, cheap models in bounded subagents — the smarter planner takes fewer steps and is often net cheaper.
+7. **Multi-agent only when subtasks are independent, interface-clean, individually verifiable.** Test: if you can't write each subtask's acceptance test (or the merge step) before spawning, it isn't decomposed enough. Shared mutable state → worktrees per agent or don't parallelize.
+8. **Completion is a harness-verified state transition, not a model sentence.** Re-run the verification from the harness, parse exit codes, diff-guard test files, and catch "0 tests ran" reported as success.
+9. Ship a checked-in `CLAUDE.md`/`AGENTS.md`: exact build/test/lint commands, project map, conventions, landmines. Cheapest performance win available; keep it short — a stale one is worse than none.
 
-### Build on a harness or roll your own?
+## Build on a harness or roll your own?
 
-Ask in order: (1) Is your need "coding agent with custom tools/prompts"? Use an existing harness — as of 2026 the Claude Agent SDK (Python/TS) is the reference: it ships the tool suite (bash, edit, glob/grep, web), auto-compaction, subagents, hooks (pre/post tool-use interception), permission modes, and OS sandboxing; comparable open harnesses exist (OpenAI Codex CLI, OpenHands, Pi/mini agents). Rolling your own means re-solving truncation, compaction, permissioning, and loop-termination — months of unglamorous work. (2) Do you need a *different loop shape* (e.g., code-orchestrated pipeline with model steps, or a custom verifier-in-the-loop)? Then own the loop but still steal the tool designs. (3) Is it actually a workflow with known steps? Write code that calls the model; don't build an agent at all.
+Need = "coding agent with custom tools/prompts" → use an existing harness; as of 2026 the **Claude Agent SDK** (Python/TS) is the reference: tool suite, auto-compaction, subagents, **hooks (pre/post tool-use interception)**, permission modes, OS sandboxing. Rolling your own re-solves truncation/compaction/permissioning/termination — months of unglamorous work. Different loop shape (code-orchestrated pipeline, verifier-in-the-loop) → own the loop, steal the tool designs. Known steps → it's a workflow; don't build an agent.
 
-### Tool-result truncation strategy
+## Failure modes (the big four + defenses — structural, never prompt-only)
 
-The question is never "truncate or not" but "what does the model's next decision need?"
-- Head+tail beats head-only for command output (errors concentrate at the end; build banners at the start). Keep ~first 20 + last 80 lines of long output with a `[... N lines omitted ...]` marker.
-- For file reads: cap default read length; force offset/limit params for big files; return "file is 4,200 lines; showing 1–400" so the model knows to page rather than assume completeness.
-- For search: cap match count, return file:line + one-line context, never full file bodies.
-- Preserve *counts* when you cut content ("2,113 tests passed, 3 failed, failures shown below") — models reason correctly from summaries but wrongly from silent truncation.
+- **Premature completion** → finish action requires evidence arguments the harness re-checks.
+- **Deceptive green** (weakened asserts, `@skip`, hardcoded expecteds, editing the test) → diff-gate test files, held-out tests, mutation checks on suspicious passes. The most damaging failure because it passes every naive check.
+- **Error-loop spirals** → root causes in observed order: truncated error output (fix first), missing capability, ambiguous goal; harness loop-detection (hash tool+args, interrupt after N) as backstop, not cure.
+- **Scope drift** → plan file with non-goals, diff-size guardrail per task class; review the diff, not the narrative.
+- Also: permission fatigue (a gate humans rubber-stamp is worse than no gate plus a hard sandbox — auto-allow reads/workspace writes, prompt only on real escalations); sandbox theater (writes to `~/.bashrc`/`.git/hooks` escape on next shell — close writes+network+secrets together).
 
-### Context over long horizons — escalation ladder
+## Benchmark calibration (where cold models are wrong, as of mid-2026)
 
-1. Always: per-result truncation (above).
-2. Sessions >30–50 steps: **compaction** — summarize the transcript into goal / constraints / decisions-with-reasons / current state / next step. Losing "why" makes the agent re-litigate settled choices; test your compaction prompt by resuming from it cold.
-3. Multi-phase tasks: a **plan file** the agent re-reads and updates (`TODO.md` with done/doing/next). Cheapest goal-drift defense there is — the goal keeps re-entering recent context.
-4. Read-heavy phases: **subagent fan-out**. "Find every caller of X across the monorepo" burns 60k tokens of listings; a subagent absorbs them and returns 15 lines. Delegate any work whose *intermediate* products would pollute the parent. Keep the parent as the sole decision-maker.
-5. Cross-session work: file-based memory with a convention (`NOTES.md`, `findings/`) the prompt teaches — don't hope the agent invents one.
+The stale reflex is "frontier ≈ 70–80% on SWE-bench Verified." Current: **frontier models score ~90–95% on Verified — the top of the range is saturating**; **SWE-bench Pro sits ~80% at the frontier** and **Terminal-Bench** (terminal/infra tasks, tbench.ai) retains real headroom. SWE-bench is a *family* (original, Verified, Pro, Multilingual, Live) and cross-variant comparisons are meaningless. Public scores measure model+scaffold; your harness changes yours — evaluate end-to-end on your own task distribution with held-out verification, and keep every past failure as a regression task.
 
-### Verification design — choosing the agent's senses
+## How an expert thinks it through (compressed): CI-failure → fix-PR agent
 
-Rank feedback sources by (signal quality × speed × availability) and wire the best ones into the loop as *default behavior*, not optional tools:
+Start from verification, not the prompt: terminal condition = failing test passes + affected suite green, checked by the harness parsing exit codes. Add a `run_tests` tool not because bash can't run pytest but to return structured, truncated results and log invocations for the eval set. CI logs are huge → first step is a subagent that reads the raw log and returns failing IDs + tracebacks + suspected files. No `gh` token inside the sandbox — one prompt injection in a CI log away from pushing to main; the harness creates the PR outside after checks pass. After 3 test runs with no progress, interrupt: a written failure report is a *successful* product outcome. Ship rule: ≥60% correct green PRs, 0% false-green, on 20 historical failures; iterate on failure transcripts, not prompt vibes.
 
-1. **Compiler/typechecker** — fastest, near-zero false positives, catches whole error classes per run. An agent in a typed codebase should typecheck after every edit batch; it's the cheapest hallucination filter that exists.
-2. **Targeted tests** — the failing test first (seconds), affected package next (minutes), full suite only at completion gates. Making the agent run the *narrowest relevant* test is a prompt+tool design task: give it a `run_tests(path_or_pattern)` tool, not just `bash`, so you can enforce narrowness and structure output.
-3. **Linters/formatters** — low signal for correctness, high signal for "will this PR be rejected on style." Run at the end, not per-edit (per-edit lint noise burns steps).
-4. **Runtime observation** — for changes tests don't cover: run the CLI, curl the endpoint, screenshot the UI (multimodal models can read their own screenshots — closing this loop is what makes frontend agents work at all).
-5. **Ratchets** — record the baseline (failing test count, type error count) at session start; any step that increases it triggers an interrupt. Prevents the classic "fixed my bug, broke three others, reported success" outcome.
-
-The design question for every new agent: "after the agent acts, what tells it the truth, and how fast?" If the honest answer is "nothing until a human reviews," the agent will hallucinate success — add a verifier before adding capabilities. Verifier quality is the ceiling on agent quality; a mediocre model with a tight feedback loop beats a frontier model flying blind.
-
-### Multi-agent: when parallelism pays
-
-Prior: it usually doesn't. Parallel agents win only when subtasks are (a) independent, (b) interface-clean, and (c) individually verifiable — review 12 files, fix 8 unrelated lint classes, research N libraries. They lose when tasks share mutable state (two agents editing the same module = merge hell; use git worktrees per agent if you must) or when coordination requires judgment mid-flight (the orchestrator becomes a bottleneck relaying context it doesn't have). Reasoning check: if you can't write each subtask's acceptance test before spawning, it isn't decomposed enough to parallelize.
-
-### Sandboxing — the blast-radius grid
-
-| Axis | Default | Escalation path |
-|---|---|---|
-| Read | Repo + declared deps: free. Home dir, dotfiles, keychains: deny | Explicit allowlist entries per path |
-| Write | Workspace/worktree only; `.git/hooks`, `~/.bashrc`, package manifests of *other* projects: deny | Human prompt per out-of-workspace path |
-| Execute | Inside OS sandbox (bubblewrap / Seatbelt) or container; no setuid, no docker socket | Container/microVM (Docker, E2B-style) for untrusted-origin code |
-| Network | Default-deny; allowlist package registries + declared APIs | Human prompt per new domain; never blanket-open because "tests need internet" |
-
-Two rules that fall out of the grid: (1) secrets never enter the sandbox environment — the harness holds credentials and performs privileged actions (push, deploy, PR creation) *outside*, from artifacts the sandbox produced; (2) the moment the agent processes untrusted content (cloned third-party repo, web page, issue text), treat its subsequent tool calls as potentially attacker-directed — which is why network egress and out-of-workspace writes stay locked even when everything else is convenient.
-
-### Model choice inside the loop
-
-Errors compound: 5% per-step error ≈ 40% over 10 dependent steps. Strongest affordable model for the decision loop; route bulk classify/summarize sub-work to cheap models via subagents. This inverts single-call cost intuition — a smarter planner takes fewer steps and is often net cheaper.
-
-## How an expert thinks through it
-
-*Scenario: internal agent that takes a failing CI job and produces a fix PR.*
-
-Start from verification, not from the prompt: what tells the agent it's done? The failing job must pass *and* the rest of the suite must not regress. So the loop's terminal condition is "targeted test passes + full affected-package suite passes," checked by the harness parsing exit codes — never by the model asserting it. (Rejected: trusting a final "all tests pass" message. That's the deceptive-green failure waiting to happen.)
-
-Tools: bash, read, edit, grep/glob. Do I add a `run_tests` tool? Yes — not because bash can't run pytest, but because a dedicated tool lets me return *structured, truncated* results (fail count, first 3 tracebacks, nothing else) instead of 3,000 lines of dots, and lets me log every test invocation for the eval set later. (Rejected: a `create_pr` tool available mid-loop — the agent should earn PR creation only after the harness verifies green; sequencing enforced in code, not prompt.)
-
-Context plan: CI logs are huge. First step is a subagent that reads the raw log and returns failing test IDs + relevant traceback + suspected files. Main agent starts from that brief, reads only implicated files. Budget: if >40 steps, compact with a template that preserves the hypothesis history — "tried X, ruled out because Y" is the most valuable thing to keep, or the agent will retry X.
-
-Sandbox: read repo-wide; write only in a fresh worktree; execute inside bubblewrap with network limited to the package registry (tests may need to install). No repo-push credentials inside the sandbox — the harness, outside, creates the PR from the worktree diff after checks pass. (Rejected: giving the agent `gh` with a token — one prompt injection in a CI log away from pushing to main.)
-
-Failure exits: after 3 consecutive test runs with no reduction in failure count, the harness interrupts: "no progress; write up findings and stop." A written failure report is a *successful outcome* for the product — silent flailing and fabricated fixes are the failures.
-
-Stopping rule for me, the builder: run it on 20 historical CI failures. If ≥60% produce correct green PRs and 0% produce false-green claims, ship behind human review of every PR; iterate on the failure transcripts, not on the prompt in the abstract.
-
-## Failure modes and pitfalls
-
-- **Premature completion claims.** Agent says "done, tests pass" without running them, or after running a subset. Fix structurally: the finish action requires evidence arguments (test command + exit code + summary the harness re-checks); prompts alone don't cure this bias.
-- **Deceptive green tests.** The agent makes tests pass by weakening them: deleting assertions, adding `@skip`, widening `except`, hardcoding expected values, editing the test instead of the code. Defenses: diff-gate on test files (test edits require justification or human review), run mutation-style checks on suspicious passes, and evaluate against *held-out* tests the agent never sees. This is the single most damaging coding-agent failure because it passes every naive check.
-- **Error-loop spirals.** Same failing command retried verbatim, or two remedies alternated. Root causes in observed order: error output truncated so the model never saw the actual message; missing capability (agent substitutes the nearest tool repeatedly); ambiguous goal. Fix result readability first; add harness loop detection (hash of tool+args, interrupt after N repeats) as backstop, not cure.
-- **Scope drift.** "Fix the date bug" becomes a refactor of the date module. Defenses: plan file with explicit non-goals, diff-size guardrail (harness flags when changed-lines exceed a task-class budget), and prompt language that makes minimal-diff a stated value. Review the *diff*, not the narrative.
-- **Truncation hiding the signal.** Harness cuts output at 10k chars head-first; pytest's failure summary lives at the end; agent reasons about a log whose only useful part was deleted. Head+tail, always, and preserve counts.
-- **Compaction losing the "why".** Post-compaction agent re-opens decided questions or repeats ruled-out fixes. Your summary template must carry decisions *with reasons* and dead ends *with evidence*. Test: resume a session from only the summary; if the agent's next action is one it already tried, the template is broken.
-- **Sandbox theater.** Execution sandboxed, but the agent can write `~/.bashrc` or `.git/hooks/` (escapes on next shell), or network is open so a hostile README can exfiltrate `env`. Close the quartet together: workspace-confined writes, default-deny network, no secrets in the sandbox env, and treat *anything the agent read from the internet or from user-supplied files* as hostile input to a system that can execute code.
-- **Permission fatigue defeating the gate.** Prompting per bash command trains humans to approve blindly. Auto-allow reads and workspace writes; reserve prompts for the rare escalations (network, out-of-workspace, credentials). A gate humans rubber-stamp is worse than no gate plus a hard sandbox.
-- **Evaluating on vibes or on the wrong benchmark.** Transcript-looks-reasonable is not a metric. Evaluate end-to-end task success on your own task distribution with held-out verification. On public benchmarks (as of mid-2026): SWE-bench is a *family* — original, Verified, Pro, Multilingual, Live — and cross-variant comparisons are meaningless; frontier models score ~90–95% on Verified (top of the range saturating) while SWE-bench Pro (~80% at the frontier) and Terminal-Bench (terminal/infra tasks, tbench.ai) retain headroom. Public benchmark scores measure model+scaffold; your harness changes yours.
-- **Skipping the agent's environment doc.** An agent dropped into a repo without build/test/run instructions burns 20 steps rediscovering them each session. Ship a checked-in context file (`CLAUDE.md`/`AGENTS.md`) with commands, conventions, and landmines; it's the cheapest performance win available.
-
-## Worked micro-example
-
-Harness-side truncation + evidence-checked completion (TypeScript, Claude Agent SDK shape):
+## Worked micro-example — harness-side output shaping + external completion gate
 
 ```typescript
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -114,11 +56,10 @@ for await (const msg of query({
   prompt: task,
   options: {
     allowedTools: ["Bash", "Read", "Edit", "Glob", "Grep"],
-    permissionMode: "acceptEdits",          // free writes in workspace; escalations still prompt
+    permissionMode: "acceptEdits",          // free workspace writes; escalations still prompt
     hooks: {
       PostToolUse: [{ hooks: [async (input) => {
-        // never let raw test logs hit the context window
-        if (input.tool_name === "Bash") {
+        if (input.tool_name === "Bash") {   // raw logs never hit the context window
           input.tool_response.content = truncateOutput(String(input.tool_response.content));
         }
         return { continue: true };
@@ -128,41 +69,22 @@ for await (const msg of query({
 })) { /* ... */ }
 
 // completion gate lives OUTSIDE the model:
-const verified = await run("pytest tests/affected -q");   // harness re-runs, parses exit code
+const verified = await run("pytest tests/affected -q");
 if (verified.exitCode !== 0) reject("agent claimed done; verification failed");
 ```
 
-The two load-bearing ideas: output shaping happens in a hook (the model never depends on its own discipline), and "done" is an exit code the harness observes, not a sentence the model writes.
+Two load-bearing ideas: output shaping lives in a hook (never the model's own discipline), and "done" is an exit code the harness observes.
 
-**Compaction summary template** (what the transcript collapses into — test it by cold-resuming):
-
-```markdown
-## Task
-Fix flaky test_checkout_timeout in payments service; CI job #8841. Do NOT refactor beyond the fix.
-
-## Constraints
-- No changes to public API of payments/client.py
-- Test files may not be weakened (no skips, no loosened asserts)
-
-## Decisions made (with reasons)
-- Root cause is NOT the retry logic — ruled out by adding logging, saw single attempt (step 12)
-- Timeout originates in mock server startup race — reproduced 3/10 runs with `pytest -p no:cacheprovider --count=10` (step 19)
-
-## Dead ends (do not retry)
-- Increasing client timeout to 30s: masked it locally, still flaked in CI (step 15)
-
-## Current state
-- Fix drafted in payments/tests/conftest.py (wait-for-port helper); 8/10 reruns pass, need 10/10
-
-## Next step
-- Make wait-for-port deadline configurable; rerun --count=10; then full payments suite
-```
-
-The sections that earn their bytes: *decisions with reasons* and *dead ends* — without them, the resumed agent re-litigates step 12 and re-tries the timeout bump. Goal and constraints re-entering context is your scope-drift defense.
+Compaction template sections that earn their bytes: task + explicit non-goals; constraints; **decisions with reasons**; **dead ends with evidence** ("timeout bump masked it locally, still flaked in CI — do not retry"); current state; next step.
 
 ## Verification and self-check
 
-- Before shipping any harness change, run the same 10–20 task regression set and compare *end-to-end success*, cost, and step count — not transcript aesthetics. Keep every past failure as a regression task.
-- Audit five random transcripts per iteration for the big four: false completion, weakened tests, loop spirals, scope drift. Read the diffs the agent produced, not its summaries of them.
-- Red-team the sandbox once per design change: from inside the agent's shell, try to write outside the workspace, reach a non-allowlisted domain, read a secret, and persist across sessions. All four should fail.
-- Stopping rule: the agent is good enough to ship (behind review) when held-out verification passes on the majority of your task set and false-success rate is ~0; past that, invest in the verifier and the task distribution, not in prompt polish — verifier quality is the ceiling on everything else.
+- Regression-run the same 10–20 tasks per harness change; compare end-to-end success/cost/steps, not transcript aesthetics.
+- Audit five random transcripts per iteration for the big four; read the diffs, not the agent's summaries of them.
+- Red-team the sandbox per design change: write outside workspace, reach a non-allowlisted domain, read a secret, persist across sessions — all four must fail.
+- Ship (behind review) when held-out verification passes on most tasks and false-success ≈ 0; past that, invest in the verifier and task distribution, not prompt polish.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 12 claims: 10 baseline (cut/compressed), 1 partial, 1 delta (expanded).
+- Delta: benchmark calibration — Opus says frontier ≈70–80% on SWE-bench Verified; reality mid-2026 is ~90–95% (saturating), Pro ~80%, Terminal-Bench with headroom.
+- Opus cold nails: minimal tool set + tool-earning test, head+tail truncation with counts, context ladder, compaction resume-test, deceptive-green defenses, sandbox primitives (Landlock/seccomp/bubblewrap/Seatbelt), 0.95^10 math, error-loop root-cause ordering, AGENTS.md content. All compressed to anchors; SDK-specific hook/permission-mode shapes kept as reference.

@@ -7,176 +7,89 @@ description: Load when deploying to, debugging, or designing workloads for Kuber
 
 ## Core mental model
 
-- **Kubernetes is a reconciliation engine, not a deployment tool.** Every object is a *desired state* record; controllers run infinite loops comparing desired vs observed state and nudging reality toward the spec. This explains everything confusing: why `kubectl apply` returns before anything happens (you wrote a record, that's all), why deleted pods come back (a controller's desired state still says 3 replicas), why fixes must go to the *owner* (edit the Deployment, not the pod — the ReplicaSet will stomp your pod edit), and why the right debugging question is always "which controller owns this object, and what does it think the desired state is?"
-- **The scheduler bets on requests; the kernel enforces limits.** `requests` are a scheduling-time claim used for bin-packing — never measured against actual usage after placement. `limits` are runtime enforcement: cgroup CPU throttling for CPU, OOM-kill for memory. A cluster can be 30% utilized and unschedulable (requests over-provisioned), or 95% utilized and healthy. These are different axes; reason about them separately.
-- **Pods are cattle by construction.** Any pod can be killed at any time by node drain, eviction, preemption, or bin-packing (consolidation). If your app can't tolerate a random pod death right now, the fix is app architecture (graceful shutdown, PDBs, StatefulSet if identity matters), not "please don't touch my pod."
-- **Labels and selectors are the only glue.** Service→pod, Deployment→ReplicaSet→pod, NetworkPolicy→pod: all label matching. A huge fraction of "traffic isn't reaching my pod" bugs are selector typos. `kubectl get endpointslices` is the truth about what a Service actually routes to.
-- **YAML is not the interface; the API is.** `kubectl explain deployment.spec.strategy`, `kubectl get -o yaml`, and events are how you interrogate the system. Fields you didn't set have defaults that matter (e.g., `terminationGracePeriodSeconds: 30`, `restartPolicy: Always`).
+- **Kubernetes is a reconciliation engine.** Every mystery resolves to "which controller owns this object, and what does it think desired state is?" — why `apply` returns before anything happens, why deleted pods come back, why fixes go to the owner (edit the Deployment; the ReplicaSet stomps pod edits).
+- **The scheduler bets on requests; the kernel enforces limits.** A cluster can be 30% utilized and unschedulable (requests over-provisioned) or 95% and healthy — different axes, reason separately.
+- **Pods are cattle by construction**; if the app can't tolerate a random pod death right now, the fix is app architecture (graceful shutdown, PDB, StatefulSet if identity matters), not "don't touch my pod."
+- **Labels/selectors are the only glue**; `kubectl get endpointslices` is the truth about what a Service routes to.
 
-## Workload resource selection — the reasoning chain
+## Workload selection
 
-Ask in order:
+Runs to completion → Job/CronJob (never a Deployment — `restartPolicy: Always` restarts *successful* exits into CrashLoopBackOff by design). Replicas non-interchangeable (own PV, stable DNS, ordered start) → StatefulSet — the test is interchangeability, not "has state"; local disk cache is `emptyDir`, still a Deployment. Every node → DaemonSet. Otherwise → Deployment (~90%). Databases: prefer managed or a mature operator (CloudNativePG, Strimzi) over hand-rolled StatefulSets.
 
-1. **Does it run to completion?** → `Job` (or `CronJob` for schedules). Never a Deployment with a script that exits — you'll get CrashLoopBackOff by design, because `restartPolicy: Always` restarts *successful* exits too.
-2. **Does each replica need stable identity** — its own persistent volume, a stable DNS name, or ordered startup (databases, Kafka, anything with a notion of "node 0")? → `StatefulSet`. The test isn't "has state" but "are replicas interchangeable?" A stateless API writing to RDS is a Deployment; replicas are fungible.
-3. **Must it run on every node** (log shipper, node agent, CNI)? → `DaemonSet`.
-4. **Otherwise** → `Deployment`. This is the default; ~90% of workloads.
+## Debugging: describe + events first
 
-What changes the answer: "our app caches to local disk" does *not* make it a StatefulSet (use `emptyDir`; cache is disposable). "Replicas coordinate via each other's hostnames" does. If you're reaching for StatefulSet for a database, first ask whether a managed DB or an operator (CloudNativePG, Strimzi) should own that complexity instead.
+`kubectl describe pod` (Events = the controller's diary) + `kubectl get pod -o wide` resolve 80% of cases. Branch: **Pending** = scheduler (insufficient resources per node allocatable, taints/affinity, unbound PVC/zone mismatch, or autoscaler can't fit the shape — check its logs). **CrashLoopBackOff** = the app; `kubectl logs --previous` (the most-forgotten flag — restarts >0 → `--previous` first), exit codes 137=SIGKILL (OOM or liveness), 139=segfault, 127/126=bad entrypoint; empty logs + missing ConfigMap/Secret = `CreateContainerConfigError`. **Running-not-Ready** = readiness probe; empty endpointslices + existing pods = selector mismatch. **Terminating forever** = a finalizer nobody processes. If the story doesn't match `kubectl get events --sort-by=.lastTimestamp`, it's a guess — selectors, resources, and probes are common; the CNI is rare.
 
-## The debugging decision tree
+## Requests and limits
 
-Start every pod investigation with the same two commands — they resolve 80% of cases:
+Memory: request = limit (incompressible; overcommit resolves via someone's OOM kill). CPU: request yes, **limit usually no** — CFS quota stalls the pod for the rest of each 100ms period even on an idle node; `container_cpu_cfs_throttled_periods_total` is the smoking gun for mystery tail latency. CPU limits are justified only for static-CPU-manager pinning, strict multi-tenancy, or spin-loop protection. Requests come from measured p99 over a representative week — **in-place pod resize went GA in Kubernetes 1.35 (late 2025), not 1.34 as commonly misremembered**, and VPA's `InPlaceOrRecreate` mode now applies recommendations without restarts; VPA-in-recommendation-mode remains the expert default measuring instrument.
 
-```bash
-kubectl describe pod <pod>        # Events section = the controller's diary
-kubectl get pod <pod> -o wide     # phase, restarts, node, IP
-```
+## Probes
 
-Then branch on the symptom:
+Readiness = "route to me?"; be careful checking *shared* dependencies — a DB blip taking every pod unready converts partial degradation into total outage; prefer failing requests fast. Liveness = "restart cures me" — most apps shouldn't have one; a liveness probe with dependencies turns every DB blip into a fleet-wide restart storm, and one that fails under load (GC, thread exhaustion) turns "slow" into "restart storm → colder → slower." Startup probe replaces giant `initialDelaySeconds` for slow boots. Shutdown: SIGTERM and endpoint removal race *in parallel* — serve while draining, or `preStop: sleep 5–10` so endpoint propagation wins.
 
-**Pending** — the scheduler can't place it. Nothing is wrong with your app; it never started.
-- `kubectl describe pod` → Events. Look for `FailedScheduling: 0/12 nodes available: insufficient cpu` (requests too big or cluster full — check `kubectl describe nodes | grep -A5 "Allocated resources"`), `didn't match node selector/affinity`, `had untolerated taint`, or `unbound PersistentVolumeClaim` (check `kubectl get pvc` — a WaitForFirstConsumer StorageClass or a zone mismatch between the PV and schedulable nodes).
-- If the cluster autoscaler/Karpenter should have added a node, check its events/logs — a pod whose requests fit no *possible* node shape stays Pending forever.
+## Autoscaling layers
 
-**CrashLoopBackOff** — the container starts, exits nonzero, and kubelet backs off exponentially (max 5 min). The app is the problem.
-- `kubectl logs <pod> --previous` — the crashed container's logs, not the current attempt's. This is the single most-forgotten flag.
-- Exit code from `kubectl describe pod` (`Last State: Terminated, Exit Code:`): 1 = app error, 137 = SIGKILL (OOM or liveness timeout), 139 = segfault, 127/126 = bad command/entrypoint.
-- If logs are empty: bad command/args, missing env var making it die pre-logging, or a missing ConfigMap/Secret mount (that one shows as `CreateContainerConfigError` instead). Reproduce with `kubectl run debug -it --image=<image> -- sh` or `kubectl debug`.
+HPA scales count on metrics relative to *requests* (no requests → `<unknown>` and nothing happens; requests far below baseline → permanently >100% → pinned at maxReplicas). Don't run HPA and VPA on the same metric. Node layer: Karpenter is the EKS default (and underlies AKS Node Auto Provisioning) — right-sized nodes in ~1 min and active *consolidation*, so your PDBs and graceful shutdown had better work (`karpenter.sh/do-not-disrupt` for the exceptions); Cluster Autoscaler is the slower, no-surprises multi-cloud choice. HPA reacts in seconds, nodes in minutes — overprovisioning placeholder pods (low `priorityClassName`) if spike latency matters.
 
-**OOMKilled** — `describe` shows `Reason: OOMKilled`, exit code 137. The container exceeded its *memory limit* (or the node ran out and it lost the eviction/OOM lottery).
-- Distinguish: steady growth to the limit = leak or genuinely undersized; instant kill at startup = limit below baseline footprint; kills under load spikes = right-size for peak, not average.
-- Check actual usage vs limit: `kubectl top pod` (needs metrics-server) or your metrics stack (`container_memory_working_set_bytes` — that's what the OOM decision uses, not RSS).
-- JVM/Node gotcha: the runtime must know its budget. Modern JVMs respect cgroup limits (`MaxRAMPercentage`); Node needs `--max-old-space-size`. A 4 GiB-default heap in a 512 MiB container is a guaranteed 137.
+## Networking
 
-**Running but not Ready** — pod is up, readiness probe failing, so the Service won't route to it.
-- `kubectl describe pod` → `Readiness probe failed: ...` with the actual HTTP code/connection error. Then: is the probe port/path right? Does the app listen on 0.0.0.0 or only localhost? Is the dependency the readiness check pings actually down (in which case not-ready is *correct behavior*)?
-- Service-level check: `kubectl get endpointslices -l kubernetes.io/service-name=<svc>` — empty means selector mismatch or nothing ready.
+**ingress-nginx maintenance ended March 2026 — running it now means unpatched CVEs** (post-IngressNightmare); the Ingress API itself is frozen. New work: Gateway API (Envoy Gateway, Cilium, cloud-native implementations); `ingress2gateway` converts; the role split (infra owns Gateway, app teams own HTTPRoutes) is the design win — use it that way. Cross-namespace DNS needs the namespace qualifier ("works in staging, fails in prod" is often a missing `.namespace` in a URL). Default network policy is allow-everything.
 
-**ImagePullBackOff** — wrong image name/tag, missing `imagePullSecrets`, or registry auth/network. `describe` events contain the exact registry error.
+## Operators, and what NOT to run on k8s
 
-**Terminating forever** — a finalizer nobody is processing (`kubectl get pod -o yaml | grep -A3 finalizers`) or a node that died; last resort `--force --grace-period=0`, but understand a stuck finalizer means some controller is broken.
+Use mature community operators freely; *writing* one is a last resort (you're maintaining a distributed-systems controller). Red flag: a CRD whose controller just templates objects with no ongoing reconciliation — a Helm chart in a trench coat. Keep off k8s: databases you can't operate, uncheckpointable never-interrupt work (upgrades and consolidation *will* interrupt it), singleton legacy apps, and tiny total footprints — under the N-2/14-month support policy you're upgrading every ~4 months; if the company fits in 4 VMs, the control-plane tax exceeds the benefit.
 
-## Requests and limits — current reasoning (as of 2026)
+## Failure modes & pitfalls (checklist)
 
-- **Always set memory requests and limits, and set them equal.** Memory is incompressible — overcommit resolves via OOM kills of *someone*, often not the overcommitter. `requests == limits` gives predictable eviction behavior.
-- **Always set CPU requests; usually omit CPU limits.** This is now the mainstream position, not a hot take. CPU is compressible: without limits, contention is resolved proportionally by CPU *requests* (cgroup cpu.weight), so a noisy neighbor can only steal *idle* cycles — your request is still guaranteed. CPU limits add hard throttling: a pod hitting its quota is stalled for the rest of the 100ms CFS period even on an idle node, which manifests as mysterious tail latency (`container_cpu_cfs_throttled_periods_total` is the smoking gun).
-- When CPU limits *are* justified: Guaranteed QoS for static CPU-manager pinning (latency-critical, core-isolated workloads), strict multi-tenant platforms where predictability beats utilization, benchmarking to simulate constrained capacity, and pathological spin-loop protection.
-- Setting requests: measure (p99 of actual usage over a representative week), don't guess. In-place pod resize is GA (Kubernetes 1.35, late 2025), and VPA can now apply recommendations without restarting pods (`InPlaceOrRecreate` mode) — use VPA in recommendation mode as a measuring instrument even if you never let it actuate.
+- Editing the pod instead of its owner; `kubectl apply` fighting GitOps/an operator (find the other writer via `--show-managed-fields` before "fixing" harder).
+- One-shot script in a Deployment → CrashLoopBackOff with no error in sight.
+- **Same-tag image pushes don't roll out** (spec unchanged; `IfNotPresent` serves stale cache even on reschedule) — unique tags or digests, never mutated tags.
+- Deployment `spec.selector` is immutable — plan labels before first apply; fix = delete/recreate with `--cascade=orphan`.
+- Env vars from ConfigMaps/Secrets never update running pods; mounted files do (~1 min) **except `subPath` mounts, which never update**; rotate via checksum annotation on the pod template or a reloader.
+- PDB `maxUnavailable: 0` (or `minAvailable` = replicas) makes eviction impossible: drains hang, upgrades stall, Karpenter can't consolidate — and it's the *platform team* that gets paged. Single-replica workloads get no restrictive PDB.
+- Cargo-cult `{cpu: 100m, memory: 128Mi}` on a JVM = startup OOM or 20× under-request; JVM/Node must know the cgroup budget (`MaxRAMPercentage`, `--max-old-space-size`).
+- `ephemeral-storage` unset: a chatty container triggers node DiskPressure and evicts *neighbors*.
+- CronJob default `concurrencyPolicy: Allow` overlaps slow runs — set `Forbid`/`Replace` + `startingDeadlineSeconds`.
+- Sidecars as bare extra containers block Jobs and race the app at startup — native sidecars (init container + `restartPolicy: Always`, GA 1.33) fix ordering and Job completion.
+- `kubectl top` lies about OOM proximity — use `container_memory_working_set_bytes` max-over-time; a kill *under* the limit means node-level pressure (different fix: evictions, system-reserved).
 
-## Probes done right
-
-- **Readiness** = "send me traffic?" Checked continuously; failing removes the pod from Service endpoints but does *not* restart it. Should reflect ability to serve: app initialized, critical local resources up. Be careful checking *shared* dependencies: if the database blips and every pod's readiness check pings the DB, the whole fleet goes unready simultaneously and you convert a partial degradation into a total outage. Prefer failing requests fast over going unready for shared-dependency failures.
-- **Liveness** = "am I irrecoverably wedged? kill me." A liveness restart is a kill -9 with no diagnosis. Most apps don't need one. Never make liveness check dependencies; never make it the same endpoint as readiness. A liveness probe that fails under load (heavy GC, thread-pool exhaustion) turns "slow" into "restart storm": slow pod → probe timeout → restart → cold cache → slower → more restarts. If you must have one, probe the barest "event loop responds" endpoint with generous `timeoutSeconds` and `failureThreshold`.
-- **Startup** = "don't judge me while booting." For slow-starting apps (JVM warmup, large model load), a startup probe gates liveness/readiness until first success, replacing the old hack of huge `initialDelaySeconds`. `failureThreshold: 30, periodSeconds: 10` = up to 5 minutes to boot.
-- Graceful shutdown is a probe-adjacent must: on pod deletion, endpoint removal and SIGTERM race *in parallel* — traffic can arrive after SIGTERM. Handle SIGTERM by continuing to serve while draining, or add a `preStop: sleep 5-10` hook to let endpoint propagation win the race.
-
-## Autoscaling layers (as of 2026)
-
-Four layers that must be reasoned about together:
-
-- **HPA** scales replica *count* on metrics (CPU utilization relative to *requests* — another reason requests must be honest; or custom/external metrics like queue depth, e.g. via KEDA for scale-to-zero and event sources).
-- **VPA** adjusts per-pod requests. Historically restart-on-resize made it unpopular; with in-place resize GA this is changing, but recommendation-mode-first is still the expert default. Don't run HPA and VPA on the same metric (both act on CPU → feedback loop); HPA-on-CPU + VPA-on-memory is fine.
-- **Node layer:** Karpenter is the default choice on AWS EKS (and underlies AKS Node Auto Provisioning): provisions right-sized nodes directly from the cloud API in under a minute, no node-group ceremony, and actively *consolidates* (kills and repacks nodes to cut cost — your PDBs and graceful shutdown had better work). Cluster Autoscaler remains the safe, multi-cloud choice elsewhere: scales predefined node groups, slower, no repacking surprises.
-- Interplay trap: HPA reacts in seconds, node provisioning in ~minutes (CAS) or ~1 min (Karpenter). Under a spike, new replicas go Pending until nodes arrive — keep headroom (overprovisioning placeholder pods with low `priorityClassName`) if spike latency matters.
-
-## Networking model (as of 2026)
-
-- Every pod gets a routable IP; Services are stable virtual IPs load-balancing over ready endpoints. `ClusterIP` for internal, `LoadBalancer` for direct external exposure, `NodePort` almost never directly.
-- **Ingress is frozen; Gateway API is the successor.** ingress-nginx was retired (maintenance ended March 2026 — running it now means unpatched CVEs), and the Ingress API accepts no new features. For new work use Gateway API (`GatewayClass`/`Gateway`/`HTTPRoute`) with an implementation like Envoy Gateway, Cilium, or your cloud's native gateway; `ingress2gateway` converts existing manifests. Gateway API's role split (infra team owns Gateway, app teams own HTTPRoutes in their namespaces) is the design win — use it that way.
-- DNS: `<svc>.<namespace>.svc.cluster.local`; cross-namespace calls need the namespace qualifier — "works in staging, fails in prod" is often a missing namespace in a URL.
-- Default network policy is *allow everything*; NetworkPolicy objects are additive deny→allow and require CNI support.
-
-## Operators and CRDs — judgment
-
-An operator is worth it when the operational knowledge is genuinely complex, encodable, and repeated: failover choreography, backup/restore, version upgrades of stateful systems. Use mature community operators (CloudNativePG, Strimzi, cert-manager, ESO) freely. *Writing* your own is a last resort: you're signing up to maintain a distributed-systems controller with idempotent reconciliation, conflict handling, and upgrade paths. If a Helm chart + Job can do it, don't write an operator. Red flag in reviews: a CRD whose controller just templates other objects with no ongoing reconciliation logic — that's a Helm chart wearing a trench coat.
-
-## What NOT to run on k8s
-
-- **Databases you aren't expert in operating** — the operator helps but doesn't absolve you of understanding failover; managed services win below large scale or strong data-locality needs.
-- **Anything that must never be interrupted** without checkpointing — cluster upgrades and consolidation will interrupt it.
-- **Singleton legacy apps** with no health semantics: a VM is honestly simpler.
-- **Tiny total footprint**: if your whole company fits in 4 VMs, the control-plane tax (upgrades every ~4 months under the N-2/14-month support policy, CNI/CSI/ingress churn) exceeds the benefit. Cloud Run / ECS / Fly-class platforms cover the middle ground.
-
-## Failure modes & pitfalls
-
-- **Editing the pod instead of its owner.** `kubectl edit pod` fixes disappear on the next reconcile or reschedule. Fix the Deployment/StatefulSet; if you need a one-off experiment, `kubectl debug` or a copy-pod (`kubectl debug <pod> --copy-to=...`) — never mutate managed pods and expect it to stick.
-- **One-shot scripts in a Deployment.** A Deployment's pods have `restartPolicy: Always` (not configurable); a script that exits 0 restarts forever and eventually shows CrashLoopBackOff with no error in sight. Use a Job (`restartPolicy: OnFailure` or `Never`).
-- **HPA with no CPU requests.** CPU-utilization HPA computes percentage *of requests*. No requests → HPA reports `<unknown>` and does nothing (`kubectl describe hpa` shows `FailedGetResourceMetric`). Also: a request set far below real baseline (request 100m, idle usage 150m) means utilization is permanently >100% and the HPA pins to `maxReplicas`.
-- **Same-tag image pushes don't roll out.** Kubernetes rolls a Deployment only when the pod *spec* changes. Re-pushing `:staging` changes nothing in the spec, so nothing restarts — and when a pod does eventually reschedule, `imagePullPolicy: IfNotPresent` may still use the old cached image on that node. Deploy unique tags or digests; never mutate tags in place.
-- **Deployment selector is immutable.** Changing `spec.selector.matchLabels` on an existing Deployment errors (`field is immutable`). Plan labels before first apply; fixing requires delete/recreate (use `--cascade=orphan` to keep pods serving during the swap).
-- **Env vars from Secrets/ConfigMaps never update running pods.** Mounted ConfigMap *files* eventually propagate (kubelet sync, ~1 min, and not for `subPath` mounts — subPath mounts never update); env vars are set at container start, full stop. Rotating a secret requires a rollout — automate with a checksum annotation on the pod template (Helm `sha256sum` pattern) or a reloader controller.
-- **PDB that blocks all drains.** `maxUnavailable: 0` (or `minAvailable: 1` with 1 replica) makes eviction impossible: node upgrades hang, Karpenter can't consolidate, and cluster ops teams get paged about *your* app. PDBs must leave at least one evictable pod; single-replica workloads shouldn't have restrictive PDBs at all.
-- **Liveness probe with dependencies.** Liveness hitting an endpoint that checks the DB turns every DB blip into a fleet-wide restart storm. Covered above because it's that common: liveness checks process health only, or doesn't exist.
-- **Forgetting `--previous`.** Reading the *current* (restarting) container's empty logs and concluding "no logs" while the crash reason sits in `kubectl logs --previous`. Reflex: any restart count > 0 → `--previous` first.
-- **`kubectl apply` fighting another manager.** GitOps (Argo CD/Flux) or an operator will revert manual applies, and field-manager conflicts (`server-side apply` errors) mean two writers disagree. Find the other writer (`kubectl get <obj> -o yaml --show-managed-fields`) before "fixing" harder.
-- **Cargo-cult resources.** `requests: {cpu: 100m, memory: 128Mi}` copied from a tutorial onto a JVM service = OOMKilled at startup or 20x under-request that destabilizes bin-packing. Requests come from measurement; there is no universal default.
-- **Node-local ephemeral storage surprise.** Logs and `emptyDir` count against node disk; a chatty container can trigger node `DiskPressure` and evict *neighbors*. Set `ephemeral-storage` requests/limits for anything writing real volume.
-- **CronJob overlap.** Default `concurrencyPolicy: Allow` runs a slow job's next tick alongside it — duplicate processing. Set `Forbid` (or `Replace`), plus `startingDeadlineSeconds` so a controller outage doesn't fire a burst of missed schedules.
-- **Sidecars via bare extra containers.** A helper container that must outlive/precede the app (proxy, log shipper) as a plain second container has no startup ordering and can block Job completion. Use native sidecars (init container with `restartPolicy: Always` — GA since 1.33-era releases): ordered start, terminated after the main container, doesn't block Jobs.
-- **Trusting `kubectl top` for OOM analysis.** OOM decisions use the cgroup working set at the limit boundary at kill time; `top`'s sampled view can show "only 60%" right before a kill. Use `container_memory_working_set_bytes` max-over-time, and check the *node's* OOM events (`kubectl describe node`, kernel logs) when the killed pod was under its limit — that's node-level memory pressure, a different fix (evictions, system-reserved).
-
-## Worked micro-examples
-
-**A production-shaped Deployment (the fields that matter and why):**
+## Worked micro-example — the production-shaped Deployment (fields that matter)
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata: { name: api, labels: { app: api } }
 spec:
-  replicas: 3
-  selector: { matchLabels: { app: api } }   # immutable — choose once
+  selector: { matchLabels: { app: api } }        # immutable — choose once
   template:
-    metadata: { labels: { app: api } }
     spec:
-      terminationGracePeriodSeconds: 45      # > preStop + drain time
+      terminationGracePeriodSeconds: 45           # > preStop + drain
       containers:
       - name: api
         image: registry.example.com/api@sha256:9f8e...   # digest, not tag
-        ports: [{ containerPort: 8080 }]
         resources:
-          requests: { cpu: 250m, memory: 512Mi }   # measured p99, not guessed
-          limits: { memory: 512Mi }                # memory only; no CPU limit
-        startupProbe:                              # slow boot lives here
-          httpGet: { path: /healthz, port: 8080 }
-          failureThreshold: 30
-          periodSeconds: 5
-        readinessProbe:
-          httpGet: { path: /ready, port: 8080 }    # app-local checks only
-          periodSeconds: 5
+          requests: { cpu: 250m, memory: 512Mi }  # measured p99
+          limits: { memory: 512Mi }               # memory only; no CPU limit
+        startupProbe: { httpGet: { path: /healthz, port: 8080 }, failureThreshold: 30, periodSeconds: 5 }
+        readinessProbe: { httpGet: { path: /ready, port: 8080 }, periodSeconds: 5 }
         # no livenessProbe until someone can justify one aloud
-        lifecycle:
-          preStop: { exec: { command: ["sleep", "8"] } }  # let endpoint removal propagate
+        lifecycle: { preStop: { exec: { command: ["sleep", "8"] } } }
 ---
-apiVersion: policy/v1
 kind: PodDisruptionBudget
-metadata: { name: api }
-spec:
-  maxUnavailable: 1                          # evictable, so drains/consolidation work
-  selector: { matchLabels: { app: api } }
+spec: { maxUnavailable: 1 }                       # evictable, so drains/consolidation work
 ```
 
-**"Service returns 503 / connection refused" — the mechanical walk:**
+## How an expert thinks through it: "deploy went out, p99 tripled"
 
-```bash
-kubectl get endpointslices -l kubernetes.io/service-name=api   # any ready endpoints?
-# empty + pods exist        -> selector mismatch: diff svc selector vs pod labels
-# addresses but ready:false -> readiness failing: kubectl describe pod (probe error is printed)
-# endpoints fine            -> test from inside: kubectl run curl --rm -it --image=curlimages/curl \
-#                              -- curl -sv http://api.<namespace>.svc:80/
-# works in-cluster, fails outside -> Gateway/Ingress or LB layer, not the Service
-```
-
-## How an expert thinks through it: "deploy went out, latency p99 tripled"
-
-Rollout event correlates → check `kubectl rollout history` and diff the manifests, not just app code. Diff shows someone "added best practices": CPU limit `500m` and a liveness probe on `/health`. Hypotheses: (a) new code is slower — but p50 unchanged, only tail; deprioritize. (b) CPU throttling — check `container_cpu_cfs_throttled_periods_total`: spiking during request bursts. That's mechanism one. (c) Restarts? `kubectl get pods` shows `RESTARTS: 3-7` — liveness `/health` calls the DB with a 1s timeout, and under throttle-induced slowness it times out, killing pods and dumping their load onto neighbors. Two interacting failures, both from the "hardening" commit. Fix: drop CPU limit (keep the request, raised to measured p99), point liveness at a no-dependency ping endpoint or delete it, keep readiness on `/health` but return 200-with-degraded rather than failing on DB slowness. Rejected along the way: scaling replicas (treats symptom, throttling is per-pod), raising the CPU limit to 2 cores (still throttles at bursts, just later), removing probes wholesale (readiness is load-bearing for rollouts).
+Diff the *manifests*, not just app code: the "hardening" commit added a CPU limit and a liveness probe on `/health`. p50 unchanged → deprioritize "new code is slower." `container_cpu_cfs_throttled_periods_total` spiking = mechanism one. Restarts 3–7 = liveness `/health` hits the DB with a 1s timeout; throttle-induced slowness kills pods and dumps load on neighbors = mechanism two. Fix: drop the CPU limit (raise the request to measured p99), liveness to a no-dependency ping or delete it, readiness returns 200-degraded on DB slowness. Rejected: scaling replicas (throttling is per-pod), raising the limit (throttles later, still throttles), removing probes wholesale (readiness is load-bearing for rollouts).
 
 ## Verification / self-check
 
-Before declaring a manifest or diagnosis done:
-- `kubectl apply --dry-run=server -f .` (server-side catches admission/schema errors client-side misses); `kubectl diff` before applying to anything shared.
-- For a diagnosis: can you name the *controller* whose desired/observed mismatch explains the symptom, and does the Events timeline agree? If your story doesn't match `kubectl get events --sort-by=.lastTimestamp`, it's a guess.
-- Every Deployment ships with: memory request=limit, CPU request, readiness probe, graceful SIGTERM handling, PDB if replicas ≥ 2, and no liveness probe you can't justify aloud.
-- Kill one pod on purpose (`kubectl delete pod`) and watch traffic: zero errors = shutdown and probes are right. If you haven't done this, you don't know.
-- Stopping rule: the incident is explained when symptom, events, metrics, and the diff all tell one story. If you're on your third "maybe it's the CNI" theory without evidence, go back to `describe` and events — exotic causes are rare; selectors, resources, and probes are common.
+- `kubectl apply --dry-run=server` + `kubectl diff` before anything shared.
+- Every Deployment: memory request=limit, CPU request no limit, readiness probe, SIGTERM handling, PDB if replicas ≥2, no unjustified liveness.
+- Kill one pod on purpose and watch traffic: zero errors = shutdown and probes are right. If you haven't done this, you don't know.
+- A diagnosis names the controller whose desired/observed mismatch explains the symptom, and the Events timeline agrees.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+
+- Probed 14 claims: 12 baseline (cut/compressed), 2 partial (sharpened), 0 delta.
+- Opus cold nails: no-CPU-limits position + throttling mechanism, liveness anti-patterns, SIGTERM/endpoint race, same-tag no-rollout, ConfigMap/subPath propagation, PDB drain-blocking, Karpenter consolidation, native sidecars (GA 1.33), CronJob overlap, exit codes and `--previous`.
+- Sharpened: in-place pod resize **GA version is 1.35, late 2025** (Opus confidently says GA 1.34 — wrong release), and ingress-nginx's concrete **March 2026 end-of-maintenance** date (Opus knows "retired," not that running it today is an unpatched-CVE liability).

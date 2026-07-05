@@ -53,12 +53,7 @@ description: Load when selecting or critiquing molecular simulation methods — 
 
 ## Worked micro-examples
 
-**1. Protocol design: "Will amine A or amine B displace the aryl fluoride faster (SNAr, DMSO)?"**
-Relative-barrier question in a congeneric pair → error cancellation works. Protocol: CREST/GFN2-xTB conformer search on reactants and Meisenheimer-like TS guesses → optimize + frequencies at ωB97X-D/def2-SVP with SMD(DMSO) → confirm 1 imaginary frequency, animate C–N formation, IRC both TSs → single points ωB97X-D/def2-TZVPP/SMD → ΔΔG‡ = ΔG‡(A) − ΔG‡(B) with quasi-harmonic entropy. Interpretation gate: |ΔΔG‡| ≥ 2 kcal/mol → confident prediction (≥30:1 rate ratio); 1–2 → likely but hedge; <1 → report "computation cannot discriminate." Note what was *not* needed: CCSD(T) (differences within a family), absolute barrier accuracy.
-
-**2. Boltzmann and rate arithmetic (do this before claiming selectivity).**
-Two competing TSs, ΔΔG‡ = 1.0 kcal/mol at 298 K: ratio = e^(1.0/0.593) ≈ 5.4 : 1 → 84:16 product mixture, not "exclusive." For 99:1 you need ΔΔG‡ = 0.593 × ln 99 ≈ 2.7 kcal/mol. Conversely a "computed" 95:5 selectivity is a 1.7 kcal/mol claim — inside typical DFT error, so present it as consistent-with, not predicted. Eyring sanity check: ΔG‡ = 20 kcal/mol at 298 K → k = (k_BT/h)·e^(−20/0.593) ≈ 6.2×10¹² × 2.2×10⁻¹⁵ ≈ 1.4×10⁻² s⁻¹ (t½ ≈ 50 s: fast lab reaction); 25 kcal/mol → ~3×10⁻⁶ s⁻¹ (days). A mechanism whose computed barrier is 35 kcal/mol for a room-temperature reaction is refuted, not "high."
-**3. BSSE in a binding energy.** Water dimer at MP2/aug-cc-pVDZ: raw ΔE_int ≈ −5.4 kcal/mol; counterpoise-corrected ≈ −4.6; near-CBS reference ≈ −5.0 (true value bracketed by raw and CP at small basis). Lesson: at DZ, BSSE (~0.8 kcal/mol here, worse for larger monomers) is the size of chemical accuracy; report CP-corrected values or extrapolate, and note that CP overcorrects slightly in small bases.
+The quantitative reflexes here are reproducible cold and should simply be *run every time*: ΔΔG‡ = 1.0 kcal/mol → 5.4:1 (not "exclusive"); 99:1 needs 2.7 kcal/mol; a "computed 95:5" is a 1.7 kcal/mol claim inside DFT error, so report it as consistent-with, not predicted. Eyring anchor: ΔG‡ = 20 kcal/mol → t½ ≈ 50 s; 25 → days; a 35 kcal/mol barrier for a room-temperature reaction *refutes* the mechanism rather than being "high." BSSE at double-zeta (~0.8 kcal/mol for a water dimer, worse for bigger monomers) is the size of chemical accuracy — counterpoise-correct or extrapolate. The load-bearing move is the **interpretation gate**: |ΔΔG‡| ≥ 2 → confident (~30:1); 1–2 → hedge; <1 → state "computation cannot discriminate."
 
 ## Verification / self-check
 
@@ -68,3 +63,8 @@ Two competing TSs, ΔΔG‡ = 1.0 kcal/mol at 298 K: ratio = e^(1.0/0.593) ≈ 5
 4. **Error bar stated with source:** every quoted energy carries an uncertainty and names its dominant contributor (functional benchmark spread, solvation, sampling). MD observables carry replica/block statistics.
 5. **Back-of-envelope agreement:** does the number survive Eyring/Boltzmann/experimental-context sanity checks (barrier vs observed timescale, ΔG_bind vs known K_d range)? If a computed value contradicts robust experiment, the default hypothesis is a setup error (protonation state, conformer, missing dispersion, standard state) — hunt for it before claiming the experiment is wrong.
 6. **Question-method match re-affirmed:** state in one sentence why the chosen rung of the ladder suffices for the decision being made — if you can't, escalate one rung or add a benchmark.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~10 baseline. Notably, the *as-of-2026* method knowledge is NOT a delta — Opus 4.8 cold recommended r²SCAN-3c, ωB97M-V, B97-3c, DSD-BLYP-D3, revDSD-PBEP86-D4, DLPNO-CCSD(T)/CBS, CREST/GFN2-xTB, plus the T1-diagnostic (>0.02) multireference warning, the 1.89 kcal/mol standard-state correction, mandatory diffuse functions for anions, and the "no dispersion → wrong sign for π-stacking" rule.
+- No knowledge gap surfaced. The skill's residual value is enforcement of the quantitative gates (Boltzmann/Eyring arithmetic, the |ΔΔG‡| interpretation thresholds, BSSE) and the stationary-point-ledger discipline — reflexes to *apply*, not facts to supply.
+- Worked examples compressed to the gate arithmetic; protocol boilerplate was reproducible.

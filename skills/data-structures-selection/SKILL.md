@@ -5,140 +5,45 @@ description: Load when choosing a data structure for a task — matching access 
 
 # Data Structures Selection
 
-## Core mental model
+Most of this catalog is strong-model baseline (two-heap median, B-tree arithmetic, Bloom sizing, DSU, SortedList internals). This sheet keeps the selection method, the constants, and the composite tricks.
 
-- **Select by operation profile, not by name.** List the operations the algorithm actually performs, with frequencies: lookups? ordered iteration? min/max extraction? range queries? insertions mid-stream? Then pick the cheapest structure covering exactly that profile. Paying for capabilities you don't use (a balanced BST when you never need order) costs constant factors and code complexity for nothing.
-- **Big-O lies about constants; memory layout tells the truth.** A cache miss costs ~100× an L1 hit. An array scan of 100 elements typically beats a hash lookup chain that misses cache twice. Pointer-chasing structures (linked lists, naive BSTs) are 5–50× slower than their Big-O twin in contiguous memory. This is *the* reason real systems look different from textbooks.
-- **Amortized ≠ smooth.** Dynamic arrays and rehashing hash maps have O(1) amortized ops with occasional O(n) spikes. Fine for throughput, potentially fatal for per-operation latency budgets (real-time, lock-held sections). If tail latency matters, pre-size or pick a structure with worst-case bounds.
-- **The sorted array is the most underrated structure in the catalog.** For build-once/query-many workloads it beats everything: binary search with zero pointer chases, perfect cache behavior, half the memory of any node-based tree, and `bisect` is 4 lines. Reach for trees only when interleaved inserts and queries force you to.
-- **Composite structures solve composite profiles.** Need O(1) lookup AND ordered iteration? dict + sorted structure. LRU cache = hash map + doubly linked list (`OrderedDict`). Streaming median = two heaps. Don't hunt for one exotic structure when two boring ones glued together do it.
+## The method (this is the skill; structures are commodities)
 
-## The selection table
+- Select by **operation profile with frequencies**, not by name: list what the algorithm actually does (lookups? ordered iteration? min/max extraction? range queries? mid-stream inserts?), then buy exactly that. Paying for unused capabilities (balanced BST when order is never needed) costs constants and bugs for nothing.
+- **Memory layout beats Big-O at real sizes**: a cache miss ≈ 100× an L1 hit; pointer-chasing structures run 5–50× behind their contiguous Big-O twins. Python object overhead is ~50–100 B/element — 3×10⁶ int64 ids = ~24 MB as a sorted numpy array vs ~200+ MB as a `set`, and one vectorized `np.searchsorted` over batched queries beats 5×10⁷ interpreter-dispatched `in` calls outright. Check n × bytes/element against memory before choosing; 10⁸ dict entries in 16 GB is not happening — that's the numpy/bitset/sketch signal.
+- **Amortized ≠ smooth**: rehash/resize spikes are fine for throughput, fatal on latency paths and lock-held sections — pre-size or pick worst-case structures. Python offers no dict pre-size; bulk-build via `dict(zip(keys, vals))`.
+- **Build-once/query-many → sorted array**, the most underrated entry: zero pointer chases, half the memory of any node-based tree, `bisect` in 4 lines, batch-vectorizable, ranges for free. Trees only earn their keep under interleaved inserts+queries; in Python that means `sortedcontainers.SortedList` (chunked array-of-arrays; `add` is ~O(√n) memmove in C, which still crushes pure-Python log-n pointer trees).
+- **Composite profiles → composite structures**: O(1) lookup + order = dict + sorted structure; LRU = `OrderedDict`; streaming median = two heaps. Don't hunt one exotic structure when two boring ones glued together do it.
 
-| Dominant operation profile | Structure | Real-world notes on constants |
-|---|---|---|
-| Lookup/insert/delete by key, no order needed | Hash map | O(1) expected; watch rehash spikes and iteration-order assumptions |
-| Membership only, huge scale, false positives OK | Bloom filter | ~10 bits/element for 1% FP; see sketches section |
-| Ordered iteration + point lookup, build-once | Sorted array + `bisect` | Beats trees by 2–10× on query; O(n) insert is the tax |
-| Ordered ops with interleaved inserts | Balanced BST / skip list; in Python: `sortedcontainers.SortedList` | SortedList (chunked array-of-arrays) is cache-friendly and usually fastest in Python |
-| Repeated min/max extraction, insert-heavy | Binary heap (`heapq`) | Array-backed, cache-decent; no efficient arbitrary delete — use lazy deletion |
-| Top-k of a big/streaming set | Size-k min-heap (for top-k largest) | O(n log k), memory O(k); `heapq.nlargest` does exactly this |
-| FIFO/sliding window ends | `collections.deque` | O(1) both ends; never use `list.pop(0)` — it's O(n) |
-| Connectivity queries under union-only merging | Union-find (DSU) | Near-O(1) amortized with path compression + union by rank |
-| Range aggregate + point/range updates | Segment tree / Fenwick (BIT) | Fenwick: ~15 lines, prefix-sum-invertible ops; segment tree: any associative op, lazy propagation for range updates |
-| Stabbing queries ("which intervals contain point x") | Interval tree; or sort + sweep if offline | If queries can be sorted/batched, a sweep line kills the tree |
-| String prefix queries, autocomplete | Trie | Memory hog (per-node dict/array); sorted array of strings + `bisect` on prefixes often suffices |
-| Dense integer keys in a known range | Plain array/bitset | The fastest "hash map" ever shipped |
-| Disk/large-memory ordered storage | B-tree/B+tree | See "why databases choose B-trees" |
+## Constants and formulas worth citing exactly
 
-## Hash map pitfalls (the expensive ones)
+- B-trees: one page fetch buys a whole node of keys — branching ~500–1000 → 3–4 page reads for 10⁹ keys vs ~30 pointer hops for a binary tree; B+trees keep values in leaves (higher fan-out) and chain leaves for range scans. Write-heavy → LSM (sequential writes, compaction, per-SSTable Bloom filters); read-heavy point/range → B-tree. Ask the read/write ratio first.
+- Bloom filter: ~9.6 bits/element for 1% FP, k ≈ 7 (k = (m/n)·ln2); no false negatives; can't delete (counting/cuckoo variants); FP rate degrades sharply past design capacity — size for peak. Count-Min for stream frequencies (overestimates only); HyperLogLog ~1.5 KB for ~2% distinct-count error. Never sketches for money, auth, or dedup-with-consequences.
+- Heaps: top-k largest = size-k **min**-heap (the direction error evicts the largest of the kept set); `heapify` O(n) vs n pushes O(n log n); no arbitrary delete — lazy deletion (dead-set or stale-skip on pop; the standard Dijkstra idiom); tuple ties compare payloads and crash on uncomparable objects — insert a counter tiebreaker; `sorted()` beats popping a heap dry.
+- DSU: triggers = incremental connectivity, Kruskal, merge-groups, streaming cycle detection (union returning False *is* the cycle detector); anti-trigger = deletions (can't un-merge; offline reversal or link-cut). Path halving + union by size = α(n); recursive `find` blows Python's stack — iterate.
+- Bitsets: subset-sum reachability `reach |= reach << coin` = ~64× word-parallel speedup; submask iteration `sub = (sub-1) & mask` totals O(3ⁿ) over all masks — budget with that number; `int.bit_count()` (3.10+) for popcount.
 
-- **Mutation during iteration.** Python raises `RuntimeError` for dict size changes mid-iteration; C++ invalidates iterators on `unordered_map` rehash; Java throws `ConcurrentModificationException` (best case) or silently misbehaves. Correction: collect keys first (`for k in list(d)`) or build a new map.
-- **Mutable keys.** A key mutated after insertion changes its hash and becomes unfindable while still occupying a slot — no error, just a leak plus a lookup miss. Python blocks lists/dicts as keys, but a custom class with `__hash__` over mutable fields recreates the bug. Rule: hash only immutable identity; if you need to key by a list, use `tuple(x)`; by a set, `frozenset(x)`.
-- **`__eq__` without `__hash__` (Python).** Defining `__eq__` on a class sets `__hash__ = None` — instances become unhashable, surprising anyone adding them to a set later. `@dataclass(frozen=True)` gives you both, consistently.
-- **Adversarial worst case.** All keys colliding degrades to O(n) per op — a real DoS vector for services hashing user-controlled strings. Python randomizes string hashes per process (note: `hash("x")` differs across runs — never persist or send `hash()` values); Java 8+ tree-ifies hot buckets; C++ `unordered_map` has no defense — use a seeded/siphash-based hash for untrusted keys.
-- **Iteration-order assumptions.** Python dicts preserve insertion order (guaranteed 3.7+); Go randomizes deliberately; C++/Rust HashMap order is arbitrary and seed-dependent. Code that "works" by iterating a hash map in a meaningful order is a portability landmine — sort explicitly when order matters.
-- **Float keys.** `0.1 + 0.2 != 0.3` means computed float keys miss. Quantize (`round(x, 9)`) or use integer fixed-point keys.
-- **Rehash cost at scale.** Inserting 10M items triggers ~24 rehashes copying everything. Pre-size when the count is known: C++ `reserve(n)`, Java `new HashMap<>(n * 4 / 3)`; Python offers no pre-size — for bulk builds, `dict(zip(keys, vals))` in one shot is meaningfully faster than a loop.
+## Hash pitfalls (the expensive ones, compressed)
 
-## Heap patterns
+Mutation during iteration (collect keys first) · mutable keys / `__hash__` over mutable fields → unfindable entry + leak (tuple/frozenset the key; `@dataclass(frozen=True)` gives consistent eq+hash — defining `__eq__` alone sets `__hash__ = None`) · `hash()` is per-process randomized for str/bytes — never persist or send it (use hashlib) · iteration order: Python 3.7+ insertion-ordered, Go deliberately randomized, C++/Rust arbitrary — sort explicitly when order matters · float keys miss (`0.1+0.2 != 0.3`) — quantize or fixed-point · adversarial collisions degrade to O(n): C++ `unordered_map` has no defense — seeded hash for untrusted keys.
 
-- **Top-k largest of n:** min-heap of size k — push, and pop when size exceeds k. O(n log k), not O(n log n). Inverting the comparison direction (max-heap for top-k largest) is the classic sign error: you'd evict the *largest* instead of the smallest of the kept set.
-- **Streaming median:** max-heap `lo` (lower half) + min-heap `hi` (upper half), rebalance to |len(lo) − len(hi)| ≤ 1. Python has no max-heap: negate values on `lo`. Push to `lo` first, then move `lo`'s max to `hi`, then rebalance sizes — this ordering avoids the "new element on wrong side" bug.
-- **Lazy deletion (the workaround for heapq's missing `remove`):** to delete arbitrary items, don't. Mark them dead (a set of dead ids, or a version counter per key) and discard stale entries when they surface at the top: `while heap and heap[0] is stale: heappop(heap)`. This is also *the* standard Dijkstra idiom: push duplicates, skip on pop if `dist[u] < d`. Memory grows by the duplicate count — fine when duplicates are O(edges).
-- **Tuple ties:** `heapq` compares tuples element-wise; if priorities tie, it compares payloads — crashing on uncomparable objects. Insert a tiebreaker counter: `heappush(h, (priority, next(counter), item))`.
-- **Heapify is O(n), not O(n log n).** Building a heap from a list: `heapq.heapify(lst)` beats n pushes. If you need all elements sorted anyway, `sorted()` beats heap-popping n times (better constants, same complexity).
+## Selection judgment calls that go beyond the defaults
 
-## Trees, skip lists, B-trees — and why databases pick B-trees
-
-- In-memory ordered maps: red-black/AVL trees, skip lists, and B-trees are all O(log n). Skip lists win for lock-free concurrency (Java's `ConcurrentSkipListMap`, Redis sorted sets) because insertion touches few nodes probabilistically. Binary trees lose in practice because each comparison is a random pointer dereference — a cache miss.
-- **B-trees win on storage and even in-memory because of transfer granularity.** Disk reads are 4KB pages, cache reads are 64B lines. A B-tree node packs hundreds of keys into one page, so one fetch buys ~9 comparisons' worth of progress (branching factor ~500 → log₅₀₀(10⁹) ≈ 3–4 page reads for a billion keys, vs ~30 for a binary tree). B+trees additionally chain leaves for fast range scans and keep values out of interior nodes so more keys fit per page. Same logic at cache-line scale explains why in-memory B-trees (Rust `BTreeMap`, node size tuned to lines) beat red-black trees.
-- **LSM-trees vs B-trees (know when the DB flips):** write-heavy workloads (logs, time series) favor LSM (RocksDB, Cassandra) — sequential writes, deferred merge; read-heavy point/range lookups favor B-trees (Postgres, MySQL InnoDB). If asked to pick a storage index, ask the read/write ratio first.
-- In Python, skip the whole debate: `sortedcontainers.SortedList/SortedDict` (pure Python, chunked arrays) empirically outperforms tree implementations for nearly all sizes. In C++, `std::map` is a red-black tree; prefer `std::unordered_map` unless order/range ops are needed, and consider `boost::flat_map` (sorted vector) for read-mostly.
-
-## Union-find: triggers and implementation
-
-Triggers: "are X and Y connected", incremental edge additions with connectivity queries, Kruskal's MST, "merge accounts/groups", cycle detection in an undirected graph while streaming edges, grid percolation. Anti-trigger: edge *deletions* — DSU can't un-merge; you need offline reversal tricks or a different structure.
-
-```python
-parent = list(range(n))
-size = [1] * n
-def find(x):
-    while parent[x] != x:
-        parent[x] = parent[parent[x]]   # path halving: as good as full compression, no recursion
-        x = parent[x]
-    return x
-def union(a, b):
-    ra, rb = find(a), find(b)
-    if ra == rb: return False           # already connected — this return value IS your cycle detector
-    if size[ra] < size[rb]: ra, rb = rb, ra
-    parent[rb] = ra
-    size[ra] += size[rb]
-    return True
-```
-Both optimizations together give α(n) amortized (effectively constant). Path compression alone is enough in practice; skipping *both* degrades to O(n) chains. Recursive `find` overflows Python's stack on ~1000-deep chains — use the iterative form above.
-
-## Bloom filters and sketches (approximate structures for scale)
-
-- **Bloom filter:** set membership, no false negatives, tunable false positives. Sizing: m/n ≈ 10 bits per element → ~1% FP with k = 7 hash functions (optimal k = (m/n)·ln 2). Use for: "definitely not present" fast paths — cache admission, LSM SSTable filters, "have we crawled this URL". Cannot delete (use counting Bloom or cuckoo filter if you must). Pitfall: FP rate degrades badly past design capacity — size for peak n, not average.
-- **Count-Min Sketch:** approximate frequencies of stream items in sublinear memory; overestimates only. Use for heavy hitters/rate limiting at scale.
-- **HyperLogLog:** distinct-count in ~1.5KB with ~2% error (Redis `PFCOUNT`). Use whenever the question is "how many unique" and exactness isn't contractual.
-- Decision rule: reach for a sketch when n × (bytes per exact entry) exceeds comfortable memory AND the consumer tolerates quantified error. Never for money, auth, or dedup-with-consequences.
-
-## Segment trees, Fenwick, interval structures
-
-- **Fenwick (BIT)** when the operation is invertible (sum, XOR): point update + prefix query in O(log n), ~15 lines, tiny constant. Range-sum query = two prefix queries.
-- **Segment tree** when you need min/max/gcd (non-invertible) or range updates (lazy propagation). 4n array sizing, iterative versions are faster but recursive is far easier to get right.
-- **Recognition:** "range query + updates interleaved" → segment tree family. "All queries known upfront" → consider offline sorting/sweep line instead; it's often simpler AND faster.
-- **Interval trees vs the cheap alternative:** for "which intervals contain point x" queries arriving online, an interval tree (or `IntervalTree` from the `intervaltree` package) is right. If intervals and queries are both known, sort endpoints and sweep — O((n+q) log(n+q)) with trivial code. Most "I need an interval tree" moments are actually sweep-line problems.
-
-## Bit manipulation structures
-
-- **Bitset as a set of small ints:** Python arbitrary-precision ints make elegant bitsets: `mask |= 1 << x`, test `mask >> x & 1`, iterate set bits via `while m: low = m & -m; ...; m ^= low`. Popcount: `bin(m).count("1")` or 3.10+ `m.bit_count()` (much faster).
-- **Bitset DP acceleration:** subset-sum reachability in O(n·maxsum/64): `reach |= reach << coin`. This one trick turns 10⁸ operations into 10⁶ — remember it exists.
-- **Bitmask as dict key for subset DP:** `dp[mask]` over 2^n subsets; iterate submasks with `sub = mask; while sub: ...; sub = (sub - 1) & mask` — total O(3^n) over all masks, a fact worth knowing when budgeting.
-
-## Worked micro-examples
-
-**1. Streaming median — two heaps with the safe insertion order.**
-```python
-import heapq
-class StreamingMedian:
-    def __init__(self):
-        self.lo = []                     # max-heap via negation: lower half
-        self.hi = []                     # min-heap: upper half
-    def add(self, x):
-        heapq.heappush(self.lo, -x)      # 1. always enter through lo
-        heapq.heappush(self.hi, -heapq.heappop(self.lo))   # 2. lo's max -> hi (fixes ordering)
-        if len(self.hi) > len(self.lo):                    # 3. rebalance sizes
-            heapq.heappush(self.lo, -heapq.heappop(self.hi))
-    def median(self):
-        if len(self.lo) > len(self.hi):
-            return -self.lo[0]
-        return (-self.lo[0] + self.hi[0]) / 2
-```
-The push-then-transfer sequence makes it impossible for an element to land on the wrong side — the direct "compare x to the median and pick a side" version has three edge cases and most implementations get one wrong.
-
-**2. Selection reasoning end-to-end.** Task: 5×10⁷ lookups against 3×10⁶ known 64-bit ids, build once, read-only, latency-sensitive. Profile: membership only, no inserts after build, no order. Candidates: `set` (fits: ~3×10⁶ × ~100B ≈ 300MB in Python object overhead — heavy), sorted numpy array + `np.searchsorted` (24MB, cache-friendly, ~O(log n) with tiny constant, vectorizable over query batches), bitset (id range too large), Bloom filter (only if 300MB→24MB still too big AND 1% FP acceptable). Choice: sorted numpy array; batch the queries with one vectorized `searchsorted` call and it beats the hash set by an order of magnitude in Python. The generalist answer ("use a set, it's O(1)") loses on memory AND speed — constants and layout decided this, not Big-O.
-
-## Failure modes & pitfalls (cross-cutting)
-
-- Using `list.insert(0, x)` / `pop(0)` as a queue — O(n) each; that "mysteriously slow BFS" is usually this. Use `deque`.
-- Choosing a heap when you need "min AND delete arbitrary" — that's a sorted structure or lazy deletion, not more heap.
-- Reaching for a trie/suffix automaton when `bisect` over sorted strings answers the prefix query in 3 lines.
-- Storing parallel data in 4 dicts keyed the same way instead of one dict → dataclass values; four hash lookups where one suffices, and update-consistency bugs.
-- Ignoring that `heapq` is a *min*-heap: for max behavior negate keys, and negate again on read — sign errors here produce plausible-looking wrong answers, so test with a 3-element example.
-- Benchmarking with wall-clock on n = 100 and extrapolating: rehash spikes, GC, and cache effects don't extrapolate. Measure at target n.
-- Using a `set`/`dict` of tuples for 2-D grid visited state at scale: `visited[r][c]` on a boolean list-of-lists is 3–5× faster and predictable — the tuple hash + allocation per check is pure overhead when coordinates are dense.
-- Deleting from a list while index-iterating it (`for i in range(len(a)): del a[i]`) — skips elements and eventually IndexErrors. Build a new list with a comprehension, or iterate a copy.
-- `collections.Counter` left un-reached-for: `most_common(k)` is the top-k pattern, `Counter(a) & Counter(b)` is multiset intersection. Hand-rolling these invites off-by-ones.
-- Priority queue with mutable priorities updated in place — the heap silently loses its invariant (heapq never re-checks). Correction: lazy deletion with a fresh push, or `dict` + full re-heapify if updates are rare and bulk.
-- Choosing `frozenset` keys when order matters ("path visited so far" where revisit rules depend on sequence) — the collapsed key merges distinct states; the DP/search then returns wrong answers only on inputs where order mattered. Key design = state design.
+- Fenwick when the op is invertible (sum/XOR): 15 lines, tiny constant. Segment tree for min/max/gcd or lazy range updates. **All queries known upfront → sort + sweep instead** — most "I need an interval tree" moments are sweep-line problems, simpler and faster.
+- Trie vs `bisect` over sorted strings: the latter answers most prefix queries in 3 lines without the per-node memory hog.
+- Dense integer keys in a known range → plain array/bitset — the fastest "hash map" ever shipped. 2-D grid visited state → boolean list-of-lists, 3–5× faster than a set of tuples (per-check tuple hash + allocation).
+- `Counter.most_common(k)`, `Counter & Counter` — reach for them before hand-rolling top-k/multiset ops.
+- Key design = state design: `frozenset` keys collapse order-dependent states; if the future depends on sequence, the collapsed key silently merges distinct states and the search returns wrong answers only on inputs where order mattered.
+- Priorities mutated in place silently break heap invariants (heapq never re-checks) — lazy delete + fresh push.
+- Four parallel dicts keyed identically → one dict of dataclasses: four lookups where one suffices plus update-consistency bugs.
 
 ## Verification / self-check
 
-- Re-list the operation profile and confirm every operation used has the complexity you claimed *in the chosen library's implementation* (e.g., `SortedList.add` is O(n^0.5)-ish, not O(log n) — still usually fine, but claim it correctly).
-- Check n against memory: node-based structures cost ~50–100 bytes/element in Python (object overhead); 10⁸ elements in a dict is not happening in 16GB — that's the sketch/bitset/numpy signal.
-- For any hash-keyed design: are keys immutable, is iteration order relied upon, can an adversary choose keys?
-- For amortized structures on a latency path: is a spike acceptable mid-operation?
-- Trace one insert + one query by hand through the chosen structure at size 3 — most selection errors surface immediately.
+- Re-confirm each operation's cost *in the chosen library's implementation* (SortedList.add ~O(√n), not O(log n) — usually fine, claim it correctly).
+- n × bytes/element vs available memory; amortized spikes vs the latency budget; adversarial keys vs the hash.
+- Trace one insert + one query by hand at size 3 — most selection errors surface immediately; benchmark at target n, not n=100 (rehash/GC/cache effects don't extrapolate).
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 13 claims: 13 baseline (cut/compressed), 0 partial, 0 delta.
+- Opus 4.8 nailed everything: min-heap direction for top-k, push-then-migrate median insertion, the 24 MB-vs-200 MB numpy-vs-set analysis with the batching argument, B-tree page math and LSM tradeoff, 9.6 bits/7 hashes Bloom sizing with saturation behavior, DSU incl. path halving and the union-return cycle bit, heapq gotchas, hash randomization/iteration-order per language, Fenwick-vs-segment invertibility rule and the sweep-line escape, SortedList internals with the O(√n) add, bitset DP at ~64×, and O(3ⁿ) submasks.
+- No substantive gaps; retained value is the selection method (profile → layout → constants), the exact formulas, and checklist completeness.
