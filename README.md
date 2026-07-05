@@ -2,7 +2,9 @@
 
 A library of 101 knowledge-transfer skills authored by Claude Fable 5 to distill expert-level judgment for Claude Opus 4.8 (and other agents). Each skill lives at `skills/<name>/SKILL.md` with standard frontmatter (`name`, `description`) so it can be loaded by Claude Code's skill system.
 
-These are not tutorials. Each skill encodes what a senior practitioner knows that a strong generalist gets wrong: core mental models, decision frameworks with explicit reasoning chains, "how an expert thinks through this" walkthroughs (including rejected alternatives), specific failure modes with corrections, worked micro-examples, and verification checklists with stopping rules. Round-2 skills (the practice-oriented ones below) were written against live web research, with fast-moving facts verified and marked "as of 2026".
+These are not tutorials. Each skill encodes what a senior practitioner knows that a strong generalist gets wrong: corrections to reflex answers, decision rules, calibrated numbers, failure modes, and verification checklists. Practice-oriented skills were written against live web research, with fast-moving facts verified and marked "as of 2026".
+
+**Every skill has been empirically delta-audited against Opus 4.8** (July 2026): its load-bearing claims were turned into cold probe questions, answered by an Opus-model agent with no access to the skill, and graded. Content Opus already produces cold was cut or compressed to checklist anchors; measured gaps (wrong, outdated, or missing answers) were expanded into each skill's spine. Each file ends with a "Delta notes" section recording the audit counts and the biggest baseline gaps found — so you know exactly what each skill is for. Skills that proved ≥80% baseline were restructured into compact correction/discipline sheets; the durable delta concentrates in post-cutoff facts (2025–2026 tool, protocol, pricing, and model-landscape changes), decision-flipping calibration numbers, and second-order mechanisms the baseline reasons past.
 
 ## Usage
 
