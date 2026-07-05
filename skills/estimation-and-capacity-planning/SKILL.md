@@ -43,6 +43,25 @@ Corollary: latency degradation *silently eats capacity* — if downstream latenc
 - **Runway alerts:** for every hard limit (disk, connection cap, IP space, partition count, quota), alert on *projected time-to-exhaustion* (e.g., <90 days at trailing-30-day growth rate), not on percent-full. 80%-full disk growing 1%/year is fine; 40%-full growing 5%/week is an incident in six weeks.
 - Cloud quotas are capacity limits too: on-demand instance quotas, Lambda concurrency, API rate limits, EIP counts. The p99-day plan that ignores a default quota gets to discover it during the event.
 
+## Queueing intuition — the hockey stick, numerically
+
+For a single-server queue with random arrivals (M/M/1), mean wait ≈ service_time × ρ/(1−ρ):
+
+| Utilization ρ | Queue wait (multiples of service time) |
+|---|---|
+| 50% | 1× |
+| 70% | 2.3× |
+| 80% | 4× |
+| 90% | 9× |
+| 95% | 19× |
+| 99% | 99× |
+
+Three consequences worth internalizing:
+- The curve is why "we have 20% headroom" is not conservative — it's the edge of the elbow. Load variance of ±15% around an 80% target routinely visits 95%, where latency is 5× worse.
+- **Variance makes it worse than the table:** bursty arrivals and heavy-tailed service times (that one 2-second query) push real queues above M/M/1 predictions. The table is the *optimistic* bound.
+- Pooling helps: one queue feeding N servers beats N separate queues (idle servers can't help the neighbor's backlog) — prefer shared worker pools over per-partition workers until ordering forces partitioning.
+The practical use is not computing exact waits — it's recognizing that between 80% and 95% utilization lies a 5× latency cliff, and pricing headroom accordingly.
+
 ## Headroom policy — why 70–80%, not 95%
 
 The utilization target debate resolves on four grounds:
