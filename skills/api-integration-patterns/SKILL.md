@@ -75,10 +75,10 @@ async def receive(request: Request):
     verify_standard_webhook(SECRET, request.headers["webhook-id"],
                             request.headers["webhook-timestamp"], raw,
                             request.headers["webhook-signature"])
-    inserted = await db.execute(
+    inserted = await db.fetchrow(                              # execute() returns "INSERT 0 0" (truthy) on skip
         "INSERT INTO webhook_events (id, raw, received_at) VALUES ($1,$2,now()) "
-        "ON CONFLICT (id) DO NOTHING", request.headers["webhook-id"], raw)
-    if inserted:
+        "ON CONFLICT (id) DO NOTHING RETURNING id", request.headers["webhook-id"], raw)
+    if inserted is not None:                                   # row returned only when actually inserted
         await queue.enqueue("process_webhook", request.headers["webhook-id"])
     return {"ok": True}                                        # 2xx in <1s either way
 ```

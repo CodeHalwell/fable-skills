@@ -30,7 +30,8 @@ description: Load when working with molecular data — SMILES/InChI/mol files, R
 from rdkit import Chem
 from rdkit.Chem.MolStandardize import rdMolStandardize
 mol = Chem.MolFromSmiles(smi)                    # None on failure — check!
-if mol is None: ...                              # log & quarantine, don't drop silently
+if mol is None:
+    return None                                  # log & quarantine upstream, don't drop silently
 mol = rdMolStandardize.Cleanup(mol)              # normalize nitro/N-oxide etc., strip Hs
 mol = rdMolStandardize.FragmentParent(mol)       # salt/solvate stripping → largest organic fragment
 mol = rdMolStandardize.Uncharger().uncharge(mol) # neutralize where possible (decide if you want this)

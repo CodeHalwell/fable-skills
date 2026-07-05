@@ -31,7 +31,9 @@ The baseline here is exceptionally strong — Opus produced Rule of Two, CaMeL's
 TAINT_DROPS = {"send_email", "http_fetch_new_domain", "file_write"}
 
 def authorize(call, session):
-    policy = TOOL_POLICIES[call.name]                   # missing policy -> deny by default
+    policy = TOOL_POLICIES.get(call.name)
+    if policy is None:                                  # missing policy -> deny by default
+        return Decision.deny(f"no policy for tool {call.name}")
     if session.tainted and call.name in TAINT_DROPS:    # read hostile content? lose reach.
         return Decision.confirm("session read untrusted content this turn")
     if call.name == "send_email":
