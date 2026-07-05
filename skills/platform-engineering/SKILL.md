@@ -37,6 +37,16 @@ Order of typical value delivery (start at the top):
 
 Sequencing judgment: teams commonly start with the portal because it demos well — usually wrong. A catalog of services nobody can easily create or deploy is a museum. Start where the pain is (almost always CI/CD + deploy), add the portal when there's something to catalog.
 
+**What one golden path concretely contains** (the checklist for "is our scaffold real?"): `create-service my-api --template=node-service` produces a repo with working CI (build/test/scan on PR, deploy on merge, all via the org's versioned reusable workflows), a `service.yaml` deploy contract, a running dev/staging deployment by the end of the command, dashboards and paging alerts wired to `team:`, workload identity to cloud resources (zero copied credentials), structured logging and tracing on by default, an on-call runbook stub, and catalog registration as a side effect. If any of those steps is "then file a ticket," the path isn't paved yet — the ticket is the roadmap item.
+
+## Portal selection — the reasoning chain (as of 2026)
+
+When the portal layer's time genuinely comes, ask in order:
+1. **What must it do on day one?** Rank: ownership catalog, scaffolding ("create-service"), self-service actions, scorecards, docs (TechDocs-style). If the top need is catalog + scaffold, almost any option works and the decision matters less than teams think — timebox it.
+2. **Can you staff self-hosted Backstage honestly?** It's a framework, not a product: React/TypeScript plugin development, realistic ongoing cost of 2–4 dedicated engineers. Below that staffing, self-hosted Backstage becomes an abandoned demo — the single most common portal failure as of 2026.
+3. **If not: managed Backstage (Roadie-style) vs SaaS portals (Port, Cortex, OpsLevel)?** Managed Backstage keeps the open ecosystem and exit path; SaaS portals win on time-to-value and low-code self-service actions, cost per-seat money and lock-in. Deciding factor is usually whether you need deep custom plugins (→ Backstage lineage) or configuration-level customization (→ SaaS).
+4. **Whatever you pick**: the catalog must be populated *mechanically* (from scaffold metadata, repo scanning, cloud tags) — a hand-maintained catalog is stale in a quarter, and a stale catalog is worse than none because people stop trusting all of it.
+
 ## Team topologies — who does what
 
 Use the Team Topologies frame precisely, because conflating these roles breaks them:
@@ -44,6 +54,23 @@ Use the Team Topologies frame precisely, because conflating these roles breaks t
 - **Platform team** builds and runs the internal product, interacting *as a service* (self-service consumption, docs, SLAs) — not as a gate in other teams' critical paths. If every deploy needs a platform-team human, you built a bottleneck, not a platform.
 - **Enabling teams** coach and upskill (e.g. "help teams adopt tracing"), embedding temporarily and *leaving*. Standing "DevOps team that does the DevOps for you" is the anti-pattern both of these get confused with.
 - Interaction modes evolve: new capabilities often start in *collaboration* mode with one pilot team, then harden to *X-as-a-Service*. A platform team permanently in collaboration mode with everyone is under-productized; permanently ticket-driven is an ops team.
+
+## Escape hatches — designing the off-road
+
+An escape hatch is a product feature, not a defeat. Design rules:
+- **Documented and first-class**: "bring your own manifests" has a how-to page, not a shrug. Undocumented escapes still happen; they're just invisible and unsupported.
+- **Partial, not total**: a team ejecting from the deploy abstraction should *keep* CI templates, observability defaults, and workload identity. All-or-nothing hatches force teams who need one divergence to abandon everything — maximum shadow infra for minimum cause.
+- **Cost stays visible**: off-road teams own their extra operational load explicitly (their on-call, their upgrade toil). Not punishment — honest pricing; the paved road should win on economics, not access control.
+- **Instrumented**: count hatch usage per capability. One team off-road is their special need; five teams off-road on the same capability is your feature gap, discovered for free.
+- **Two-way**: returning to the paved road must be cheap, or every temporary divergence becomes permanent.
+
+## Priors an expert carries into any platform conversation
+
+- The stated problem ("we need a portal/mesh/multi-cloud") is downstream of the real one (slow provisioning, unclear ownership, deploy fear) most of the time — go find the timing data before accepting the framing.
+- Adoption problems are product problems ~80% of the time and communication problems ~20%; they are almost never solved by mandate, and a mandate hides which one you had.
+- The highest-ROI platform work is usually the least glamorous: CI templates, secrets wiring, one-command scaffolds. Distrust roadmaps that lead with catalogs and dashboards.
+- Buy beats build for anything a vendor does at scale (portals, observability, secret stores); build wins only for the thin layer encoding org-specific opinions. Teams systematically overestimate their uniqueness.
+- Every platform capability has an ongoing maintenance tax around 20–30% of build cost per year; a roadmap that assumes zero maintenance is fiction.
 
 ## Platform-as-product discipline
 
@@ -70,6 +97,53 @@ Use the Team Topologies frame precisely, because conflating these roles breaks t
 - **Snowflake golden paths**: five scaffolds (per language) that drift apart, each with its own CI shape. Correction: one paved road with per-language surface layers over shared pipeline/deploy/observability contracts; the contract is the product.
 - **Ops team with a rebrand**: platform "team" spends 80% on interrupt tickets, builds nothing, burns out. Correction: measure interrupt load, convert top ticket classes into self-service features, and protect build capacity explicitly (rotation for interrupts, roadmap for the rest).
 - **Ignoring the exodus signal**: a team quietly moves to their own AWS account and their velocity *improves*. That's not insubordination; it's a churn event with product feedback attached. Interview them like lost customers.
+- **The platform-for-the-builders**: abstractions shaped by what's elegant to *implement* (a beautiful CRD hierarchy, a config DSL) rather than what's easy to *consume*. Tell: the platform team finds it intuitive and every consumer keeps a cheat sheet. Correction: the interface is designed from the consumer's vocabulary ("I have a web service that needs Postgres"), and consumers review interface changes before implementation starts.
+- **The v2 rewrite trap**: platform v1 has warts; the team disappears for three quarters building v2 "properly" while v1 rots and trust drains. Correction: platforms earn change tolerance through continuous small migrations they run themselves; if a rewrite is truly needed, it ships strangler-style, one capability at a time, with v1 supported until the last consumer is moved *by the platform team*.
+- **Support channel as documentation**: every question answered ad-hoc in Slack, nothing written; the same question costs a platform engineer 20 minutes weekly forever. Correction: answer-once policy — every non-trivial support answer becomes a docs PR or an error-message improvement the same day; track questions-answered-by-docs-link as a win.
+- **Wrong-altitude abstraction**: wrapping `kubectl` flag-for-flag (too low — no cognitive load removed, one more layer to debug) or "just push code, we handle everything" for an org with genuinely varied workloads (too high — the exceptions eat the team). Correction: abstract at the level where 80%+ of services are honestly identical; if you can't find such a level, the org isn't convergent enough for that layer yet — paved-road the layers below it instead.
+
+## Deprecation done right — the template
+
+Deprecation policy is where platform-as-product gets tested for real. The sequence that keeps trust:
+1. **Announce with a migration path**, not a deadline alone: what replaces it, why, and the automated migration (codemod, bot PR) the platform team provides.
+2. **Ship the automation first**: open PRs against every consumer repo; teams review and merge rather than research and rewrite. If you can't automate most of the migration, the replacement may not be ready to deprecate *into*.
+3. **Dashboards of remaining consumers**, public, with owners — social proof does most of the chasing.
+4. **Support window proportional to blast radius** (a CI template: a quarter; a deploy contract: two-plus), and the old path *keeps working* — degraded velocity of new features, never sudden breakage.
+5. **Hard cutoff only at the long tail**, coordinated individually with the stragglers. An org-wide breaking flag-day is a product failure being reframed as a compliance problem.
+
+## Worked micro-examples
+
+**A deployment abstraction contract that respects cognitive load (and shows its work):**
+
+```yaml
+# service.yaml — the whole interface a stream-aligned team must know
+name: payments-api
+team: payments            # drives ownership, alerts routing, cost attribution
+runtime: nodejs22
+port: 8080
+resources: standard       # named tiers (standard/high-mem/burst), not raw requests/limits
+scaling: { min: 3, max: 20, target: cpu:70 }
+dependencies:
+  - postgres: { tier: production }      # provisions DB + injects creds via workload identity
+env:
+  LOG_LEVEL: info
+# escape hatch, by design — not a workaround:
+# overlays/production/*.yaml is strategic-merge-patched onto generated manifests,
+# and `platform render` prints exactly what will be applied.
+```
+
+Design notes an expert would defend: named resource tiers instead of raw numbers (the platform owns right-sizing; teams state intent), `team:` as load-bearing metadata (ownership is the catalog), one documented escape hatch with `render` for progressive disclosure — and everything omitted (probes, PDBs, TLS, sidecars) is a deliberate "teams shouldn't need to know," each with a platform-set default they can inspect.
+
+**A cognitive-load audit, the 30-minute version:** list every question a developer must answer to get a new endpoint to production (Where does CI config come from? How do I get a DB? Who approves IAM? How do I see logs? What's the rollback command?). Sort into: *platform answers it* / *docs answer it* / *tribal knowledge*. The third column, weighted by how often each question recurs, is the roadmap. Rerun quarterly; the metric is the third column shrinking.
+
+**Metrics starter set (pre-registered before building anything):**
+
+| Metric | Source | Target trend |
+|---|---|---|
+| Time-to-first-deploy (new service, scaffold → prod) | quarterly timed run by a non-platform engineer | days → < 1 day |
+| Voluntary adoption (services on paved road / total) | catalog metadata | up, without mandates |
+| Platform interrupt tickets per consumer team per month | ticket labels: how-do-i / do-for-me / broken | down; "do-for-me" → self-service features |
+| Consumer DORA: lead time & change-failure rate | CI/CD + incident data, adopters vs not | adopters better and improving |
 
 ## How an expert thinks through it: "leadership wants an IDP; 12 product teams; where do we start?"
 

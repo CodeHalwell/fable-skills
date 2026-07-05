@@ -40,6 +40,21 @@ Three layers, cheapest first:
 2. **Explicit feedback** (sparse, biased negative — calibrate, don't trust rates as absolute quality): thumbs, categorized reports. Value is in the *attached trace*, not the aggregate rate.
 3. **Sampled LLM-judge scoring on production traffic**: run binary-rubric judges (grounded-in-context? answered-the-question? refused?) on a few percent of traces, async, off the request path. Pin the judge model + prompt version; recalibrate against human labels when either changes. Judge scores are for *trends and triage*, not per-user decisions.
 
+Wiring the loop end to end — the **feedback-to-improvement loop** as a standing process, not an aspiration:
+1. Weekly: pull the union of (negative implicit signals, explicit reports, judge-flagged traces) for the window.
+2. Cluster them — embedding the user inputs and k-means/HDBSCAN-ing is enough; you're looking for the 3–5 dominant failure themes, not a taxonomy.
+3. For each cluster: read 5–10 traces, run the root-cause tree (below), and promote 2–3 representative cases into the offline eval set *before* attempting the fix — the eval case is what proves the fix and prevents regression.
+4. Ship the fix through the eval-on-deploy gate; verify the cluster's judge-score/feedback trend actually moves. A fix that doesn't move the dashboard didn't fix the cluster.
+Track one meta-metric: eval cases added from production per month. Zero means the loop is broken regardless of how good the dashboards look.
+
+## Agent-specific observability
+
+Agents multiply everything: one user request = N model calls, M tool calls, loops, and self-corrections. Additions beyond basic tracing:
+- **Span hierarchy must mirror the agent graph**: agent step → model call → tool call(s), with parent-child links intact. A flat list of 40 spans for one request is unreadable at incident time.
+- **Loop/budget telemetry as first-class attributes**: steps taken, tokens consumed vs. per-trace budget, distinct-tools-used, repeated-tool-call count (same tool + same args twice = warning sign; three times = loop).
+- **Tool error vs. tool-error-handled distinction**: log whether the model acknowledged a failed tool result or narrated past it — the latter is the dangerous one, and it's detectable (tool span status=error followed by a confident final answer with no retry).
+- **Trajectory outcome labels**: completed / gave-up / budget-cutoff / user-abandoned. The cutoff and gave-up rates are the agent's real reliability metrics; final-answer judge scores alone miss the requests that never produced an answer.
+
 ## Drift and regression detection
 
 - **Input drift**: monitor input length distribution, language mix, topic cluster shares (embed + cluster daily, compare to baseline), and rate of out-of-scope requests. Input drift explains quality drops that no deploy caused — your users changed, or a new integration started sending garbage.
@@ -85,6 +100,9 @@ Support-bot CSAT dips; no deploy in the changelog. Internal monologue: *No deplo
 - **Cost dashboards keyed on API key only** — can't answer "which feature doubled spend." Correction: feature + template attributes on every span.
 - **Agent error loops invisible until the invoice**: retries + tool failures + "let me try again" can run for minutes. Correction: per-trace step and token budget with hard cutoff, alert on cutoff rate.
 - **Eval set frozen at launch** while production distribution moves. Correction: scheduled trace-mining ritual — weekly, pull the worst-judged and negative-feedback traces, cluster them (embedding clustering works), promote representative failures to eval cases. If eval-set growth is zero for a month, the loop is broken.
+- **Judging only traces that already have negative signals** and reporting the judge pass-rate as "quality." That's the failure population's pass-rate. Correction: maintain the unbiased random judge sample as the headline metric; use signal-triggered judging for triage only.
+- **Trace IDs that don't propagate across service boundaries** — the retrieval service, the agent loop, and the frontend feedback event each mint their own. The trace tree exists in three databases and joins nowhere. Correction: W3C trace context propagation end-to-end; the feedback widget carries the trace ID from the response headers.
+- **Logging the prompt template but not the rendered prompt** (or vice versa). Template-only can't show you the bad variable substitution; rendered-only can't tell you which version to fix. Correction: template ID + version as attributes, rendered content in the sampled payload.
 
 ## Worked micro-example: OTel-shaped span for a model call
 
@@ -106,6 +124,30 @@ with tracer.start_as_current_span("chat claude-sonnet-4-5") as span:
 ```
 
 Feedback joins later by trace ID: `record_feedback(trace_id, kind="regenerate", value=-1)`.
+
+## Worked micro-example: tail-sampling + judge-sampling policy
+
+```python
+# Decide retention AFTER the trace completes (tail-based), then decide judging.
+def sampling_decision(trace) -> dict:
+    interesting = (
+        trace.error
+        or trace.feedback in {"thumbs_down", "regenerate", "large_edit"}
+        or trace.finish_reason == "max_tokens"          # truncation = quality suspect
+        or trace.total_latency_ms > LATENCY_P99
+        or trace.parse_failed                            # structured-output break
+        or trace.deployment == "canary"                  # 100% of canary, always
+    )
+    keep_content = interesting or (hash(trace.id) % 100 < 5)   # + 5% random baseline
+    # Judge a subset of what we keep: all interesting, 1% of random keeps.
+    run_judge = interesting or (keep_content and hash(trace.id) % 500 == 0)
+    return {"keep_content": keep_content, "run_judge": run_judge,
+            "keep_metadata": True}                       # metadata: always, 100%
+```
+
+Two properties to preserve when adapting: the random slice exists (interesting-only sampling
+biases every trend metric toward failures — you need the unbiased denominator), and canary
+traffic is exempt from sampling entirely (it's the population you're gating a deploy on).
 
 ## Verification / self-check
 

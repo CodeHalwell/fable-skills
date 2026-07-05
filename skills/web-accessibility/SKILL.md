@@ -31,7 +31,13 @@ description: Load when building or reviewing UI for accessibility — semantic H
 ## Screen-reader mental model (enough to predict behavior)
 
 - SR users operate in two modes: browse/virtual mode (reading the accessibility tree linearly, jumping by headings/landmarks/links — heading structure is *navigation*, not styling: one `<h1>`, no skipped levels) and focus/forms mode (interacting with widgets, where the widget's keyboard handling takes over). `role="application"` disables browse mode — almost never what you want.
-- Name computation gotchas that produce real bugs: `aria-label` on a `<div>` with no role does nothing reliable (names need roles); `aria-label` *overrides* inner text (`<button aria-label="Close">Save</button>` announces "Close" — and fails WCAG 2.5.3 Label in Name for voice-control users who say "click Save"); placeholder is not a label; an icon button with no name announces "button" — the void.
+- Landmarks are the page's SR-level layout: one `<main>`, `<nav>` (labelled if multiple: `aria-label="Breadcrumb"`), `<header>`/`<footer>`, `<aside>`, `<search>`. All content should live inside some landmark; SR users jump between them the way sighted users saccade.
+- Name computation gotchas that produce real bugs:
+  - `aria-label` on a `<div>` with no role does nothing reliable — names need roles.
+  - `aria-label` *overrides* inner text: `<button aria-label="Close">Save</button>` announces "Close" — and fails WCAG 2.5.3 Label in Name for voice-control users who say "click Save". If there's visible text, the accessible name must contain it.
+  - Placeholder is not a label (disappears on input, low contrast, not reliably announced).
+  - An icon button with no name announces "button" — the void. A linked logo image with empty alt announces the raw URL.
+  - `aria-labelledby` can compose names from multiple ids (`aria-labelledby="row-title col-title"`) — often better than duplicating text into `aria-label` that then drifts from the visible copy.
 - `display: none`/`visibility: hidden`/`hidden` remove from the tree; `aria-hidden="true"` removes from the tree while staying visible (never put focusable elements inside it — "ghost" tab stops that announce nothing); visually-hidden CSS (clip-path/1px pattern, e.g. Tailwind `sr-only`) keeps it in the tree while invisible — for SR-only text.
 - `aria-live="polite"` (waits for silence) vs `role="alert"`/`assertive` (interrupts — reserve for urgent errors). Live regions must exist in the DOM *before* content changes; injecting a node with `role="alert"` already populated is unreliable across AT — render the empty container upfront, then set its text.
 
@@ -72,10 +78,18 @@ First instinct: can HTML do it? `<datalist>` — considered, rejected: styling i
 - **Custom select rebuilt as div-soup** when `<select>` (now stylable with `appearance: base-select` in Chromium — verify current cross-browser status) or a headless listbox would do.
 - **Alt text**: decorative images need `alt=""` (omitting `alt` entirely makes SRs read the filename); meaningful images need content, not "image of".
 - **Auto-playing carousels/motion** with no pause control (2.2.2) and ignoring `prefers-reduced-motion`.
+- **Headings chosen by font size**: `<div class="h2">` styled as a heading gives SR users nothing to navigate by; conversely `<h4>` used "because it's smaller" breaks the outline. Pick the level by structure, restyle with CSS.
+- **`title` attribute as the only label/tooltip** — not reliably announced, invisible to touch and keyboard. Use visible text, `aria-label`, or a real tooltip pattern (focus/hover-triggered, `aria-describedby`-linked, dismissible per WCAG 1.4.13).
+- **Radio/checkbox groups without a group name**: individual labels ("Yes", "No") announce without the question. Wrap in `<fieldset><legend>Question?</legend>…</fieldset>` (or `role="group"` + `aria-labelledby`).
+- **Data tables without header associations**: use `<th scope="col|row">` (or `headers`/`id` for complex tables) and `<caption>`; a grid of `<div>`s styled as a table announces as word soup. Never use `role="presentation"` on a real data table.
+- **`autofocus` on page load** (skips context for SR users, scrolls unexpectedly) — acceptable only inside just-opened dialogs where focus must move anyway.
+- **`user-scalable=no` / `maximum-scale=1`** in the viewport meta — disables pinch-zoom, fails 1.4.4, and iOS ignores it anyway; just remove it.
+- **Infinite scroll with no way past it**: keyboard users Tab through 500 loaded items to reach the footer. Provide a skip link past the feed, a "load more" button instead of auto-load, or both.
+- **Ellipsis/truncation-only affordances**: hover-revealed full text is unreachable on touch and keyboard; ensure the full value is available in-flow, on focus, or via an accessible tooltip.
 
-## Worked micro-example
+## Worked micro-examples
 
-Accessible async feedback + field error, React:
+**1. Accessible async feedback + field error, React:**
 
 ```tsx
 function SaveSettings() {
@@ -97,7 +111,7 @@ function SaveSettings() {
 // AND move focus: document.getElementById('email')?.focus()
 ```
 
-SPA route-change focus (framework-agnostic):
+**2. SPA route-change focus (framework-agnostic):**
 
 ```ts
 router.afterEach(() => {
@@ -105,6 +119,55 @@ router.afterEach(() => {
   const main = document.getElementById('main'); // <main id="main" tabindex="-1">
   main?.focus({ preventScroll: false });
 });
+```
+
+**3. Roving tabindex for a toolbar (one Tab stop, arrows within):**
+
+```ts
+const toolbar = document.querySelector('[role="toolbar"]')!;
+const items = [...toolbar.querySelectorAll<HTMLButtonElement>('button')];
+let active = 0;
+const setActive = (next: number) => {
+  items[active].tabIndex = -1;
+  active = (next + items.length) % items.length;   // wrap
+  items[active].tabIndex = 0;
+  items[active].focus();
+};
+items.forEach((el, i) => { el.tabIndex = i === 0 ? 0 : -1; });
+toolbar.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') { e.preventDefault(); setActive(active + 1); }
+  if (e.key === 'ArrowLeft')  { e.preventDefault(); setActive(active - 1); }
+  if (e.key === 'Home')       { e.preventDefault(); setActive(0); }
+  if (e.key === 'End')        { e.preventDefault(); setActive(items.length - 1); }
+});
+// Also update `active` on click/focus so mouse use doesn't desync the roving 0.
+```
+
+**4. Icon button + native dialog with focus restoration:**
+
+```tsx
+function DeleteButton({ onConfirm }: { onConfirm: () => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const openerRef = useRef<HTMLButtonElement>(null);
+  return (
+    <>
+      <button ref={openerRef} type="button" aria-label="Delete item"
+              onClick={() => dialogRef.current?.showModal()}>
+        <TrashIcon aria-hidden="true" focusable="false" />
+      </button>
+      {/* showModal(): top layer, focus trap, Escape-to-close, ::backdrop — all native */}
+      <dialog ref={dialogRef} aria-labelledby="del-title"
+              onClose={() => openerRef.current?.focus()}>  {/* restore focus to invoker */}
+        <h2 id="del-title">Delete this item?</h2>
+        <p>This cannot be undone.</p>
+        <button type="button" onClick={() => dialogRef.current?.close()}>Cancel</button>
+        <button type="button" onClick={() => { onConfirm(); dialogRef.current?.close(); }}>
+          Delete
+        </button>
+      </dialog>
+    </>
+  );
+}
 ```
 
 ## Verification / self-check

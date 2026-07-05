@@ -43,7 +43,7 @@ What changes the answer:
 
 The expert's diagnostic order when "the app feels slow on interaction":
 
-1. **Find what re-renders** (React DevTools Profiler, "record why each component rendered"). The prior: it's usually one wide subscription — a context or store selector at the top — not a thousand small ones.
+1. **Find what re-renders** (React DevTools Profiler, "record why each component rendered"). The prior: it's usually one wide subscription — a context or store selector at the top — not a thousand small ones. A component re-renders because: its state changed, its parent re-rendered, or a context it consumes changed. Props changing is *not* on that list — parent re-render is what actually triggers it, which is why `memo` (opt into prop comparison) exists at all.
 2. **Narrow before memoizing.** Three structural fixes beat `memo`:
    - *Push state down*: if only the search box needs the query string, don't hold it in the page component.
    - *Lift content up*: `<Parent>{expensiveChildren}</Parent>` — children passed as props don't re-render when Parent's own state changes, because the element was created by the grandparent.
@@ -60,6 +60,14 @@ The expert's diagnostic order when "the app feels slow on interaction":
 - Avoid server-side request waterfalls: two independent `await fetch(...)` lines in one Server Component serialize. Start promises together (`Promise.all`, or kick off both and `await` late), or push each fetch into the component that needs it and let Suspense parallelize the streams.
 - Caching (Next.js 16): `cacheComponents` + the `use cache` directive replace the old fetch-cache heuristics and `unstable_cache`; dynamic-by-default, opt into caching per page/component/function, with Partial Prerendering serving a static shell while dynamic parts stream. Don't reason from Next 13/14-era "fetch is cached by default" memories — that model is gone.
 - RSC replaces the *server-read* half of TanStack Query for initial data; client-side interactive refetching (infinite scroll, polling, optimistic mutation) still belongs to a client cache. Many apps legitimately use both (hydrate the query cache from server data, then let the client layer own updates).
+
+## Effects: the escape-hatch test
+
+Before writing `useEffect`, name the *external system* being synchronized (DOM measurement, subscription, `document.title`, analytics, a map/chart widget, a timer). If you can't name one, the effect is wrong — the logic belongs in render (derivation), an event handler (user-caused changes), or the router/data layer. Priors on `useEffect` review, most common first:
+1. Data fetching that belongs in the query layer/RSC.
+2. State derivation ("sync state A into state B") that belongs in render.
+3. Reacting to a user event indirectly (`useEffect(..., [submittedFlag])`) — put the logic in the submit handler; effects that watch flags create ordering puzzles and double-fires.
+4. Legitimate external sync — keep it, add cleanup, and check the dependency list isn't lying (`useEffectEvent` for "trigger on X, read latest Y").
 
 ## Component API design
 
@@ -89,13 +97,23 @@ Now performance. Profile first — hypothesis: the filter lives in a top-level c
 - **Server Action without auth check** because "it's just a function" — it's a public endpoint; check session inside the action.
 - **`memo` defeated invisibly**: any inline object/array/function prop, or `children` (always a fresh element), makes `memo` compare-and-fail every time. If you must memo a component that takes children, memoize at the caller or restructure.
 - **Index-as-key on reorderable lists** — state (input values, animations) sticks to positions, not items. Stable IDs, always.
+- **Hydration mismatch from non-deterministic render**: `Date.now()`, `Math.random()`, locale-dependent formatting, or `typeof window` branches that change markup produce the "hydration failed" error and a full client re-render. Compute such values in effects/state after mount, pass them from the server as props, or use `suppressHydrationWarning` only for genuinely-expected mismatches like timestamps.
+- **Client-side data waterfalls**: parent fetches, renders child, child fetches — serial round trips. Hoist queries to route level (router loaders + `queryClient.prefetchQuery`/`ensureQueryData`), or fetch in parallel and let components `useQuery` the already-warm cache.
+- **StrictMode-double-render "bugs"**: dev-only double invocation of render and effects exposes non-idempotent code. The fix is making the code idempotent (cleanup functions, abortable fetches), never removing StrictMode.
+- **Prop-drilling overcorrection**: three levels of prop passing is fine and explicit; reaching for context/store to avoid it trades greppable data flow for hidden coupling. Component composition (pass the composed child down) removes most drilling without either.
 - **Zustand store holding fetched data** with hand-written `loading`/`error` flags per resource — you've rebuilt 2018 Redux. Query library, or keep it and accept you now own cache invalidation forever.
 - **Micro-frontends adopted for code organization**: the honest trigger for micro-frontends is *independent deployment by autonomous teams with incompatible release cadences* — an org-chart problem. If one team owns the app, a monorepo with enforced module boundaries (Nx/Turborepo + lint rules) gives the modularity without duplicate framework payloads, version-skew matrices, cross-app routing hacks, and design drift. If genuinely needed, prefer build-time composition or Module Federation with a *strictly shared* singleton React — two React copies on one page breaks context and events in ways that surface months later.
-- **Framework calculus** (when Vue/Svelte/Solid change the answer): their fine-grained/signal-based reactivity (Vue `ref`, Svelte 5 runes, Solid signals) means *component-level re-render reasoning mostly disappears* — updates target the exact DOM bindings, so the memo/context-width sections above are largely React-specific. The state-location chain, server-cache principle (Pinia Colada / TanStack Query have Vue/Svelte/Solid adapters), URL-state rule, and component-API guidance carry over unchanged. Choose off ecosystem and hiring more than benchmarks; don't port React's `useCallback` habits into signal frameworks.
 
-## Worked micro-example
+## When Vue/Svelte/Solid change the calculus
 
-Server state + URL state + minimal client state, TanStack Query v5 style:
+- Their fine-grained/signal-based reactivity (Vue `ref`/`computed`, Svelte 5 runes, Solid signals) means *component-level re-render reasoning mostly disappears*: updates target the exact DOM bindings that read a signal, so the memo/context-width material above is largely React-specific. Don't port `useCallback` habits into signal frameworks — referential identity of callbacks doesn't cause re-render cascades there.
+- What carries over unchanged: the state-location chain, the server-cache principle (TanStack Query ships Vue/Svelte/Solid adapters; Pinia Colada for Vue), the URL-state rule, form-state reasoning, and all component-API guidance.
+- What differs: derived state is a first-class primitive (`computed`/`$derived`/`createMemo`) — use it instead of effects *always*; SSR stories differ (Nuxt and SvelteKit have mature server rendering; RSC-style server/client module boundaries remain React-specific).
+- Choose frameworks on ecosystem depth, hiring pool, and team experience more than benchmarks — the runtime performance differences are real but rarely the binding constraint; the component-library and tooling gaps are.
+
+## Worked micro-examples
+
+**1. Server state + URL state + minimal client state, TanStack Query v5 style:**
 
 ```tsx
 // queries.ts — key factory + queryOptions (v5 pattern)
@@ -121,6 +139,39 @@ function Dashboard({ orgId }: { orgId: string }) {
 ```
 
 Invalidation after mutation: `onSettled: () => queryClient.invalidateQueries({ queryKey: ['metrics', orgId] })` — invalidate the prefix, let active queries refetch.
+
+**2. RSC boundary + authorized Server Action (Next.js App Router):**
+
+```tsx
+// app/orders/[id]/page.tsx — Server Component: data access, zero client JS
+import { AddNoteButton } from './add-note-button';
+export default async function OrderPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;                      // async params in Next 15+
+  const order = await getOrder(id);                 // direct DB/service call, no API hop
+  return (
+    <article>
+      <h1>Order {order.number}</h1>
+      <OrderTimeline events={order.events} />       {/* stays server-rendered */}
+      <AddNoteButton orderId={order.id} />          {/* the only client island */}
+    </article>
+  );
+}
+
+// app/orders/actions.ts
+'use server';
+import { z } from 'zod';
+const NoteInput = z.object({ orderId: z.string().uuid(), body: z.string().min(1).max(2000) });
+export async function addNote(raw: unknown) {
+  const session = await auth();                     // authorize INSIDE the action
+  if (!session) throw new Error('unauthorized');
+  const input = NoteInput.parse(raw);               // validate INSIDE the action
+  await assertCanEditOrder(session.user.id, input.orderId);
+  await db.notes.create({ ...input, authorId: session.user.id });
+  revalidatePath(`/orders/${input.orderId}`);
+}
+```
+
+The button component is the whole `"use client"` surface; the page, timeline, and data layer never ship to the browser.
 
 ## Verification / self-check
 

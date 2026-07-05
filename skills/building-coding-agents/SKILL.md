@@ -35,9 +35,32 @@ The question is never "truncate or not" but "what does the model's next decision
 4. Read-heavy phases: **subagent fan-out**. "Find every caller of X across the monorepo" burns 60k tokens of listings; a subagent absorbs them and returns 15 lines. Delegate any work whose *intermediate* products would pollute the parent. Keep the parent as the sole decision-maker.
 5. Cross-session work: file-based memory with a convention (`NOTES.md`, `findings/`) the prompt teaches — don't hope the agent invents one.
 
+### Verification design — choosing the agent's senses
+
+Rank feedback sources by (signal quality × speed × availability) and wire the best ones into the loop as *default behavior*, not optional tools:
+
+1. **Compiler/typechecker** — fastest, near-zero false positives, catches whole error classes per run. An agent in a typed codebase should typecheck after every edit batch; it's the cheapest hallucination filter that exists.
+2. **Targeted tests** — the failing test first (seconds), affected package next (minutes), full suite only at completion gates. Making the agent run the *narrowest relevant* test is a prompt+tool design task: give it a `run_tests(path_or_pattern)` tool, not just `bash`, so you can enforce narrowness and structure output.
+3. **Linters/formatters** — low signal for correctness, high signal for "will this PR be rejected on style." Run at the end, not per-edit (per-edit lint noise burns steps).
+4. **Runtime observation** — for changes tests don't cover: run the CLI, curl the endpoint, screenshot the UI (multimodal models can read their own screenshots — closing this loop is what makes frontend agents work at all).
+5. **Ratchets** — record the baseline (failing test count, type error count) at session start; any step that increases it triggers an interrupt. Prevents the classic "fixed my bug, broke three others, reported success" outcome.
+
+The design question for every new agent: "after the agent acts, what tells it the truth, and how fast?" If the honest answer is "nothing until a human reviews," the agent will hallucinate success — add a verifier before adding capabilities. Verifier quality is the ceiling on agent quality; a mediocre model with a tight feedback loop beats a frontier model flying blind.
+
 ### Multi-agent: when parallelism pays
 
 Prior: it usually doesn't. Parallel agents win only when subtasks are (a) independent, (b) interface-clean, and (c) individually verifiable — review 12 files, fix 8 unrelated lint classes, research N libraries. They lose when tasks share mutable state (two agents editing the same module = merge hell; use git worktrees per agent if you must) or when coordination requires judgment mid-flight (the orchestrator becomes a bottleneck relaying context it doesn't have). Reasoning check: if you can't write each subtask's acceptance test before spawning, it isn't decomposed enough to parallelize.
+
+### Sandboxing — the blast-radius grid
+
+| Axis | Default | Escalation path |
+|---|---|---|
+| Read | Repo + declared deps: free. Home dir, dotfiles, keychains: deny | Explicit allowlist entries per path |
+| Write | Workspace/worktree only; `.git/hooks`, `~/.bashrc`, package manifests of *other* projects: deny | Human prompt per out-of-workspace path |
+| Execute | Inside OS sandbox (bubblewrap / Seatbelt) or container; no setuid, no docker socket | Container/microVM (Docker, E2B-style) for untrusted-origin code |
+| Network | Default-deny; allowlist package registries + declared APIs | Human prompt per new domain; never blanket-open because "tests need internet" |
+
+Two rules that fall out of the grid: (1) secrets never enter the sandbox environment — the harness holds credentials and performs privileged actions (push, deploy, PR creation) *outside*, from artifacts the sandbox produced; (2) the moment the agent processes untrusted content (cloned third-party repo, web page, issue text), treat its subsequent tool calls as potentially attacker-directed — which is why network egress and out-of-workspace writes stay locked even when everything else is convenient.
 
 ### Model choice inside the loop
 
@@ -110,6 +133,32 @@ if (verified.exitCode !== 0) reject("agent claimed done; verification failed");
 ```
 
 The two load-bearing ideas: output shaping happens in a hook (the model never depends on its own discipline), and "done" is an exit code the harness observes, not a sentence the model writes.
+
+**Compaction summary template** (what the transcript collapses into — test it by cold-resuming):
+
+```markdown
+## Task
+Fix flaky test_checkout_timeout in payments service; CI job #8841. Do NOT refactor beyond the fix.
+
+## Constraints
+- No changes to public API of payments/client.py
+- Test files may not be weakened (no skips, no loosened asserts)
+
+## Decisions made (with reasons)
+- Root cause is NOT the retry logic — ruled out by adding logging, saw single attempt (step 12)
+- Timeout originates in mock server startup race — reproduced 3/10 runs with `pytest -p no:cacheprovider --count=10` (step 19)
+
+## Dead ends (do not retry)
+- Increasing client timeout to 30s: masked it locally, still flaked in CI (step 15)
+
+## Current state
+- Fix drafted in payments/tests/conftest.py (wait-for-port helper); 8/10 reruns pass, need 10/10
+
+## Next step
+- Make wait-for-port deadline configurable; rerun --count=10; then full payments suite
+```
+
+The sections that earn their bytes: *decisions with reasons* and *dead ends* — without them, the resumed agent re-litigates step 12 and re-tries the timeout bump. Goal and constraints re-entering context is your scope-drift defense.
 
 ## Verification and self-check
 

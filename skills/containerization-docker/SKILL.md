@@ -89,12 +89,90 @@ Apple-silicon dev + x86 prod (or ARM prod for cost) makes this table stakes. `do
 
 Compose (v2, `docker compose`) is the local-dev tool, not a production orchestrator. Expert setup: bind-mount source for hot reload but **volume-mask dependency dirs** (`volumes: [".:/app", "/app/node_modules"]`) so host node_modules (wrong arch/OS) never shadows the container's; `depends_on` with `condition: service_healthy` because default depends_on only orders *start*, not readiness — the classic "app crashes because postgres isn't accepting connections yet"; one `compose.yaml` committed, `compose.override.yaml` for personal tweaks. Resist parity theater: compose approximates prod topology, it doesn't replicate k8s behavior; test probes and resource limits in a real cluster.
 
+## ENTRYPOINT vs CMD, and runtime configuration
+
+- The composition rule: `ENTRYPOINT` is the executable, `CMD` is its default arguments; `docker run img <args>` replaces CMD, not ENTRYPOINT. Design for it deliberately:
+  - **Tool images** (CLIs): `ENTRYPOINT ["mytool"]`, `CMD ["--help"]` — `docker run img subcommand` reads naturally.
+  - **Service images**: either `ENTRYPOINT ["/app/server"]` alone, or `CMD ["/app/server"]` alone if operators legitimately swap the command (debug shells, migrations via the same image). Same image running server *and* migrations (`command: ["/app/migrate"]` in k8s Jobs) is a feature — keep the command overridable.
+- Configuration enters at runtime (env vars, mounted files), never at build time. One image per commit, promoted across environments; `ARG ENVIRONMENT=prod` baked into the image means you build per-env and test something other than what ships.
+- 12-factor logging: write to stdout/stderr, unbuffered (`PYTHONUNBUFFERED=1`, or flush-on-newline). A container logging to `/var/log/app.log` is invisible to `docker logs`, kubectl, and every log pipeline.
+
+## Debugging containers
+
+- Running container with a shell: `docker exec -it <c> sh`. Distroless/scratch: no shell exists — use `docker debug` (Docker Desktop) or, in Kubernetes, `kubectl debug -it <pod> --image=busybox --target=<container>` for an ephemeral container sharing the process namespace.
+- Won't start at all: `docker run --rm -it --entrypoint sh img` to poke around the filesystem; `docker inspect img --format '{{json .Config}}'` for the real ENTRYPOINT/CMD/ENV/user after all layers.
+- "Works locally, dies in k8s": compare the runtime contract, not the image — memory limits (OOM), read-only rootfs (app writes somewhere unwritable), non-root enforcement (port <1024 or file ownership), missing env vars. `docker run --read-only --memory=512m --user 10001` reproduces most of them locally.
+- Exit code fast-reference: 125 = docker itself failed (bad flag), 126 = not executable, 127 = command not found (typo'd ENTRYPOINT or missing shared library — check with `ldd`), 137 = SIGKILL/OOM, 139 = segfault (on alpine: suspect musl).
+
 ## Registry and tagging strategy
 
 - Tag every CI build with the immutable git SHA (`app:sha-abc1234`); deploy manifests reference the digest CI resolved (`app@sha256:...`). Human-friendly tags (`:v1.4.2`, `:main`) are aliases layered on top.
 - Never re-push a changed image under an existing version tag; never deploy `:latest` anywhere that matters — you lose the ability to know what's running or to roll back to "the same thing."
 - Set a registry retention policy from day one (untagged manifests, SHA tags >N months) or the registry bill becomes its own project.
 - Sign/attest if your platform supports it (cosign, GitHub artifact attestations) — cheap now, painful to retrofit.
+
+## Failure modes & pitfalls
+
+- **Secrets via `ARG` or `ENV`.** `docker history --no-trunc` shows every build arg used in a `RUN`, and `ENV` values sit in the image config forever (`docker inspect`). The 2026-correct pattern is `--mount=type=secret` at build time and injected-at-runtime secrets otherwise. If a credential ever touched a pushed layer or config: rotate it — deleting the image later doesn't un-leak it.
+- **`apt-get update` in its own RUN.** `RUN apt-get update` then later `RUN apt-get install X`: the update layer gets cached, and months later the install pulls from a stale (or 404ing) package index. Always one instruction: `RUN apt-get update && apt-get install -y --no-install-recommends X && rm -rf /var/lib/apt/lists/*` (or a cache mount on `/var/cache/apt`).
+- **`COPY . .` before dependency install.** Restated because it's the #1 build-time bug: any source edit invalidates the dependency layer. Manifests first, install, then source.
+- **Cache mounts assumed to work in ephemeral CI.** `--mount=type=cache` lives on the *builder* — a fresh CI runner has an empty one. In CI, pair BuildKit with exported cache (`--cache-to/--cache-from type=gha` or a registry ref), or the cache mounts silently do nothing.
+- **`RUN chown -R app:app /app` after COPY.** On classic layered builds this duplicates every copied file into a new layer (metadata change = file copied). Use `COPY --chown=10001:10001 . .` instead.
+- **`EXPOSE` treated as functional.** It's documentation; it publishes nothing. Runtime publishing is `-p`/Service config. Conversely, *not* having EXPOSE blocks nothing.
+- **Shell-form `CMD`/`ENTRYPOINT`.** Signals go to `/bin/sh`, your app never sees SIGTERM, every stop is a 10s SIGKILL. Exec form always; wrapper scripts end in `exec "$@"`.
+- **`VOLUME` in the Dockerfile.** It forces an anonymous volume at that path for every run, silently discards later build-stage changes under it, and surprises Kubernetes users. Declare volumes at runtime, not in the image.
+- **Alpine chosen by reflex for Python/Node.** musl means missing/slow wheels (source builds needing gcc — now your "small" image needs a compiler), subtle DNS differences, occasional native-module segfaults. `-slim` is the default small choice for interpreted stacks; alpine is for when you've verified your dependency set is musl-clean.
+- **`FROM python:3.13` (unpinned) in prod.** The tag moves; last month's build and today's differ. Pin a digest and let Renovate bump it — that's reproducibility *plus* patches, versus reproducibility *or* patches.
+- **Building the prod image on a laptop.** M-series Macs emit arm64 by default; "exec format error" at deploy. Prod images come from CI with explicit `--platform`; laptops build dev images only.
+- **`.dockerignore` missing or wrong.** Symptoms: multi-minute "transferring context", `.git` or `.env` inside the image (`docker run --rm img ls -la /app`), cache busts on every commit. Note it lives next to the *context* root (or as `Dockerfile.dockerignore` per-Dockerfile with BuildKit), and unlike gitignore, you often want the allowlist style: `*` then `!src/`, `!package*.json`.
+- **HEALTHCHECK expectations.** Ignored by Kubernetes (probes rule there); can't `curl` in distroless (no shell/curl). And a missing healthcheck in compose makes `depends_on: service_healthy` a silent no-op — compose falls back to "started".
+- **Zombie accumulation.** App forks workers, PID 1 never reaps: `docker exec <c> ps` shows `<defunct>` rows growing until PID exhaustion. Fix: `--init`/tini, or a runtime that reaps (most don't).
+- **`docker commit` as a build strategy.** Unreproducible, unreviewable, undiffable. If someone "fixed the container and committed it," the Dockerfile is now a lie; rebuild from source and re-apply the fix there.
+
+## Worked micro-example: Python service, current best practice
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM python:3.13-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev     # deps only — cached until lockfile changes
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+
+FROM python:3.13-slim
+RUN groupadd -g 10001 app && useradd -u 10001 -g app app
+WORKDIR /app
+COPY --from=build --chown=10001:10001 /app /app
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["gunicorn", "-b", "0.0.0.0:8080", "myapp.wsgi:app"]
+```
+
+And the matching local-dev compose:
+
+```yaml
+services:
+  app:
+    build: { context: ., target: build }   # dev uses the fatter stage (has dev deps)
+    command: ["python", "-m", "flask", "--app", "myapp", "run", "--host", "0.0.0.0", "--debug"]
+    volumes: [".:/app", "/app/.venv"]      # mask the venv — host's must never shadow it
+    ports: ["8080:5000"]
+    depends_on:
+      db: { condition: service_healthy }
+  db:
+    image: postgres:17
+    environment: { POSTGRES_PASSWORD: dev }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 15
+```
+
+Load-bearing choices: lockfile-first with a uv cache mount (dep layer survives code edits), two-stage so the runtime has no build tooling, numeric non-root user created in-image, venv on PATH instead of activate scripts, volume-masked `.venv` in dev, and healthcheck-gated startup ordering.
 
 ## How an expert thinks through it: "our Python image is 2.8 GB and builds take 15 minutes"
 

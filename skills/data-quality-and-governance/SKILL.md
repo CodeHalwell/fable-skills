@@ -51,6 +51,16 @@ For each critical table, cover four dimensions with *concrete* checks and thresh
 - Two queries lineage must answer or it isn't earning its keep: **impact analysis** ("if I change/drop this column, which models, dashboards, and ML features break?") — run *before* every contracted-schema change; and **root-cause tracing** ("this metric is wrong; walk upstream to the first node where the data went bad").
 - Column-level matters because table-level lineage over-alarms: a table feeding 40 dashboards usually has any given *column* feeding 3.
 
+## Reasoning chain: which layer does a new check belong in?
+
+Ask in order:
+1. *Is it an invariant the producer can enforce?* → producer's CI / schema registry / dbt contract at the source model. Done — everything downstream inherits it.
+2. *Does it need only one table, inside the warehouse DAG?* → dbt test on the earliest model where the assertion is meaningful (staging for structure, marts for business rules that require joins).
+3. *Does it guard a Python/service boundary (ingestion, feature pipeline, ML training input)?* → Pandera-class validation in the job itself, blocking.
+4. *Does it compare across systems (source-vs-warehouse reconciliation) or need docs for stakeholders?* → GX/Soda-class suite on a schedule.
+5. *Is it statistical rather than invariant?* → anomaly monitor, warning-only, owner-routed.
+A check placed one layer too far downstream still fires — after the damage has propagated. When reviewing an existing suite, the highest-value refactor is usually *moving* checks upstream, not adding more.
+
 ## Anomaly detection on data — and the seasonality trap
 
 - Monitor volume, null rates, distinct-count, and distribution (mean/quantiles per numeric column; category shares) per table per load. Tools: elementary/re_data in the dbt world, Monte Carlo/Bigeye class commercially, or hand-rolled z-scores off a metrics table — the model matters less than the baseline design.
@@ -120,6 +130,38 @@ models:
 ```
 
 For the cross-team version of the same agreement, express it as an ODCS v3 YAML (schema + SLA blocks) and run `datacontract test` against the producer's actual table in their CI.
+
+## Worked micro-example: boundary validation in Python (Pandera)
+
+```python
+# Ingestion boundary for an events feed — fail the job BEFORE bad data lands.
+import pandera.pandas as pa
+from pandera.typing import Series
+import pandas as pd
+
+class EventSchema(pa.DataFrameModel):
+    event_id: Series[str] = pa.Field(unique=True, nullable=False)
+    event_type: Series[str] = pa.Field(isin=["view", "click", "purchase", "refund"])
+    amount_usd: Series[float] = pa.Field(ge=0, nullable=True)      # null OK, negative not
+    event_time: Series[pd.Timestamp] = pa.Field(nullable=False)
+    loaded_at: Series[pd.Timestamp] = pa.Field(nullable=False)
+
+    @pa.dataframe_check
+    def time_sanity(cls, df: pd.DataFrame) -> Series[bool]:
+        return df["event_time"] <= df["loaded_at"]                 # no future events
+
+    @pa.dataframe_check
+    def purchase_has_amount(cls, df: pd.DataFrame) -> Series[bool]:
+        return ~((df["event_type"] == "purchase") & df["amount_usd"].isna())
+
+validated = EventSchema.validate(raw_df, lazy=True)   # lazy=True → report ALL failures,
+                                                      # not just the first — essential for triage
+```
+
+`lazy=True` matters operationally: the failure report enumerates every violated check with row
+counts, which is the difference between one fix cycle and five. Quarantine the failing rows
+(write them to a reject table with the failure reason) rather than dropping them — rejects are
+the evidence for the producer conversation.
 
 ## Verification / self-check
 

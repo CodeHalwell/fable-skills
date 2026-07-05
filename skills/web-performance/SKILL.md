@@ -47,7 +47,13 @@ description: Load when optimizing web page speed or Core Web Vitals (LCP, INP, C
 
 ## Images
 
-Decision chain: (1) format — AVIF first, WebP fallback, via `<picture>` or an image CDN that content-negotiates (universally supported as of 2026); SVG for icons/diagrams; (2) responsive sizing — `srcset` + `sizes`, where wrong `sizes` silently downloads desktop images on mobile (audit with DevTools' actual-vs-intrinsic size); (3) loading policy — LCP/above-fold: eager + `fetchpriority="high"`; below-fold: `loading="lazy"`; *near*-fold: eager (lazy-loading just-below-fold images delays them behind IntersectionObserver and hurts perceived speed); (4) always `width`/`height` or `aspect-ratio` for CLS; (5) `decoding="async"` is default-adjacent, don't cargo-cult it.
+Decision chain, in order:
+1. **Right asset type**: SVG for icons/diagrams/logos; raster only for photos. Icon fonts are dead; inline or sprite the SVGs.
+2. **Format**: AVIF first, WebP fallback, via `<picture>` or an image CDN that content-negotiates on `Accept` (both universally supported as of 2026). JPEG remains the safe base `src`.
+3. **Responsive sizing**: `srcset` + `sizes`. Wrong `sizes` silently downloads desktop images on mobile — the browser picks before layout, using `sizes` as gospel. Audit with DevTools' rendered-vs-intrinsic size overlay; >2x intrinsic is waste.
+4. **Loading policy**: LCP/above-fold → eager + `fetchpriority="high"`. Deep below-fold → `loading="lazy"`. *Near*-fold → eager: lazy-loading just-below-fold images gates them behind IntersectionObserver and hurts perceived speed. Lazy-load offscreen `<iframe>`s too (`loading="lazy"` works on them).
+5. **CLS insurance**: always `width`/`height` attributes or CSS `aspect-ratio`.
+6. Don't cargo-cult `decoding="async"`; it's near-default behavior. Do cap DPR at 2x for photos on high-density screens (3x is invisible-difference bandwidth).
 
 ## Fonts
 
@@ -63,12 +69,45 @@ Decision chain: (1) format — AVIF first, WebP fallback, via `<picture>` or an 
 - **Fonts**: immutable (hashed or versioned path).
 - Service worker: powerful, but a mis-scoped cache-first SW is how sites serve year-old bundles; use Workbox recipes, version caches, and have a kill switch. Don't add one for "performance" alone — add it for offline/installability.
 
+Reference header set:
+
+```text
+/assets/app.3f9c2b.js      Cache-Control: public, max-age=31536000, immutable
+/index.html                Cache-Control: no-cache            # + ETag; or at CDN:
+/products/* (SSG/ISR HTML) Cache-Control: public, s-maxage=300, stale-while-revalidate=86400
+/api/catalog               Cache-Control: private, max-age=0, must-revalidate  # or SWR if safe
+/fonts/inter-var.woff2     Cache-Control: public, max-age=31536000, immutable
+```
+
+## Failure modes & pitfalls
+
+- **`loading="lazy"` on the LCP image** — delays the most important resource behind layout + IntersectionObserver. Also common: lazy-loading everything, so just-below-fold images pop in late during the first scroll.
+- **bfcache broken**: an `unload` handler or `Cache-Control: no-store` on the HTML disables back/forward cache — every back navigation becomes a full reload, silently doubling real-user page loads. Use `pagehide` instead of `unload`, avoid `no-store` unless truly required, and check `performance.getEntriesByType('navigation')[0].notRestoredReasons` in RUM.
+- **CSS `@import` inside stylesheets** — serial request chains invisible to the preload scanner (HTML → CSS → imported CSS before render). Bundle at build time.
+- **Anti-flicker snippets from A/B tools** — `opacity: 0` on `<body>` until the experiment script loads sets your effective LCP floor to their timeout (often 2–4s). Server-side or edge experimentation, or drastically shorten the timeout.
+- **Measuring dev builds**: React/Vue development mode is multiples slower than production; any profile taken on `npm run dev` overstates JS cost. Profile production builds with source maps.
+- **Preload hoarding**: five `<link rel="preload">` tags demote each other and the HTML-discovered critical path. Preload is a scalpel — one or two resources, verified in the waterfall.
+- **`document.write`-injected third-party scripts** — block parsing entirely; still shipped by some ad tags. Refuse or sandbox them.
+- **Skeleton screens that shift**: skeletons sized differently from the real content convert a perceived-speed win into CLS. Match dimensions exactly (same `aspect-ratio`/`min-height`).
+- **Giant DOM**: tens of thousands of nodes make every style recalc and layout slow regardless of JS discipline. Virtualize long lists; apply `content-visibility: auto` + `contain-intrinsic-size` to long offscreen sections (huge render-cost win for long articles/feeds).
+- **Compression misconfiguration**: text assets (HTML/JS/CSS/SVG/JSON) should be Brotli at the CDN (zstd increasingly supported — check your CDN); already-compressed formats (images, woff2, video) should not be recompressed. A `Content-Encoding` audit takes five minutes and regularly finds uncompressed JSON APIs.
+- **Trusting `onLoad` timing as UX**: the `load` event fires long after (or before) the user-visible moment that matters; report CWV, not load time, to stakeholders.
+
 ## Measuring correctly
 
 - **Field (RUM)**: CrUX (BigQuery / CrUX API / PageSpeed Insights "field" section) for Chrome-population p75; your own RUM (`web-vitals` library posting to analytics) for all browsers, per-page, per-segment, with attribution (`onINP(({attribution}) => ...)` tells you *which element*). Field data is the verdict.
 - **Lab**: Lighthouse/DevTools traces to reproduce and diagnose what field data flagged. Throttle honestly (mobile CPU 4x, slow 4G) — your M-series laptop is a lie machine.
 - The classic mismatch: lab LCP fine, field LCP bad → real users hit cold caches, slower devices, longer RTTs, or a different page state (logged-in, ads). Lab INP barely exists — INP needs real interactions, so RUM is mandatory for INP work.
-- **Performance budget discipline**: budgets only work as CI gates, not aspirations — e.g., Lighthouse CI assertions or `size-limit` per-entry-point (fail PRs over e.g. 200KB gz route JS). Budget the *deltas* conversation: any PR adding >10KB to a route needs a stated reason. Without enforcement, budgets decay in one quarter.
+- **Performance budget discipline**: budgets only work as CI gates, not aspirations — e.g., Lighthouse CI assertions or `size-limit` per-entry-point (fail PRs over e.g. 200KB gz route JS). Budget the *deltas* conversation: any PR adding >10KB to a route needs a stated reason. Without enforcement, budgets decay in one quarter. Reasonable starting budgets for a content/commerce site: ≤ 100–200KB gz JS per route, ≤ 50KB critical CSS, ≤ 2 font files, LCP resource ≤ 150KB, third-party blocking time ≈ 0. Adjust to your CrUX reality, but write numbers down — "fast" is not a budget.
+
+```yaml
+# lighthouserc excerpt — CI assertion style
+assertions:
+  largest-contentful-paint: ["error", { maxNumericValue: 2500 }]
+  total-blocking-time: ["error", { maxNumericValue: 300 }]
+  cumulative-layout-shift: ["error", { maxNumericValue: 0.1 }]
+  resource-summary:script:size: ["error", { maxNumericValue: 200000 }]
+```
 
 ## Third-party containment
 
@@ -122,6 +161,14 @@ async function processAll(items) {
     else await new Promise(r => setTimeout(r, 0));
   }
 }
+```
+
+Next-navigation warmup (Chromium progressive enhancement; harmless elsewhere):
+
+```html
+<script type="speculationrules">
+{ "prefetch": [{ "where": { "selector_matches": ".product-link" }, "eagerness": "moderate" }] }
+</script>
 ```
 
 ## Verification / self-check

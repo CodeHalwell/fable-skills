@@ -39,6 +39,10 @@ Anti-pattern: cron "warmer" pings — they keep one instance warm while real tra
 - **Idempotency, concretely:** derive a stable idempotency key from the *business event* (order ID + state transition), not the message ID (redeliveries share message IDs, but *republishes* don't). Persist key → result with a conditional write (DynamoDB `attribute_not_exists`, or a unique constraint) and a TTL longer than your maximum redelivery horizon. AWS Lambda Powertools has a ready-made `@idempotent` decorator implementing exactly this — use it instead of hand-rolling.
 - **Ordering:** most sources don't guarantee it. If you need per-entity order, you need FIFO queues with `MessageGroupId` = entity ID, or a stream partitioned by entity — and your throughput is now capped per group/shard. Design for commutativity instead when you can (version numbers, last-write-wins on versioned state).
 
+**The synchronous front door:** for HTTP entry, prefer the lightest gateway that meets requirements — on AWS: Lambda Function URLs (single function, no fan-out features) < API Gateway HTTP APIs (cheaper, most REST use cases) < REST APIs (only for request validation, usage plans/API keys, private endpoints); ALB→Lambda when the fleet is mixed containers+functions. Every option caps integration timeout around 29–30s — long work must return `202 Accepted` + a status resource or WebSocket/polling; designs that stream a 3-minute job through an HTTP gateway are broken on arrival.
+
+**Deployment safety:** functions deploy in milliseconds, which tempts teams to skip progressive delivery — don't. Use versions + aliases with weighted canary shifting (Lambda + CodeDeploy `Canary10Percent5Minutes`-style configs, or slot/revision splitting on Azure/Cloud Run), automatic rollback on alarm. The unit of rollback is the alias flip, and it's the fastest rollback mechanism in all of computing — wire it up.
+
 ## Orchestration vs choreography
 
 - **Choreography** (services react to each other's events): loose coupling, great for *broadcast-shaped* flows — "order placed" → independent reactions (email, analytics, inventory). Fails when there's a *process* with an outcome someone owns: nobody can answer "where is order 123 stuck?", timeouts and compensation are smeared across services.
@@ -46,6 +50,13 @@ Anti-pattern: cron "warmer" pings — they keep one instance warm while real tra
 - Rule of thumb: **events between bounded contexts, orchestration within one.** A state machine spanning five teams' services recreates central coupling; events for a single tightly-ordered process recreate the debugging nightmare.
 - Step Functions specifics: Standard workflows bill per state transition and support year-long executions with exactly-once semantics; Express workflows bill per duration/memory, run ≤5 min, at-least-once — high-volume short pipelines belong on Express, long/durable business processes on Standard. Don't put a 10k-iteration loop in a Standard workflow (per-transition pricing bites); use a Map state in distributed mode or Express child workflows.
 - Durable Functions' orchestrator constraint: orchestrator code **replays** — it must be deterministic (no `DateTime.Now`, no direct I/O, no random) — all effects go through activities. Violating this yields nondeterminism errors and corrupted orchestrations; it is the #1 Durable Functions bug.
+
+## Observability — non-negotiables for systems made of 40 small pieces
+
+- **Structured JSON logs with a correlation ID propagated through every hop** (API request ID → queue message attribute → function context). Without it, debugging a pipeline is archaeology across 12 log groups. Lambda Powertools Logger / Azure Functions + App Insights do the propagation if you let them.
+- **Distributed tracing on by default** (X-Ray/OTel, App Insights), sampled — the trace is the only artifact that shows *where* a 6-second user request spent its time across five functions and two queues.
+- Alert on the *system* signals, not per-function noise: DLQ depth, queue age (oldest message), stream iterator age, error-rate per alias, and concurrency-vs-limit. Per-invocation error alarms on 40 functions produce fatigue, not insight.
+- Log-ingestion cost is the serverless tax: hundreds of chatty functions at per-GB ingestion pricing. Set retention at creation, sample INFO+ in high-volume paths.
 
 ## The distributed-monolith failure mode
 
@@ -80,6 +91,10 @@ Duplicates: S3 events are at-least-once, and users re-upload the same file. Idem
 - **Payloads passed by value through the pipeline** hit the 256KB (SQS/Step Functions) limits mid-incident. Pass references (S3 key + version) between steps from day one — the claim-check pattern.
 - **Warmer crons in 2026 designs** — superseded; see cold-start ladder. Their presence signals stale patterns; audit the rest of the design accordingly.
 - **Emulator-green, prod-red:** IAM denied, event envelope mismatch (`Records[0].body` is a *string* containing JSON, double-encoded through SNS→SQS unless `RawMessageDelivery` is on). Test with recorded real payloads; enable raw delivery on SNS→SQS subscriptions.
+- **Recursive invocation loops:** S3 event → Lambda writes a processed file *to the same bucket/prefix* → triggers itself → runaway concurrency and a five-figure bill overnight. Separate input/output prefixes and scope event filters; AWS's recursive-loop detection catches some but not all topologies (e.g., loops through SNS→SQS chains) — design it out.
+- **Event source mapping batch settings fighting the timeout:** batch size 100 × 2s per record vs a 60s function timeout → perpetual partial-batch failures. Batch size × p99-per-record must fit inside the timeout with margin, or use partial-batch responses and smaller batches.
+- **EventBridge rule targets failing silently:** rules have retry then drop unless a DLQ is configured *per target*. An unsubscribed-to failure mode: the bus accepted the event, the target never ran, nothing alarmed. Set target DLQs and alarm on them like queue DLQs.
+- **Idempotency TTL shorter than the retry horizon:** a 1-hour idempotency window vs a DLQ redrive that happens next morning → the redrive re-executes side effects. The idempotency record must outlive the longest possible redelivery path, including human-driven redrives.
 - **Cost surprise at success:** per-invocation pricing that was $50/mo at launch scaling linearly to $15k/mo at 300× traffic while a container fleet would have flattened. Revisit the FaaS-vs-container arithmetic at every order of magnitude — the right answer changes.
 
 ## Worked micro-example — idempotent SQS consumer (Python, Lambda Powertools)
@@ -105,6 +120,24 @@ def handler(event, context):   # partial-batch response: only failed records ret
                                     processor=processor, context=context)
 ```
 Partial-batch response (`ReportBatchItemFailures`) matters: without it, one failure re-delivers the whole batch — idempotency then saves you, but you're relying on the seatbelt instead of not crashing.
+
+## Worked micro-example — retry policy as orchestration, not code (Step Functions ASL)
+
+```json
+"ChargeCard": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::lambda:invoke",
+  "Parameters": { "FunctionName": "charge-card", "Payload.$": "$" },
+  "TimeoutSeconds": 15,
+  "Retry": [{
+    "ErrorEquals": ["Lambda.TooManyRequestsException", "States.Timeout"],
+    "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2.0, "JitterStrategy": "FULL"
+  }],
+  "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "RefundAndFail", "ResultPath": "$.error" }],
+  "Next": "FulfillOrder"
+}
+```
+The judgment encoded: retries with backoff+jitter live in the state machine (visible, tunable, no redeploy), *not* inside handler code; the timeout is explicit and shorter than the caller's; the catch route leads to a named compensation state — the saga's unhappy path is a first-class, testable part of the definition rather than an exception handler someone hopes fires.
 
 ## Verification / self-check
 

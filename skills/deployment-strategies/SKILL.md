@@ -59,6 +59,14 @@ Corollaries:
 - Automated analysis beats eyeballs for *not skipping the check at 6pm*, but automated judges are conservative pattern-matchers: they catch regressions in the metrics you named, and nothing else. Keep a human on the hook for novel weirdness, and keep the metric set small — a judge watching 40 metrics fails a healthy canary constantly (multiple-comparisons problem) and gets turned off, which is worse than no judge.
 - Minimum soak per step: long enough to cover the slowest feedback loop you care about (cache TTLs expiring, hourly crons, memory leak slope). A 5-minute canary catches crashes, not leaks.
 
+## Deploy hygiene
+
+- **Vocabulary discipline pays.** Insist on "deploy" (code lands), "release" (users see behavior), "rollout" (the traffic transition), "rollback" (traffic back to previous *code*), "revert" (source control undo). Teams that say "release" for everything can't have the conversation "we deployed but haven't released" — which is the most useful sentence in shipping.
+- **Small and frequent beats big and careful.** Change size is the dominant risk variable: a 5-commit deploy has 5 suspects during an incident; a 200-commit deploy has 200 and no usable "what changed" signal. Deploy frequency is also your rollback insurance — you can only roll back to N-1 cheaply if N-1 is hours old, not weeks.
+- **The deploy-windows debate, resolved by reversibility:** teams argue "never deploy Friday" vs "deploy anytime, we have safeguards." The honest synthesis: your allowed deploy window is a function of your MTTR — if rollback is one rehearsed command and detection is automatic, Friday 4pm is fine; if rollback needs the one engineer who understands the migration, Tuesday 10am is the only responsible window. Fix the MTTR, then relax the window — not the reverse order.
+- **A deploy has an owner watching it land.** Automated gates catch what they were told to catch; the person who wrote the change watches the deploy dashboard through the rollout and owns the revert decision. "Merged and went home" is how 2-minute rollbacks become 2-hour incidents.
+- Humans don't run `kubectl apply` at prod; pipelines do, from tagged artifacts, with the audit trail. Manual prod mutations are config drift with extra steps — and they're invisible to the next incident's "what changed" query, which is the real cost.
+
 ## Rollback-first culture
 
 The decision rule under pressure: **if a rollback is available and not ruled out, roll back first and diagnose second.** Rollback is a known-good state reachable by a rehearsed mechanical action; fix-forward is an unrehearsed change written by a stressed engineer with partial understanding — the base rate of first-attempt fixes actually fixing the issue is poor, and each failed fix-forward resets the clock. Choose fix-forward only when rollback is genuinely impossible (irreversible data written, security fix that must stay, the bad deploy is 3 days old and 40 changes are stacked on it — which is an argument for deploying more often, not for fix-forward culture).
@@ -96,6 +104,73 @@ Stopping rule: shipped at 100%, business metrics stable for two weeks → delete
 - **Config propagated globally in one shot.** Code gets a canary; then someone pushes a routing rule / WAF rule / flag to every region simultaneously. Stage config like code: one region → soak → rest. And validate config *shape and size* at generation time — Cloudflare's Nov 2025 outage was a config file that silently doubled in size past a consumer's limit.
 - **Deploy freezes as a safety strategy.** Long freezes batch up changes, and change size is the dominant risk factor — the first deploy after the freeze is the year's riskiest. Prefer small, frequent, always-rollbackable deploys with good gates; use short freezes only around genuinely critical windows (Black Friday), paired with a fast-track exception process, because a freeze with no exception path just means undocumented hotfixes.
 - **"We'll fix forward, rollback loses today's data."** Interrogate this claim: usually only the *schema* moved forward, and code rollback is fine against the expanded schema. People conflate "roll back the code" with "restore the database" — the whole point of expand/contract is that you almost never need the latter.
+
+## Worked micro-examples
+
+**1. Canary with automated analysis gates (Argo Rollouts + Prometheus).** The load-bearing details: pauses between steps, a baseline comparison, and few metrics.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      steps:
+      - setWeight: 5
+      - pause: {duration: 15m}          # soak long enough for slow feedback loops
+      - analysis:
+          templates: [{templateName: error-rate-check}]
+      - setWeight: 25
+      - pause: {duration: 30m}
+      - analysis:
+          templates: [{templateName: error-rate-check}]
+      - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: {name: error-rate-check}
+spec:
+  metrics:
+  - name: error-rate
+    interval: 1m
+    failureLimit: 3                      # 3 bad intervals -> auto-abort + rollback
+    provider:
+      prometheus:
+        address: http://prometheus:9090
+        query: |
+          sum(rate(http_requests_total{status=~"5..",rollouts_pod_template_hash="{{args.canary-hash}}"}[5m]))
+          / sum(rate(http_requests_total{rollouts_pod_template_hash="{{args.canary-hash}}"}[5m]))
+    successCondition: result[0] < 0.01
+```
+
+Note what's *not* here: 40 metrics (multiple-comparisons false alarms) and a comparison against last week (diurnal noise). Add domain metrics (orders/min) as a second template, not twenty.
+
+**2. Batched, resumable backfill (the "migrate" step).** Never `UPDATE users SET email_address = email;` on a big table. Instead:
+
+```python
+last_id = checkpoint.load(default=0)          # resumable: it WILL be interrupted
+while True:
+    rows = db.exec(
+        """UPDATE users SET email_address = email
+           WHERE id > %s AND id <= %s AND email_address IS NULL""",  # idempotent
+        (last_id, last_id + 5000))
+    last_id += 5000
+    checkpoint.save(last_id)
+    if last_id >= max_id: break
+    if replica_lag_seconds() > 5: time.sleep(30)   # throttle on lag, not a fixed sleep
+    time.sleep(0.5)
+```
+
+Key-range batches (not `LIMIT/OFFSET`, which rescans), idempotent predicate, checkpointing, lag-based throttle.
+
+**3. Rollback-safe cache versioning.** One line that keeps rollback possible when the cached shape changes:
+
+```python
+CACHE_SCHEMA = "v2"                # bump when the serialized shape changes
+key = f"user:{CACHE_SCHEMA}:{user_id}"
+```
+
+New code populates `v2` keys; old code, if rolled back to, still reads its own `v1` keys — a cache-miss penalty instead of deserialization crashes. Delete `v1` population only in a later deploy (contract).
 
 ## Verification / self-check
 

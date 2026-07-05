@@ -62,6 +62,13 @@ The arithmetic that prevents the whole class:
 2. Enforce the invariant **server-side timeout > LB timeout > client-side pool idle timeout**, each hop pair with comfortable margin. The *upstream* member of each pair must outlive the downstream one, so the side that initiates reuse never reuses a connection its peer already closed.
 3. For long-idle links you can't tune end-to-end (DB connections through NAT, message-bus consumers), send keepalives *below* the smallest middlebox timeout: TCP keepalive (`tcp_keepalive_time` — Linux default 7200s is uselessly long; set ~60–300s via socket options) or protocol-level pings (gRPC/h2 PING, websocket ping).
 
+## TCP realities that surface in production
+
+- **RST vs FIN tells you intent.** FIN = orderly close ("I'm done sending"); RST = abort ("no such connection / go away now"). A client seeing `Connection reset by peer` means something *actively* refused state it was expected to have: a process crashed mid-connection, a backend closed with unread data in the buffer (common when servers close on request-size violations), or a middlebox with no matching table entry answered a packet on a mapping it already forgot. `ECONNREFUSED` (RST to your SYN) is different and simpler: nothing is listening on that port — wrong port, crashed process, or wrong host.
+- **TIME_WAIT and ephemeral port exhaustion:** the side that closes first holds the socket in TIME_WAIT (~60s Linux). A proxy/client machine opening thousands of short-lived outbound connections to one destination burns through the ~28k default ephemeral ports (`net.ipv4.ip_local_port_range`) and new connects fail with `EADDRNOTAVAIL` — under load only, mysteriously. Fix is connection reuse (keepalive pools), not sysctl heroics; `net.ipv4.tcp_tw_reuse=1` helps for outbound, but a service doing 500 connects/sec to one upstream *needs a pool*, full stop. Count: 28,000 ports / 60s TIME_WAIT ≈ 466 new connections/sec ceiling per (src IP, dst IP, dst port) tuple.
+- **Conntrack is a hidden capacity limit:** any Linux box doing NAT or stateful firewalling (including every Kubernetes node running kube-proxy) tracks each flow in a fixed-size table (`nf_conntrack_max`). Full table = new connections silently dropped, `nf_conntrack: table full, dropping packet` in dmesg — the symptom is "random timeouts under load" and nobody thinks to look in dmesg. Check `conntrack -C` against the max during load tests.
+- **SYN retries explain weird timeout durations.** Unanswered SYNs retry on an exponential schedule (~1s, 2s, 4s...); Linux default 6 retries ≈ 127s to `ETIMEDOUT`. When your "10s connect timeout" mysteriously takes 127s, no one set a connect timeout at all — the OS default is what you're seeing. Always set explicit connect timeouts (1–3s intra-DC) separate from request timeouts.
+
 ## CDN mental model
 
 - A CDN is a distributed cache plus a TLS/TCP terminator near the user. Even for *uncacheable* APIs it pays: the user's TCP+TLS round trips happen over a short RTT, and edge→origin rides warm, pooled connections.
@@ -72,6 +79,24 @@ The arithmetic that prevents the whole class:
 ## How an expert thinks through it: "we get intermittent 502s, ~0.2%, no pattern"
 
 Intermittent + low-rate + LB in front: prior #1 is a connection-reuse race, not the app. First, evidence over vibes: the ALB's own logs classify each 502 — check the target-connection error field, and correlate 502 timestamps with target deploys/scale-in events. Three hypotheses, ordered by base rate: (a) keepalive mismatch — backend closes idle connections sooner than the ALB expects, ALB reuses a corpse → immediate 502; (b) deploy/scale-in without draining — 502 bursts clustered at rollout times; (c) actual app crashes — but that would show in app error logs, and it doesn't. Check (a) cheaply: backend is Node — `server.keepAliveTimeout` unset → 5s, ALB idle 60s. Invariant violated (server must outlive LB). That alone explains a steady trickle. Fix: `keepAliveTimeout = 65_000`, `headersTimeout = 66_000`. Rejected along the way: "add retries at the ALB" — masks it, and retrying non-idempotent POSTs is a correctness bug; "it's AZ packet loss" — rejected because loss would show as latency/timeouts too, and `mtr` between AZs is clean. Deploy the timeout fix, watch the 502 rate: trickle gone, but small bursts remain exactly at deploy times → that's hypothesis (b): add the `preStop` sleep so pods leave the target group before SIGTERM. Both fixed, rate is 0.00x% — remaining singletons correlate with target OOM restarts, which is a different (capacity) ticket. Stop here: don't chase asymptotic zero through retry layers that hide real failures.
+
+## Production mysteries: signature → likely cause → first check
+
+| Signature | Prior | First check |
+|---|---|---|
+| Intermittent 502s, steady trickle | Keepalive timeout mismatch (backend closes before LB) | Compare backend idle timeout vs LB idle timeout; LB logs' error-cause field |
+| 502s bursting at deploy times | No draining/preStop; pods die with in-flight requests | Correlate 502 timestamps with rollout events; check deregistration delay & preStop |
+| `Connection reset by peer` after a *consistent* idle interval | NAT/firewall reaped the idle mapping | Measure the interval; compare to NAT/firewall timeouts; add keepalives below it |
+| Works on retry, fails first try after quiet periods | Stale pooled connections (same family as above) | Pool idle-eviction setting vs path's smallest middlebox timeout |
+| Small responses fine, large ones hang | PMTUD black hole (filtered ICMP, tunnel/VPN in path) | `ping -M do -s 1472`, bisect size; clamp MSS on the tunnel |
+| Slow only from some networks/regions | Path or last-mile issue; or h3/UDP blocked forcing fallback | RUM breakdown by ASN/geo; `mtr` from an affected vantage |
+| Slow first request, fast after | Cold: DNS miss + TCP + TLS + cold upstream pool | `curl -w` per-stage timing, fresh vs warm |
+| p99 slow, p50 fine, CPU idle | Queueing somewhere: listener backlog, pool contention, one slow backend in rotation | Per-backend latency split at the LB; pool wait-time metrics |
+| "Random" timeouts under load, dmesg mentions conntrack | Conntrack table full on a NAT/k8s node | `conntrack -C` vs `nf_conntrack_max` during load |
+| New connects fail under load from one busy client (`EADDRNOTAVAIL`) | Ephemeral port exhaustion / TIME_WAIT pileup | `ss -s` state counts; introduce/repair connection pooling |
+| Exactly ~127s hangs | No connect timeout set; OS SYN-retry default | Set explicit connect timeouts everywhere |
+
+Use the table as priors to order checks, not as a verdict — confirm with the layer tools before fixing.
 
 ## Failure modes & pitfalls
 
@@ -86,6 +111,39 @@ Intermittent + low-rate + LB in front: prior #1 is a connection-reuse race, not 
 - **Pool sized above the server's limit:** 50 app pods × 20 pooled DB connections = 1000 > Postgres `max_connections` 500 — works until a deploy doubles live pods briefly. Do the multiplication; it's the whole diagnosis.
 - **Assuming h3 = faster everywhere.** On fast clean links QUIC's userspace cost can make it *slower* than h2 (as of 2026 this is a measured, mainstream result). Enable h3 at the edge for lossy/mobile win, keep h2 inside the DC, and A/B it with RUM data rather than believing either camp.
 - **Caching authenticated responses at the CDN** because nobody set `Cache-Control: private/no-store` and the cache key ignores the cookie. Audit every cacheable route for "what distinguishes users, and is it in the key or in `Vary`?"
+
+## Worked micro-examples
+
+**1. Per-stage latency localization with one curl:**
+
+```bash
+curl -o /dev/null -s -w 'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://api.example.com/v1/items
+# dns=0.912 tcp=0.964 tls=1.083 ttfb=1.104 total=1.412
+```
+
+Reading it (values are cumulative): DNS took 912ms — that's the whole problem (healthy is single-digit ms warm, <100ms cold; ~5s means a resolver timed out and a fallback answered). TCP connect added 52ms (≈ the RTT), TLS 119ms (~2×RTT — fine for a fresh 1.3 handshake... suspicious if you expected session resumption), server think-time 21ms (ttfb−tls). Run it 20× in a loop before concluding anything from one sample; bimodal results point at cache expiry or load-balanced backends that differ.
+
+**2. The keepalive arithmetic, applied (Node.js behind an AWS ALB).** Invariant: server idle timeout > ALB idle timeout > client pool idle timeout.
+
+```js
+// ALB idle timeout: 60s (default). Node defaults: keepAliveTimeout 5s -> violates invariant, 502 factory.
+const server = app.listen(8080);
+server.keepAliveTimeout = 65_000;   // > ALB's 60s: ALB, not the server, retires connections
+server.headersTimeout   = 66_000;   // must exceed keepAliveTimeout (Node quirk: guards the same race on header reads)
+```
+
+And the outbound side of the same app calling an internal service through the mesh (client must be the impatient one): pool idle timeout 30s < upstream Envoy/nginx 60s < server 75s.
+
+**3. Reading a chain failure with s_client:**
+
+```bash
+openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts </dev/null 2>/dev/null | head -20
+# Certificate chain
+#  0 s:CN = api.example.com          <- leaf only; no "1 s: ... R11/intermediate" line follows
+# Verify return code: 21 (unable to verify the first certificate)
+```
+
+One cert in the chain + code 21 = server is sending the leaf without intermediates: browsers will paper over it, Go/Java/Python clients will fail. Fix is deploying `fullchain.pem`. Contrast: `Verify return code: 10 (certificate has expired)` — check *which* cert expired (`| openssl x509 -noout -dates` per chain element); an expired *intermediate* with a valid leaf is a CA-bundle/renewal-pipeline issue, not a leaf renewal.
 
 ## Verification / self-check
 

@@ -56,7 +56,9 @@ Key sizing tools and when each wins:
 - `:has()` (Baseline since Dec 2023) — parent/ancestor selection: `label:has(input:invalid)`, `.card:has(img)`, form-level state `form:has(.error) .submit`. It's a live query; keep argument selectors cheap on huge DOMs, but don't fear it.
 - `:focus-visible` not `:focus` for focus rings (keyboard-only ring); `:focus-within` for container highlighting.
 - `:nth-child(... of S)` syntax scopes counting: `:nth-child(2 of .visible)`.
+- `:user-valid` / `:user-invalid` instead of `:valid`/`:invalid` for form styling — they wait for user interaction, so required fields don't render red on first paint (Baseline 2023+).
 - Nesting is Baseline (2023+): use it, keep it ≤2 levels; nesting doesn't create specificity walls but it hides them.
+- `@scope` (donut scoping: style between `.card` and `.card-slot` without leaking into slotted content) — powerful for design systems, but verify current cross-browser support before shipping; historically Firefox lagged here.
 
 ## Stacking contexts — the z-index bug taxonomy
 
@@ -85,6 +87,12 @@ Default to logical: `margin-inline`, `padding-block`, `inset-inline-start`, `bor
 - **Margin collapse** surprises (first child's margin poking out of parent): only in flow layout, only block margins; flex/grid/`display: flow-root`/padding/border all stop it. If a parent "moves when the child has margin," this is it.
 - **`overflow: hidden` on one axis isn't**: `overflow-x: hidden; overflow-y: visible` computes y to `auto` — you get a scrollbar, not visible overflow. Also `overflow` (any non-visible) creates a scroll container that clips `position: sticky` and absolutely-positioned descendants' visibility.
 - **`position: sticky` not sticking**: an ancestor with `overflow: hidden/auto/scroll` becomes the scroll container it sticks within; or the sticky element already fills its container (nothing to stick within). Check ancestors for overflow first.
+- **Animating `height: auto`**: transitions to/from `auto` historically don't interpolate. The robust cross-browser pattern is grid: wrapper `display: grid; grid-template-rows: 0fr;` → `1fr` on open, inner element `min-height: 0; overflow: hidden;` — smooth height animation with no JS measurement. (`interpolate-size: allow-keywords` / `calc-size()` solve this natively but were Chromium-only historically — verify current support before relying on them.) Prefer `transform`/`opacity` animations wherever possible; animating layout properties triggers reflow every frame.
+- **Percentage padding/margin resolve against the *inline* size of the containing block** — including `padding-top: 100%`. That's why the old aspect-ratio hack worked, and why a percentage vertical margin "mysteriously" changes with width.
+- **`gap` vs margins**: use `gap` for spacing between flex/grid siblings (no first/last-child exceptions, no margin collapse); reserve margins for spacing between *sections*. Mixed margin+gap spacing is why "the spacing doubles sometimes."
+- **Absolutely-positioned children of a grid**: a `position: absolute` child of a grid container with `inset: 0` covers the whole container, not its assigned area — unless you also give it a `grid-area`, in which case its containing block is that area. Both behaviors are useful; know which you're getting.
+- **Layout shift from scrollbars appearing**: `scrollbar-gutter: stable` on the scroll container (or `html`) reserves the gutter and stops the page "jumping" when content grows.
+- **Ragged headlines/last lines**: `text-wrap: balance` for headings (line-count-limited), `text-wrap: pretty` for body-paragraph orphan control — both Baseline; zero-JS wins.
 
 ## CSS-in-JS vs utility classes (landscape as of 2026)
 
@@ -100,7 +108,9 @@ Default to logical: `margin-inline`, `padding-block`, `inset-inline-start`, `bor
 
 Which algorithm? Cards are in `grid-template-columns: repeat(auto-fill, minmax(280px, 1fr))`. On a 320px viewport minus padding, the available space is under 280px — `minmax`'s min wins and the track overflows. Considered a media query to change the min at small sizes: works, but it's treating the symptom; the robust idiom is `minmax(min(280px, 100%), 1fr)`. Inside the card, a long unbroken order-ID string still overflows its flex row — prior says `min-width: auto`; confirmed in DevTools (the text's min-content exceeds the row). `min-width: 0` on the flex child + `overflow-wrap: anywhere` on the ID. Now the badge: it's `position: absolute; z-index: 10` inside the card; the *next* card has a CSS `filter` on its image hover creating a stacking context... no — walk it properly: the badge's own card has `transform: translateY(...)` from an entrance animation, creating a stacking context whose z-index is auto, so it interleaves with later siblings in DOM order. Options: z-index on the *card* when hovered (fragile, N cards fighting), remove the transform after animation (`animation-fill-mode` juggling — brittle), or `isolation: isolate` + `z-index: 1` on the hovered/badged card. Actually the cleanest: the badge only needs to beat content *within its own card* — it already does; the visual bug is the next card overlapping due to a negative margin from the old design. Check that before touching z-index. It was the margin. Stopping rule: bug reproduced, mechanism named (track min, min-content floor, sibling overlap), fix verified at 320/768/1280 — done; no refactor of the whole grid.
 
-## Worked micro-example
+## Worked micro-examples
+
+**1. Layered architecture + tokens + container-responsive component:**
 
 ```css
 @layer reset, tokens, base, components, utilities;
@@ -130,6 +140,33 @@ Which algorithm? Cards are in `grid-template-columns: repeat(auto-fill, minmax(2
 }
 ```
 
+**2. Scroll-reveal + animated disclosure, no JavaScript:**
+
+```css
+/* Progressive-enhancement scroll reveal (compositor-thread, honors reduced motion) */
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    .reveal {
+      animation: reveal-in both;
+      animation-timeline: view();
+      animation-range: entry 0% entry 60%;
+    }
+    @keyframes reveal-in { from { opacity: 0; translate: 0 1rem; } }
+  }
+}
+
+/* Height-auto disclosure via grid fraction trick */
+.disclosure { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .25s ease; }
+.disclosure[data-open] { grid-template-rows: 1fr; }
+.disclosure > .content { min-height: 0; overflow: hidden; }
+
+/* Registered custom property → animatable gradient angle */
+@property --angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+.spinner-ring { background: conic-gradient(from var(--angle), var(--color-accent), transparent);
+                animation: spin 1s linear infinite; }
+@keyframes spin { to { --angle: 360deg; } }
+```
+
 ## Verification / self-check
 
 - Name the formatting context of the buggy box before proposing a fix; if you can't, open DevTools' layout panel first.
@@ -137,4 +174,5 @@ Which algorithm? Cards are in `grid-template-columns: repeat(auto-fill, minmax(2
 - Any z-index fix: did you identify the exact ancestor creating the stacking context, and consider `<dialog>`/`popover`/top layer instead?
 - Responsive claims: verified at 320px, an intermediate width, and with 200% zoom (zoom reveals fixed-size assumptions).
 - Feature-support claims (style queries, cross-document view transitions, newest features): check caniuse/MDN for the project's browser matrix — don't recall.
+- New component checklist: works with 3x the expected content, works empty, works at 320px, focus-visible styles present, no physical properties without reason.
 - Stopping rule: the bug's mechanism is named and the fix survives content stress (long words, many items, RTL if applicable). Refactoring unrelated CSS "while here" is scope creep.

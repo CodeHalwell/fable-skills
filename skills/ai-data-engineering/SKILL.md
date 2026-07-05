@@ -37,6 +37,13 @@ The 2026 consensus, distilled: model collapse is real but conditional. Error com
 3. **Diversity controls in the pipeline, not hope:** seed every generation with a distinct real example or persona/attribute combination; mix at least two teacher models; measure output diversity (distinct n-gram ratio, embedding-space dispersion vs. the real seed set) and alert when it drops. A synthetic set where 30% of completions start with the same three words is poisoning your model's entropy.
 4. **Ratio discipline:** keep real data in every mix; for general-capability fine-tuning stay minority-synthetic unless verified. Targeted, verified synthetic can be 100% of a *slice* safely.
 
+## Data mixing and curriculum (when assembling from multiple sources)
+
+- Mixture weights matter more than most hyperparameters. Reason about them explicitly: start from natural proportions, then upweight scarce-but-critical domains (code, math, your product's domain) rather than downweighting everything else — and record the weights in lineage.
+- Epoch asymmetry: repeating high-quality data 2–4× is generally safe and often beneficial; repeating low-quality or templated data amplifies its artifacts. If you must repeat, repeat the top quality tier only.
+- For fine-tuning mixes, guard against **capability regression**: a narrow fine-tune on 100% task data degrades general instruction following. Standard mitigation is blending 5–25% general instruction data back in; validate the ratio on a general-capability eval, don't guess and ship.
+- When two sources cover the same domain, dedup *across* sources before weighting — otherwise your "40/60 mix" is silently a different ratio after overlap.
+
 ## Labeling economics (LLM-as-labeler)
 
 - Default 2026 architecture: LLM labels everything cheaply; humans audit a stratified random sample (oversample low-confidence and rare classes); disagreements drive rubric iteration. Human-labels-everything is justified only for safety-critical gold sets and judge calibration.
@@ -86,6 +93,8 @@ A team fine-tunes on 40k support conversations; the new model scores lower than 
 - **PII scrubbing after the copy proliferated** — the "clean" dataset coexists with raw dumps in five buckets. Correction: scrub at ingestion; delete raw or lock it to a break-glass path.
 - **Filtering on a quality classifier trained on the same distribution you're filtering** without spot-checking the rejects: a miscalibrated filter can silently delete an entire domain (e.g., all code, all non-English). Correction: always sample and read 100 *rejected* items per filter stage; report per-stage kill rates and per-domain composition before/after.
 - **"We'll version the data later."** Later is after the model that worked can't be reproduced. Correction: dataset hash in the training config from day one.
+- **Length-filtering as a quality proxy without checking what it kills.** "Drop everything under 200 characters" also drops every legitimate short answer, yes/no case, and refusal — then the model can't be brief. Correction: filter on quality signals (repetition ratio, language ID confidence, boilerplate markers), use length only as a weak feature; inspect the length distribution of *kept* data against the target task's real distribution.
+- **Mixing epochs and mixture weights unrecorded** — the run is "the same dataset" but a different effective distribution. Correction: the lineage manifest records weights, epochs per source, and the shuffle seed, not just source hashes.
 
 ## Worked micro-example: near-dedup + decontamination gate
 
@@ -122,6 +131,40 @@ print(f"pool={len(pool)} deduped={len(keep)} clean={len(clean)}")
 ```
 
 At 10M+ documents, replace this with datatrove's Minhash stages or NeMo Curator's GPU dedup (same parameters, distributed execution) — the logic transfers unchanged.
+
+## Worked micro-example: the truncation + template audit
+
+```python
+from transformers import AutoTokenizer
+import numpy as np
+
+tok = AutoTokenizer.from_pretrained(MODEL_ID)
+
+def render(ex):
+    # THE canonical rendering — same function the trainer and the eval harness import.
+    return tok.apply_chat_template(ex["messages"], tokenize=False, add_generation_prompt=False)
+
+lengths, completion_cut = [], 0
+for ex in dataset:
+    full_ids = tok(render(ex), add_special_tokens=False).input_ids
+    lengths.append(len(full_ids))
+    if len(full_ids) > MAX_SEQ_LEN:
+        # Does truncation eat loss-bearing (assistant) tokens?
+        prefix = tok.apply_chat_template(ex["messages"][:-1], tokenize=False,
+                                         add_generation_prompt=True)
+        if len(tok(prefix, add_special_tokens=False).input_ids) < MAX_SEQ_LEN:
+            completion_cut += 1          # answer partially truncated → teaches trailing off
+        # else: even the prompt doesn't fit → drop the example entirely
+
+L = np.array(lengths)
+print(f"p50={np.percentile(L,50):.0f} p95={np.percentile(L,95):.0f} "
+      f"p99={np.percentile(L,99):.0f} max={L.max()} over={np.mean(L>MAX_SEQ_LEN):.1%} "
+      f"completion_cut={completion_cut}")
+# Gates: completion_cut == 0 after fixes; over-length rate < 1% or raise max_seq_len knowingly.
+
+# Template byte-diff against inference (catches the chat-format mismatch trap):
+assert render(sample) == inference_stack.build_prompt(sample), "train/inference template drift"
+```
 
 ## Verification / self-check
 

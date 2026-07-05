@@ -98,6 +98,76 @@ An operator is worth it when the operational knowledge is genuinely complex, enc
 - **Singleton legacy apps** with no health semantics: a VM is honestly simpler.
 - **Tiny total footprint**: if your whole company fits in 4 VMs, the control-plane tax (upgrades every ~4 months under the N-2/14-month support policy, CNI/CSI/ingress churn) exceeds the benefit. Cloud Run / ECS / Fly-class platforms cover the middle ground.
 
+## Failure modes & pitfalls
+
+- **Editing the pod instead of its owner.** `kubectl edit pod` fixes disappear on the next reconcile or reschedule. Fix the Deployment/StatefulSet; if you need a one-off experiment, `kubectl debug` or a copy-pod (`kubectl debug <pod> --copy-to=...`) — never mutate managed pods and expect it to stick.
+- **One-shot scripts in a Deployment.** A Deployment's pods have `restartPolicy: Always` (not configurable); a script that exits 0 restarts forever and eventually shows CrashLoopBackOff with no error in sight. Use a Job (`restartPolicy: OnFailure` or `Never`).
+- **HPA with no CPU requests.** CPU-utilization HPA computes percentage *of requests*. No requests → HPA reports `<unknown>` and does nothing (`kubectl describe hpa` shows `FailedGetResourceMetric`). Also: a request set far below real baseline (request 100m, idle usage 150m) means utilization is permanently >100% and the HPA pins to `maxReplicas`.
+- **Same-tag image pushes don't roll out.** Kubernetes rolls a Deployment only when the pod *spec* changes. Re-pushing `:staging` changes nothing in the spec, so nothing restarts — and when a pod does eventually reschedule, `imagePullPolicy: IfNotPresent` may still use the old cached image on that node. Deploy unique tags or digests; never mutate tags in place.
+- **Deployment selector is immutable.** Changing `spec.selector.matchLabels` on an existing Deployment errors (`field is immutable`). Plan labels before first apply; fixing requires delete/recreate (use `--cascade=orphan` to keep pods serving during the swap).
+- **Env vars from Secrets/ConfigMaps never update running pods.** Mounted ConfigMap *files* eventually propagate (kubelet sync, ~1 min, and not for `subPath` mounts — subPath mounts never update); env vars are set at container start, full stop. Rotating a secret requires a rollout — automate with a checksum annotation on the pod template (Helm `sha256sum` pattern) or a reloader controller.
+- **PDB that blocks all drains.** `maxUnavailable: 0` (or `minAvailable: 1` with 1 replica) makes eviction impossible: node upgrades hang, Karpenter can't consolidate, and cluster ops teams get paged about *your* app. PDBs must leave at least one evictable pod; single-replica workloads shouldn't have restrictive PDBs at all.
+- **Liveness probe with dependencies.** Liveness hitting an endpoint that checks the DB turns every DB blip into a fleet-wide restart storm. Covered above because it's that common: liveness checks process health only, or doesn't exist.
+- **Forgetting `--previous`.** Reading the *current* (restarting) container's empty logs and concluding "no logs" while the crash reason sits in `kubectl logs --previous`. Reflex: any restart count > 0 → `--previous` first.
+- **`kubectl apply` fighting another manager.** GitOps (Argo CD/Flux) or an operator will revert manual applies, and field-manager conflicts (`server-side apply` errors) mean two writers disagree. Find the other writer (`kubectl get <obj> -o yaml --show-managed-fields`) before "fixing" harder.
+- **Cargo-cult resources.** `requests: {cpu: 100m, memory: 128Mi}` copied from a tutorial onto a JVM service = OOMKilled at startup or 20x under-request that destabilizes bin-packing. Requests come from measurement; there is no universal default.
+- **Node-local ephemeral storage surprise.** Logs and `emptyDir` count against node disk; a chatty container can trigger node `DiskPressure` and evict *neighbors*. Set `ephemeral-storage` requests/limits for anything writing real volume.
+- **CronJob overlap.** Default `concurrencyPolicy: Allow` runs a slow job's next tick alongside it — duplicate processing. Set `Forbid` (or `Replace`), plus `startingDeadlineSeconds` so a controller outage doesn't fire a burst of missed schedules.
+- **Sidecars via bare extra containers.** A helper container that must outlive/precede the app (proxy, log shipper) as a plain second container has no startup ordering and can block Job completion. Use native sidecars (init container with `restartPolicy: Always` — GA since 1.33-era releases): ordered start, terminated after the main container, doesn't block Jobs.
+- **Trusting `kubectl top` for OOM analysis.** OOM decisions use the cgroup working set at the limit boundary at kill time; `top`'s sampled view can show "only 60%" right before a kill. Use `container_memory_working_set_bytes` max-over-time, and check the *node's* OOM events (`kubectl describe node`, kernel logs) when the killed pod was under its limit — that's node-level memory pressure, a different fix (evictions, system-reserved).
+
+## Worked micro-examples
+
+**A production-shaped Deployment (the fields that matter and why):**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, labels: { app: api } }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: api } }   # immutable — choose once
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      terminationGracePeriodSeconds: 45      # > preStop + drain time
+      containers:
+      - name: api
+        image: registry.example.com/api@sha256:9f8e...   # digest, not tag
+        ports: [{ containerPort: 8080 }]
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }   # measured p99, not guessed
+          limits: { memory: 512Mi }                # memory only; no CPU limit
+        startupProbe:                              # slow boot lives here
+          httpGet: { path: /healthz, port: 8080 }
+          failureThreshold: 30
+          periodSeconds: 5
+        readinessProbe:
+          httpGet: { path: /ready, port: 8080 }    # app-local checks only
+          periodSeconds: 5
+        # no livenessProbe until someone can justify one aloud
+        lifecycle:
+          preStop: { exec: { command: ["sleep", "8"] } }  # let endpoint removal propagate
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api }
+spec:
+  maxUnavailable: 1                          # evictable, so drains/consolidation work
+  selector: { matchLabels: { app: api } }
+```
+
+**"Service returns 503 / connection refused" — the mechanical walk:**
+
+```bash
+kubectl get endpointslices -l kubernetes.io/service-name=api   # any ready endpoints?
+# empty + pods exist        -> selector mismatch: diff svc selector vs pod labels
+# addresses but ready:false -> readiness failing: kubectl describe pod (probe error is printed)
+# endpoints fine            -> test from inside: kubectl run curl --rm -it --image=curlimages/curl \
+#                              -- curl -sv http://api.<namespace>.svc:80/
+# works in-cluster, fails outside -> Gateway/Ingress or LB layer, not the Service
+```
+
 ## How an expert thinks through it: "deploy went out, latency p99 tripled"
 
 Rollout event correlates → check `kubectl rollout history` and diff the manifests, not just app code. Diff shows someone "added best practices": CPU limit `500m` and a liveness probe on `/health`. Hypotheses: (a) new code is slower — but p50 unchanged, only tail; deprioritize. (b) CPU throttling — check `container_cpu_cfs_throttled_periods_total`: spiking during request bursts. That's mechanism one. (c) Restarts? `kubectl get pods` shows `RESTARTS: 3-7` — liveness `/health` calls the DB with a 1s timeout, and under throttle-induced slowness it times out, killing pods and dumping their load onto neighbors. Two interacting failures, both from the "hardening" commit. Fix: drop CPU limit (keep the request, raised to measured p99), point liveness at a no-dependency ping endpoint or delete it, keep readiness on `/health` but return 200-with-degraded rather than failing on DB slowness. Rejected along the way: scaling replicas (treats symptom, throttling is per-pod), raising the CPU limit to 2 cores (still throttles at bursts, just later), removing probes wholesale (readiness is load-bearing for rollouts).

@@ -17,7 +17,11 @@ description: Load when building realtime or collaborative web features — choos
 
 Ask in order:
 
-1. **Is it server→client only?** → **SSE (`EventSource`) is the underrated default.** Reasons it wins: plain HTTP (proxies, load balancers, auth middleware, HTTP/2 multiplexing, and CDNs like Fastly/Cloudflare handle it natively), **automatic browser reconnection with `Last-Event-ID` resume built into the protocol** (WebSocket gives you neither), works with standard observability, trivially testable with `curl`. It's also how LLM token streaming standardized. Costs: text-only frames, no upstream channel (use POST), and on HTTP/1.1 a ~6-connections-per-origin limit (moot on HTTP/2+, which any 2026 deployment should be).
+1. **Is it server→client only?** → **SSE (`EventSource`) is the underrated default.** Reasons it wins:
+   - Plain HTTP: proxies, load balancers, auth middleware, HTTP/2 multiplexing, and CDNs handle it natively; standard observability applies; trivially testable with `curl`.
+   - **Automatic browser reconnection with `Last-Event-ID` resume is built into the protocol** — WebSocket gives you neither.
+   - It's how LLM token streaming standardized, so infrastructure support keeps improving.
+   - Costs: text-only frames, no upstream channel (use POST — usually a feature, see principle 2), and on HTTP/1.1 a ~6-connections-per-origin limit (moot on HTTP/2+, which any 2026 deployment should be).
 2. **Genuinely bidirectional and latency-sensitive** (collab cursors, multiplayer, terminal)? → **WebSocket.** Accept its costs knowingly: you own heartbeats, reconnection, resume, backpressure; some corporate proxies/old LBs still mishandle upgrades; sticky routing questions appear at scale.
 3. **Peer-to-peer media or unreliable-delivery data** (video calls, voice, game state where late = worthless)? → **WebRTC** (the only browser path to UDP-like semantics and P2P). Budget for signaling server + STUN/TURN; expect ~10–20% of enterprise/mobile networks to need TURN relay. Never choose WebRTC just for "low latency data to server" — operational cost is an order of magnitude higher.
 4. **Updates rarer than ~every 30s, or fetch-on-signal pattern?** → **Polling is honest and cheap.** Long-polling remains the fallback transport of last resort behind hostile middleboxes.
@@ -43,7 +47,13 @@ Ask: **can the server just win?**
 
 ## Presence and ephemeral state
 
-Presence (who's online, cursors, typing, selection) is *soft state*: it must expire by TTL, never be persisted as truth, and never go through the durable message log. Implement as: client heartbeats presence every ~10–30s → store with TTL (Redis `SETEX`/sorted-set by expiry) → broadcast deltas; a missed TTL sweep marks offline. Debounce/throttle high-frequency ephemeral streams (cursor positions at ≤ 10–20Hz, coalesce to latest — dropping intermediate cursor positions is correct, they're superseded, not lost). Don't send typing indicators through the same ordered channel as messages; ephemeral state wants "latest wins," durable messages want "all, in order" — different delivery semantics, different channels. Yjs "awareness" protocol and managed presence (Liveblocks, Ably presence sets) implement exactly this split.
+Presence (who's online, cursors, typing, selection) is *soft state* — treat it categorically differently from messages:
+
+- It must expire by TTL, never be persisted as truth, and never go through the durable message log.
+- Implementation shape: client heartbeats presence every ~10–30s → store with TTL (Redis `SETEX` or a sorted-set indexed by expiry) → broadcast deltas; a missed TTL sweep marks offline. Don't rely on disconnect events alone — they don't fire for sleeping laptops.
+- Throttle high-frequency ephemeral streams: cursor positions at ≤ 10–20Hz, coalescing to latest. Dropping intermediate cursor positions is *correct* — they're superseded, not lost.
+- Don't send typing indicators through the same ordered channel as messages: ephemeral state wants "latest wins" delivery, durable messages want "all, in order" — different semantics, different channels.
+- Yjs's "awareness" protocol and managed presence (Liveblocks, Ably presence sets) implement exactly this split — use them rather than persisting cursor positions to the database (a real and recurring design review find).
 
 ## Ordering and idempotency
 
@@ -58,6 +68,21 @@ Presence (who's online, cursors, typing, selection) is *soft state*: it must exp
 - Sticky sessions are needed only for *stateful* transports/fallback stacks (Socket.IO with HTTP long-polling fallback requires them; pure WebSocket on a connection tier doesn't, beyond the connection's own lifetime). Prefer designs where losing a node only forces reconnection (cheap, jittered) rather than state loss.
 - Watch for: hot rooms (one topic with 100k subscribers → shard the room or use a broker with fan-out offload); slow consumers exerting backpressure (bound per-connection send buffers and *disconnect* readers that can't keep up — better a reconnect than an OOM); broadcast amplification (N messages × M subscribers; coalesce/batch server-side at e.g. 50–100ms ticks for high-frequency streams).
 - Managed shortcut: per-room actor models (Cloudflare Durable Objects / PartyKit) give you a single-threaded authority per document — the simplest correct topology for collaborative docs, since ordering within the room is free.
+- Build vs buy: managed realtime (Ably, Pusher, Liveblocks, Supabase Realtime) is usually right below ~10 engineers or when realtime isn't the product's core; the connection tier + broker + resume machinery is undifferentiated heavy lifting. Self-host when message volume makes per-message pricing dominate, data can't transit a third party, or you need custom in-band logic the provider can't run. Either way, keep your message envelope and cursor semantics provider-agnostic so migration stays possible.
+
+## Failure modes & pitfalls
+
+- **Auth token in the WebSocket URL query string** — logged by proxies, LBs, and server access logs. Browsers can't set WS headers, so use cookies, a short-lived one-time ticket fetched over HTTPS and passed in the URL, or authenticate in the first message. And handle *expiry mid-connection*: hours-old sockets outlive tokens; either re-auth in-band on a timer or force reconnect at expiry.
+- **SSE dying behind buffering middleware**: nginx `proxy_buffering`, compression layers, and some CDNs buffer the response so events arrive in bursts or never. Fixes: `X-Accel-Buffering: no`, disable compression for the stream route (or use a compression setup that flushes per event), and confirm streaming end-to-end through the *production* proxy chain, not localhost.
+- **Leaked connections on unmount/HMR**: an `EventSource`/`WebSocket` opened in a React effect without cleanup duplicates subscriptions on every remount — the "why do I get every message twice after navigating" bug. Return `es.close()` from the effect; keep one app-level connection in a module/store, not per component.
+- **Socket.IO multi-node without an adapter**: `io.to(room).emit(...)` only reaches sockets on the local node; you must wire `@socket.io/redis-adapter` (or equivalent) for cross-node rooms. Works perfectly in single-instance staging, drops messages in production — the classic.
+- **No backpressure handling**: on the client, check `ws.bufferedAmount` before high-frequency sends; on the server, bound per-connection outbound queues and kill slow consumers. Unbounded queues turn one stalled phone connection into node-wide memory growth.
+- **Publishing from the request handler after DB commit** (no transactional outbox): a crash between commit and publish silently drops the event; readers diverge until the next full refresh. Outbox table + relay, or CDC (Debezium-style), when events must track the database.
+- **No message schema/versioning**: a deploy changes a payload shape and every connected client throws. Envelope every message (`{type, v, seq, payload}`), ignore unknown types, and keep old shapes parseable for one deploy cycle — connected clients don't refresh on your release schedule.
+- **Assuming `onclose` fires**: half-open connections can persist through NAT reboots and sleep/wake; only missed heartbeats are truth (see lifecycle section).
+- **CRDT documents growing forever**: op history and tombstones accumulate; without compaction (Yjs update merging / snapshotting, Automerge compressed saves) load times degrade over months. Schedule snapshot+compact from day one, and load-test with a six-month-old simulated doc.
+- **Serverless + raw WebSocket mismatch**: lambdas can't hold sockets; you need the platform's managed socket layer (API Gateway WebSockets, Durable Objects) or an external provider — or just use SSE from an edge runtime that supports streaming responses.
+- **Broadcasting full state on every change**: works until documents grow; send deltas with sequence numbers, keep full state for the resync path only.
 
 ## Offline-first and sync engines (landscape as of 2026)
 
@@ -102,11 +127,40 @@ es.addEventListener('order', (ev) => {
 es.addEventListener('resync', () => queryClient.invalidateQueries()); // cursor-expired path
 ```
 
-Backoff with full jitter (for the WebSocket cases):
+Backoff with full jitter + stability-gated attempt reset (for the WebSocket cases):
 
 ```ts
-const delay = (attempt: number) =>
-  Math.random() * Math.min(30_000, 1_000 * 2 ** attempt);
+class ReconnectingWS {
+  private attempt = 0;
+  private stableTimer?: ReturnType<typeof setTimeout>;
+  constructor(private url: string, private onMsg: (m: MessageEvent) => void) { this.open(); }
+  private delay() { return Math.random() * Math.min(30_000, 1_000 * 2 ** this.attempt); }
+  private open() {
+    const ws = new WebSocket(this.url);
+    ws.onopen = () => {
+      // don't reset attempt yet — only after the connection proves stable
+      this.stableTimer = setTimeout(() => { this.attempt = 0; }, 30_000);
+    };
+    ws.onmessage = this.onMsg;
+    ws.onclose = () => {
+      clearTimeout(this.stableTimer);
+      this.attempt++;
+      setTimeout(() => this.open(), this.delay());
+    };
+    // heartbeat: expect a server ping every 20s; declare dead after 2 misses
+    let lastSeen = Date.now();
+    ws.addEventListener('message', () => { lastSeen = Date.now(); });
+    const liveness = setInterval(() => {
+      if (Date.now() - lastSeen > 45_000) { clearInterval(liveness); ws.close(); }
+    }, 5_000);
+  }
+}
+```
+
+Message envelope that survives deploys and retries:
+
+```json
+{ "type": "order.updated", "v": 1, "seq": 40213, "idempotencyKey": "b9c4…", "payload": { "orderId": "…", "status": "shipped" } }
 ```
 
 ## Verification / self-check

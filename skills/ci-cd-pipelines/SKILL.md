@@ -71,10 +71,100 @@ A 2%-flaky required suite on 50 PRs/day = a false red every day; devs learn "re-
 - **Path filtering** (`dorny/paths-filter`, or native `on.push.paths` for whole-workflow gating) is step one: don't test what didn't change. Its limit: file paths don't know your dependency graph — changing a shared lib must rebuild dependents.
 - **Affected-graph builds** are step two: Nx/Turborepo/Bazel/Pants compute the dependency-closure of changed files and run only affected targets, with remote caching so unchanged targets are cache hits even on cold runners. Adopt when path filters start needing hand-maintained "if lib changed, test these 14 apps" maps — that map *is* a dependency graph, badly.
 - Keep one required status check that aggregates (a "CI passed" fan-in job with `if: always()` checking needs' results) so branch protection doesn't need updating per-path — and so skipped jobs don't auto-satisfy required checks.
+- **Merge queues** solve the monorepo's other problem: two PRs that pass independently but break combined. A queue tests each PR against the head of the queue (main + PRs ahead of it) before merging. Adopt when merge rate makes "rebase and re-run" a daily tax; below ~20 merges/day on the affected branch it's usually ceremony.
+
+The fan-in + path-filter skeleton:
+
+```yaml
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      api: ${{ steps.filter.outputs.api }}
+    steps:
+      - uses: actions/checkout@<sha>
+      - uses: dorny/paths-filter@<sha>
+        id: filter
+        with:
+          filters: |
+            web: ['apps/web/**', 'packages/shared/**']   # shared lib fans out — this map
+            api: ['apps/api/**', 'packages/shared/**']   # is why affected-graph tools exist
+  test-web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    # ...
+  ci-passed:                       # the ONLY required status check
+    needs: [test-web, test-api]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "false" ]]
+```
 
 ## Self-hosted runners
 
 Reasons that justify them: network access to private resources, GPUs/exotic hardware, extreme cost at scale, compliance. The bill you accept: you now own patching, autoscaling, cache locality, and — critically — **isolation**: a persistent runner accumulates state between jobs (poisoned tools, leaked creds), and self-hosted runners on *public* repos are a standing RCE invitation (fork PRs run code on your infra — GitHub itself warns against this). If you must: ephemeral runners (fresh VM/container per job, e.g. actions-runner-controller on k8s), never public-repo exposure, isolate the runner's cloud permissions. If your reason is only "hosted is slow," price larger hosted runners first — they're cheaper than an SRE maintaining a runner fleet.
+
+## Failure modes & pitfalls
+
+- **`GITHUB_TOKEN` pushes don't trigger workflows.** A workflow that commits/pushes (or creates a PR) with the default `GITHUB_TOKEN` will not fire `push`/`pull_request` workflows on that commit — deliberate recursion protection. The "bot PR shows no CI" mystery. Fix: a GitHub App token or fine-grained PAT for the push, or `workflow_dispatch` the follow-up explicitly.
+- **Fan-in jobs that pass when upstreams were skipped.** A required check on a conditionally-skipped job is satisfied by the *skip*. The aggregate job must run `if: always()` and then explicitly fail on bad upstreams: `if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')` → exit 1. Otherwise path-filtered pipelines quietly let untested merges through.
+- **`success()` semantics in `if:`.** Every `if:` without an explicit status function has an implicit `success()` — so `if: steps.x.outcome == 'failure'` alone never runs (the job already failed). Cleanup/notify steps need `if: always()` or `if: failure()` spelled out.
+- **Matrix `fail-fast` hiding the real failure.** Default `fail-fast: true` cancels sibling legs on first failure; the canceled legs show as canceled, and people chase the wrong leg. For diagnostic-value matrices set `fail-fast: false`; keep fail-fast for pure gating.
+- **Reusable workflows and the secrets wall.** Called workflows don't see the caller's secrets unless passed (`secrets: inherit` or explicit). Also `env:` at the caller's workflow level does *not* propagate into called workflows — pass `inputs`. Symptom: works inline, breaks when extracted.
+- **`pull_request_target` + head checkout.** The canonical hole (see Security posture). Grep for it in every audit; it recurs because someone needed "PR labels + secrets" and copied a snippet.
+- **Cancel-in-progress on deploy groups.** `cancel-in-progress: true` copied from the PR-CI snippet onto a deploy workflow kills a half-finished production deploy when someone merges again. Deploy groups: `cancel-in-progress: false` (queue), always.
+- **Shallow checkout breaking version logic.** `actions/checkout` defaults to depth 1 — no tags, no history. Anything computing versions (`git describe`), changelogs, or affected-since-main diffs needs `fetch-depth: 0` (or `fetch-tags: true`) and will fail in subtle ways without it.
+- **No `timeout-minutes`.** Default job timeout is 6 hours; one hung integration test holds a runner (and a concurrency slot, and a merge queue) hostage. Set a timeout on every job; a job's timeout is documentation of its expected duration.
+- **Cache key without the OS/arch.** Same lockfile, different `runner.os`/arch (x64 vs ARM) → restored native binaries crash. Key must include `runner.os` (and arch if you mix runners); this got newly relevant with ARM runners.
+- **Monorepo `hashFiles` scoped wrong.** `hashFiles('package-lock.json')` at repo root when the app's lockfile lives in `apps/web/` — cache never invalidates (or never hits). `hashFiles` paths are repo-root-relative globs: `hashFiles('apps/web/package-lock.json')`.
+- **Outputs that vanish.** Job outputs must be declared (`outputs:` mapping from a step) — steps' outputs aren't automatically job outputs; and a matrix job's outputs collapse to whichever leg wrote last. If a matrix must publish per-leg results, use artifacts.
+- **Bot-authored `workflow_run` privilege confusion.** `workflow_run` runs with base-repo privileges by design — that's the point of the split pattern — so treat everything it reads from the triggering run's artifacts as untrusted *data*: validate, never execute, and don't pass it into shell interpolation.
+- **`continue-on-error` as flake management.** It turns the step green *and* the failure invisible — nobody looks at a passing build. Legitimate uses: canary legs of a matrix (new language version you're evaluating), optional annotations. Never on tests you intend to fix "later."
+- **Artifact assumptions.** Default artifact retention is bounded (90 days max, often configured lower) — release artifacts belong in a registry/releases, not `actions/upload-artifact`. And artifacts are scoped per run: passing files between *workflows* needs explicit download by run ID (`workflow_run` pattern) or a registry, not the same-name convention that works within one run.
+- **Environment protection that only guards the workflow file's branch.** Environment rules bind to the *job's* environment declaration; a writer with push access to any branch can author a new workflow targeting the environment unless you also restrict which branches may deploy to it (environment branch protection) — set both, or the approval gate is decoration.
+- **Self-hosted runner on a public repo.** Fork PRs execute on your infrastructure with network access. This is not a configuration nuance; it's the whole vulnerability. Hosted runners for public repos, full stop.
+
+## Worked micro-example: a hardened deploy job
+
+```yaml
+deploy-prod:
+  needs: [build]
+  runs-on: ubuntu-latest
+  timeout-minutes: 20
+  environment: production            # gated: required reviewers + env-scoped secrets
+  concurrency:
+    group: deploy-prod               # serialize; never cancel a running deploy
+    cancel-in-progress: false
+  permissions:
+    id-token: write                  # OIDC only — no stored cloud keys
+    contents: read
+  steps:
+    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # pinned SHA (comment the tag)
+    - uses: aws-actions/configure-aws-credentials@a159d7bb5354cf786f855f2f5d1d8d768d9a08d1
+      with:
+        role-to-assume: arn:aws:iam::123456789012:role/gha-prod-deploy  # trust policy scoped to repo+environment
+        aws-region: us-east-1
+    - name: Verify artifact provenance, then promote by digest
+      env:
+        IMAGE: ${{ needs.build.outputs.image-digest }}   # promote what was built, never rebuild
+      run: |
+        gh attestation verify oci://"$IMAGE" --owner my-org
+        ./scripts/deploy.sh "$IMAGE"
+    - name: Post-deploy smoke check
+      run: ./scripts/smoke.sh https://api.example.com   # deploy isn't done at 'apply'
+```
+
+Every line is a decision from the sections above: environment gating, OIDC, pinning, concurrency, digest promotion, attestation verification, and verification-in-pipeline.
+
+## Priors an expert carries
+
+- A red main branch is an incident, not a backlog item — either revert within minutes or fix-forward within the hour; a tolerated red main destroys the meaning of every other signal.
+- When CI "randomly" fails, the cause is (in order of prior probability): test isolation/shared state, real network dependence, resource contention on the runner, cache staleness — actual infrastructure flakiness is the last hypothesis, not the first.
+- When a pipeline is slow, the fix is (in order of expected value): stop running unneeded work, parallelize, cache, shard — buy bigger hardware only after those, and measure before each step.
+- Security reviews of workflows find the same four issues every time: `pull_request_target` misuse, context injection into `run:`, tag-pinned actions, and over-broad token permissions. Grep for all four before reading anything else.
 
 ## How an expert thinks through it: "CI takes 30 minutes and everyone re-runs it"
 

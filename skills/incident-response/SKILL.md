@@ -13,6 +13,12 @@ description: Load when production is broken or degraded — triaging an outage, 
 - **Severity buys resources and permission.** Classifying severity isn't bureaucracy — it decides who gets paged, whether you may take risky mitigations (serving stale data, disabling a feature for everyone), and how often you must communicate. Classify by *user impact and trajectory*, not by how alarming the internals look. When uncertain, classify high and downgrade: over-paging costs minutes of attention; under-paging costs hours of unmanaged outage. Downgrading feels good; upgrading late feels like a cover-up.
 - **The postmortem is the product.** The incident itself is sunk cost; the only return on it is what changes afterward. A postmortem that produces a root-cause sentence and no system changes converted user pain into paperwork.
 
+## Declaring: the cheapest decision you'll make all incident
+
+- Declare early and cheaply. The cost of declaring an incident that fizzles is ten minutes of two people's time; the cost of *not* declaring is 40 minutes of one engineer quietly drowning while stakeholders discover the outage from customers. Set the bar mechanically: symptom alert fired + user impact plausible → declare, open the channel, name an IC. You can always close it as "false alarm" — closed-as-nothing incidents are evidence of a healthy trigger finger, not waste.
+- Solo-debugging thresholds: if you've been investigating alone for 15 minutes without mitigation, or the blast radius exceeds one customer, declare. The failure mode this prevents has a name in every postmortem: "the on-call knew at 13:45 but the incident was declared at 14:40."
+- Declaring is also what starts the clock on everything else in this skill — roles, comms cadence, timeline capture. None of it happens retroactively.
+
 ## The first five minutes: the mitigation decision tree
 
 Run this in order. It's a decision tree, not a checklist — take the first exit that applies.
@@ -33,6 +39,14 @@ The rollback-vs-fix-forward rule under pressure: rollback is rehearsed and mecha
 - **Comms lead** (IC does it if unstaffed): status updates *on a clock* — every 30 minutes for high-sev, even when the update is "no change, still investigating, next update 15:30." Updates on a clock, not on progress: stakeholders who don't hear anything escalate, ping responders directly, and start shadow incidents. A predictable cadence is what buys responders silence to work in. Template: impact (user terms), current hypothesis or "unknown," actions in flight, next update time. Never speculate about cause in external comms.
 - One channel per incident, timestamps on everything (screenshots of graphs *with time ranges*), decisions logged as they're made. The channel log is the postmortem's raw material and the 2am-handoff document.
 - **Handoffs are explicit.** Long incidents kill people via fatigue; after ~2–4 hours of high-sev response, effectiveness craters and risk appetite goes weird. The IC schedules relief, and handoff means the incoming person reads the timeline and states the situation back — not "you're up, good luck."
+
+## Severity classification reasoning
+
+- Classify on three inputs, in this order: **breadth** (what fraction of users/requests/revenue), **depth** (hard failure vs degraded vs cosmetic; any data loss or security dimension jumps a level automatically), **trajectory** (stable, recovering, or climbing — a climbing symptom classifies one level above its current impact, because you're classifying where it will be in 20 minutes, not where it is).
+- Ignore two tempting inputs: how dramatic the internals look (a scary failover with zero user impact is low-sev), and how embarrassing the cause is (severity measures impact, not blame — mixing them teaches people to lowball).
+- Severity is a *live* variable: the IC re-evaluates at every status update. Upgrades are announced immediately (they change who's involved and what's authorized); downgrades wait for sustained evidence, not one good minute on a graph.
+- Pre-agree the definitions per product (the table in the examples below) so the 3am classification is a lookup, not a negotiation. The worst time to design a severity scheme is during the incident that needed it.
+- Sub-severity but nonzero events (the "weird blip" that self-recovered) get a lightweight tracking issue anyway — they're your near-miss inventory (see postmortems), and three identical blips are an incident announcing itself in installments.
 
 ## Diagnosis under pressure
 
@@ -86,7 +100,50 @@ What changed? Deploy log: checkout service shipped 13:40. Errors started 14:02. 
 - **Two mitigations at once.** Flag revert and deploy rollback simultaneously is fine (both are safe reverts to known-good). But two *novel* changes at once (config edit + failover) means when things improve — or worsen — you can't attribute it, and you may have created a second incident. Novel changes: one at a time, announced, with an expected effect.
 - **Sev classification by internal drama.** A scary-looking master-failover with zero user impact gets sev-1 while a 3%-of-checkouts silent failure ambles along as sev-3 for six hours. Classify on user impact and trajectory; a low-and-climbing symptom outranks a big-but-recovered one.
 - **Postmortem action item: "be more careful during deploys."** Not falsifiable, not owned, decays instantly. Rewrite every human-vigilance item as a system change or delete it.
+- **The runbook that describes the old architecture.** Mid-incident is when you discover the failover procedure references a cluster decommissioned last quarter. Runbooks rot on the same clock as infrastructure; the tabletop game day (above) is the cheapest rot detector, and every real incident should end with a "was the runbook right?" line item in the postmortem.
+- **Nobody writes anything down during the incident** — then the postmortem timeline is reconstructed from fallible memory three days later, and the 14:07–14:20 gap where the crucial wrong turn happened is invisible. The IC's running log (or an incident bot capturing the channel) is not bureaucracy; it's the raw data for every lesson you'll extract.
 - **Alert thresholds tuned once, in 2023.** Traffic doubled; the "queue depth > 10k" page now fires nightly and means nothing. Alerts need the same lifecycle as flags: owner, review date, deletion path.
+
+## Worked micro-examples
+
+**1. A severity ladder that makes decisions, not paperwork.** The columns that matter are the rightmost two — what the level *buys* and *demands*:
+
+| Sev | Definition (user terms) | Response | Comms cadence |
+|---|---|---|---|
+| 1 | Critical path down or data loss occurring for many users | Page IC + responders now, exec notification, risky mitigations pre-authorized (fail over region, kill features) | Every 30 min, plus public status page |
+| 2 | Critical path degraded (elevated errors/latency) or full outage of a secondary feature | Page on-call, IC assigned, normal-change discipline suspended for reverts | Every 60 min, internal |
+| 3 | Minor degradation, workaround exists, not worsening | Ticket + business-hours fix; no page | On resolution |
+
+Plus the trajectory rule: anything *climbing* gets classified one level above its current impact.
+
+**2. Status update template (fill-in, 60 seconds to write):**
+
+```text
+[SEV2] Checkout errors — update 14:30
+Impact: ~8% of checkout attempts failing since 14:02 (was 12% at peak).
+Cause: suspected payments-routing flag rollout; flag reverted 14:11.
+Actions: monitoring recovery; payments team checking pool saturation on new path.
+Next update: 15:00 or on material change. IC: @dana  Channel: #inc-2231
+```
+
+Impact in user terms, hypothesis labeled as suspected, named next-update time. No speculation about blame, no internal jargon in anything customer-facing.
+
+**3. Page on symptoms via error-budget burn rate (Prometheus), not on causes.** The multiwindow burn-rate alert — fast window catches cliffs, slow window confirms it's not a blip:
+
+```yaml
+- alert: CheckoutAvailabilityBurn
+  expr: |
+    ( sum(rate(http_requests_total{job="checkout",code=~"5.."}[5m]))
+      / sum(rate(http_requests_total{job="checkout"}[5m])) ) > (14.4 * 0.001)
+    and
+    ( sum(rate(http_requests_total{job="checkout",code=~"5.."}[1h]))
+      / sum(rate(http_requests_total{job="checkout"}[1h])) ) > (14.4 * 0.001)
+  labels: {severity: page}
+  annotations:
+    runbook: https://runbooks/checkout-availability
+```
+
+14.4× burn of a 99.9% SLO ≈ exhausting a 30-day error budget in ~2 days — fast enough to page, slow enough to be real. The `queue_depth > 10k` and `cpu > 90%` alerts this replaces become dashboard panels you consult *after* this pages.
 
 ## Verification / self-check
 

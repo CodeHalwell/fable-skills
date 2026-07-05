@@ -15,6 +15,30 @@ description: Engineering with vision, audio, document, and video models — imag
 
 ## Decision frameworks
 
+### The capability map — route work to model vs code (state of practice, mid-2026)
+
+| Task | VLM alone | Expert routing |
+|---|---|---|
+| Chart/figure QA, trend reading | Good | VLM; ask for the underlying numbers table first, then reason over it |
+| UI/screenshot understanding | Good (drives computer-use agents) | VLM; for clicking, use models/APIs with explicit grounding support |
+| Clean printed text (Latin) | Good | Text layer if it exists (free + exact); VLM otherwise |
+| Complex tables | Decent, degrades with density | Layout parser first; VLM verify/repair on failures |
+| Handwriting (legible) | Good | VLM — now beats classical OCR here |
+| Non-Latin / degraded scans | Weak-to-fair | Purpose-built OCR models; measure per-script |
+| Counting >~10 similar objects | Unreliable | Detector counts; VLM classifies |
+| Precise coordinates / measurements | Unreliable | Detection/segmentation models, or grounding-specific APIs; verify by re-rendering |
+| Negation, absence ("which has NO…") | Unreliable | Reframe as positive enumeration + code filters |
+| Small text near resolution floor | Fails silently | Crop to native resolution — no prompt fixes sub-~20px glyphs |
+
+The rows change slowly; the columns' quality improves every model generation — re-verify the "unreliable" rows against the current frontier before designing around a limitation, but never *assume* one has been fixed.
+
+### Structured extraction from visual inputs
+
+- Always schema-guided (tool call / JSON schema), never free text you re-parse. Every field optional/nullable with an explicit "null if not visible" instruction — required fields are a fabrication pump.
+- Grounding: where the stack supports citations/bounding boxes (provider citation features, grounding-tuned VLMs), demand them and *verify by rendering* — draw the box, check the value is inside it. Where it doesn't, require a verbatim source snippet per field and string-match it against the OCR/text layer; a snippet that doesn't appear in the source is a hallucination flag you can automate.
+- Order the schema to mirror reading order of the document; extraction quality measurably improves when the model fills fields in the order it encounters them.
+- Split mega-schemas: one pass for header fields, one per table/region. A 60-field single pass degrades tail-field accuracy; two 30-field passes on crops usually cost less than the retries.
+
 ### Document pipeline: parse natively, render-to-image, or hybrid?
 
 Questions in order:
@@ -30,6 +54,12 @@ Questions in order:
 - **Native speech-to-speech (OpenAI Realtime, Google Gemini Live, Hume EVI):** choose when latency and prosody dominate (emotional nuance, natural interruptions) and the task is conversational rather than transactional. Costs: harder to guardrail (no text checkpoint mid-pipeline unless you add one), model lock-in, tool-calling maturity varies.
 - The interruption problem (barge-in) is a *product requirement*, not a nicety: you need always-on VAD/endpointing, TTS playback you can kill instantly, and state reconciliation ("how much of my sentence did the user actually hear before cutting me off?") — decide what the LLM's history should say it said. Semantic endpointing (is the user done or just pausing?) is the current quality frontier; a fixed silence-timeout either interrupts thinkers or feels laggy.
 
+STT selection judgment (the spec-sheet WER number is nearly useless):
+- WER concentrates where it hurts: proper nouns, domain jargon, alphanumeric IDs, accented speech, crosstalk. Benchmark on *your* audio — 50 real clips with ground truth beats any leaderboard; slice results by accent and SNR.
+- Streaming vs batch are different products with different models/accuracy: don't validate on batch and ship streaming.
+- Check the features that decide integration pain before accuracy deltas of 1%: word-level timestamps (needed for grounded citations into audio), diarization quality (meeting use cases live or die on it), custom vocabulary/keyword boosting (the fix for domain-term WER), endpointing controls, and price per streamed hour.
+- Realistic mid-2026 expectations: streaming latencies around 150–300ms and mid-single-digit WER on clean English from the major vendors (Deepgram, AssemblyAI, ElevenLabs, OpenAI, Google); differences on *your* domain audio dwarf differences on their marketing benchmarks.
+
 ### Video
 
 Almost all practical "video understanding" is frame sampling + VLM. Economics dominate: at 1 fps, a 10-minute video is 600 frames — hundreds of thousands of tokens. Expert defaults: sample 0.5–1 fps for activity understanding; use shot/scene detection to pick representative frames instead of uniform sampling; transcribe audio separately (it usually carries most of the semantic load — and is ~100× cheaper per minute); reserve dense sampling for the specific segment a cheap pass located. Ask "what question am I answering?" — "did the assembly step get skipped" needs the 20 relevant seconds densely, not the hour uniformly.
@@ -37,6 +67,14 @@ Almost all practical "video understanding" is frame sampling + VLM. Economics do
 ### Generation-side (brief, as of mid-2026)
 
 The image-gen market is multi-model by design: GPT Image 2 for instruction-heavy generation/editing and reasoning over layout; FLUX.2 family for photorealism with open weights (LoRA/fine-tune ecosystem); Imagen 4 for natural photographic looks; Ideogram/Seedream when *legible in-image text* is the requirement. Route per request-type rather than picking one winner; text rendering is still the sharpest differentiator, so test your actual text cases before committing.
+
+### Evaluating multimodal outputs
+
+- Build the golden set before the pipeline: 100–300 hand-labeled examples covering every input condition you'll meet (digital/scan/photo; accents/noise; chart types). Label at the *field* level, not document level — "83% of documents perfect" hides "the total field is wrong 15% of the time."
+- Normalize before scoring: currency/number/date canonicalization for extraction, text normalization (casing, punctuation, number formatting) before WER for speech. Un-normalized exact-match understates real quality and hides real errors equally.
+- Use LLM-as-judge only for what rules can't score (caption quality, summary faithfulness), with a rubric per criterion and periodic human calibration on a sample; use deterministic checks (schema validity, arithmetic consistency, citation-snippet match, box-contains-value) for everything else — they're free and unimpeachable.
+- Track the *fallback and human-queue rates* as first-class metrics: a pipeline whose accuracy "improved" by routing 30% of traffic to humans didn't improve, it moved cost.
+- Re-run the golden set on every model/prompt/DPI change. Multimodal pipelines are exquisitely sensitive to preprocessing changes that look harmless (a default DPI bump, a new JPEG quality setting) — treat preprocessing config as versioned code under eval, not as environment.
 
 ## How an expert thinks through it
 

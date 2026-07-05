@@ -1,48 +1,81 @@
 ---
 name: go-development
-description: Loads expert Go judgment for goroutine lifecycle management, channels vs mutexes, context discipline, interface and error design, slice/nil gotchas, generics restraint, and pprof-driven performance work. Use when writing or reviewing Go services, debugging goroutine leaks or races, designing packages/interfaces, or structuring Go tests and project layout.
+description: Loads expert Go judgment for goroutine lifecycle management, channels vs mutexes, context discipline, interface and error design, slice/nil gotchas, generics restraint, and pprof-driven performance work. Use when writing or reviewing Go services, debugging goroutine leaks or races, designing packages and interfaces, or structuring Go tests and project layout.
 ---
 
 # Go Development
 
 ## Core mental model
 
-1. **Every goroutine needs an exit plan before you write `go`.** Goroutine leaks are the #1 production bug class in Go services: a goroutine blocked forever on a channel nobody reads, a `ctx` nobody cancels, or a loop with no stop signal. Before every `go` statement, answer: *how does this goroutine terminate, and who waits for it?* If you can't answer both, don't start it.
-2. **Share memory by communicating — but only when there's a flow.** Channels model pipelines, fan-in/fan-out, ownership transfer, and signaling. Mutexes model shared state (caches, counters, config). The slogan is not "always channels"; a mutex around a map is simpler and faster than a channel-guarded map service goroutine.
-3. **`context.Context` is the cancellation and deadline bus, and it flows one way.** First parameter of every function that blocks, does I/O, or can be slow: `func F(ctx context.Context, ...)`. Never store a context in a struct (except transitional request wrappers); never pass `nil` (use `context.Background()`/`TODO()`); values on context are for request-scoped cross-cutting data (trace IDs, auth principal), not function parameters in disguise.
-4. **Interfaces are discovered by consumers, not designed by producers.** Define the interface in the package that *uses* it, sized to exactly what it calls (often one method). Return concrete types; accept interfaces. A package exporting `type FooInterface` next to `type fooImpl` with a constructor returning the interface is Java smuggled into Go.
-5. **Errors are values with a wrapping convention.** `fmt.Errorf("opening config: %w", err)` builds a cause chain; `errors.Is` (sentinel comparison) and `errors.As` (type extraction) walk it. Callers must never string-match error text. Wrap with context at each layer; handle (log OR return, never both) exactly once.
+1. **Every goroutine needs an exit plan before you write `go`.** Goroutine leaks are the #1 Go production bug class: a goroutine parked forever on a channel nobody reads, a context nobody cancels, a loop with no stop condition. Before every `go` statement, answer two questions — *how does this goroutine terminate?* and *who waits for it?* If either answer is missing, don't start it.
+2. **Share memory by communicating — but only when there's a flow.** Channels model movement: pipelines, fan-out/fan-in, ownership hand-off, completion signals. Mutexes model state: caches, counters, config. The slogan is not "always channels" — a mutex around a map is simpler, faster, and more obvious than a channel-fronted map-owning goroutine.
+3. **`context.Context` is the cancellation/deadline bus, and it flows one way.** First parameter of anything that blocks, does I/O, or can be slow: `func F(ctx context.Context, ...)`. Never stored in structs (except transitional request wrappers), never `nil` (use `context.Background()`), and its value bag is for request-scoped cross-cutting data (trace ID, auth principal) — not for function parameters in disguise.
+4. **Interfaces are discovered by consumers, not designed by producers.** Define the interface in the package that *uses* it, sized to exactly the methods it calls — often one. Accept interfaces, return concrete types. A package exporting `FooInterface` next to `fooImpl` with a constructor returning the interface is Java smuggled into Go.
+5. **Errors are values with a wrapping convention.** `fmt.Errorf("opening config: %w", err)` builds a cause chain; `errors.Is` (sentinels) and `errors.As` (types) walk it. Callers never string-match. Each error is *handled once*: log it or return it, not both.
+6. **Clarity beats cleverness, structurally.** Go's design rewards code that reads top-to-bottom with no hidden control flow. When choosing between a clever abstraction and 15 lines of repetition, Go culture — and future debuggability — usually picks the repetition.
 
 ## Current state (verified July 2026)
 
-- **Go 1.26 is current** (Feb 2026; 1.25 still supported — Go supports the last two minors). Notables: 1.25 finalized **`testing/synctest`** (deterministic testing of concurrent code with a fake clock — use it instead of `time.Sleep` in tests) and container-aware `GOMAXPROCS` (respects cgroup CPU limits — the old uber-go/automaxprocs workaround is unnecessary on 1.25+). The **Green Tea GC**, experimental in 1.25, is **on by default in 1.26** (roughly 10–40% GC overhead reduction in GC-heavy programs). `encoding/json/v2` is available experimentally (1.25+, `GOEXPERIMENT=jsonv2`) — mention it, don't default to it.
-- Project layout consensus: `cmd/<binary>/main.go` for entry points, `internal/` for private packages (compiler-enforced), a flat root for small libraries. **Do not create `pkg/`** by reflex, don't mirror MVC layer names as packages (`models`, `utils`, `helpers` are smells); package names are part of the API (`storage.Client`, not `storage.StorageClient`).
+- **Go 1.26 is current** (Feb 2026); 1.25 remains supported (Go supports the last two minors). Highlights that change advice:
+  - **`testing/synctest` finalized in 1.25** — deterministic testing of concurrent code with a virtualized clock. Use it instead of `time.Sleep` in tests of timeout/retry logic.
+  - **Container-aware `GOMAXPROCS` (1.25+)**: the runtime respects cgroup CPU limits — the `uber-go/automaxprocs` workaround is no longer needed on modern versions.
+  - **Green Tea GC**: experimental in 1.25 (`GOEXPERIMENT=greenteagc`), **on by default in 1.26** — roughly 10–40% GC overhead reduction in GC-heavy programs; no code changes required.
+  - `encoding/json/v2` exists behind `GOEXPERIMENT=jsonv2` (1.25+) — mention as future, don't default to it.
+  - Loop variables are per-iteration since 1.22; `for range n` over ints also since 1.22.
+- Layout consensus: `cmd/<binary>/` for entry points, `internal/` for private packages (compiler-enforced), flat root for small libraries. **Do not create `pkg/` by reflex.** Package names are API: `storage.Client` not `storage.StorageClient`; no `utils`, `helpers`, `common`, `models` grab-bags — packages are organized by *capability*, not by layer.
 
 ## Decision frameworks with reasoning chains
 
-**Channel or mutex?** Ask: (1) Is there a *transfer* — data moving from producers to consumers, stages of a pipeline, a completion signal? → channel. (2) Is it *state* — multiple goroutines reading/updating the same structure in place? → `sync.Mutex` (or `RWMutex` only with measured read-mostly contention; unmeasured RWMutex is premature). (3) Is it one-time signaling? → `close(ch)` broadcast, `sync.Once`, or context cancellation. (4) Is it a counter/flag? → `sync/atomic` types (`atomic.Int64`, `atomic.Bool`). What changes the answer: if the mutex-based design grows condition-waiting ("wait until the map has a key"), that's flow, switch to channels; if the channel design grows request/response pairs with reply channels everywhere, that's state access, switch to a mutex.
-**Buffered or unbuffered?** Default unbuffered (synchronization point, backpressure by construction). Buffer size N only with a reason you can state: known burst size, decoupling producer hiccups, or a semaphore (`chan struct{}` of size N). "Buffer so sends don't block" is how you hide deadlocks and lose backpressure.
+**Channel or mutex?** Ask in order:
+1. Is there a *transfer* — data moving producer→consumer, pipeline stages, a completion signal? → channel.
+2. Is it *state* — goroutines reading/updating a structure in place? → `sync.Mutex`. (`RWMutex` only with *measured* read-mostly contention; unmeasured RWMutex is premature and can be slower.)
+3. One-time broadcast? → `close(ch)`, `sync.Once`, or context cancellation.
+4. Counter or flag? → `sync/atomic` types (`atomic.Int64`, `atomic.Bool`).
+What flips the answer: a mutex design growing "wait until condition" logic is flow — switch to channels; a channel design growing request/response pairs with reply channels everywhere is state access — switch to a mutex. Both migrations are common and both directions are legitimate.
 
-**Generics or interfaces?** (Generics have been in since 1.18; the judgment is mature now.) Use generics for: type-safe containers/collections, functions over `[]T` (`Map`, `Keys`), constraints like `cmp.Ordered` on algorithms. Use interfaces for: *behavioral* polymorphism — things that do something (`io.Reader`, `Storer`). Litmus test: if the type parameter appears only once in the signature and you never return it, an interface parameter is simpler (`func Log(w io.Writer)`, not `func Log[W io.Writer](w W)`). Avoid: generic structs to dodge writing two small concrete types, and `any`-constrained parameters that just re-create `interface{}` with extra syntax. The standard library's restraint (`slices`, `maps`, `cmp`) is the calibration.
+**Buffered or unbuffered?** Default unbuffered: it's a synchronization point and gives backpressure by construction. Choose buffer size N only with a stateable reason: known burst size, decoupling a jittery producer, a semaphore (`make(chan struct{}, N)`), or fan-in sized to the number of senders (see scenario). "Buffered so sends don't block" is how deadlocks get hidden and backpressure gets lost.
 
-**Performance investigation order.** Never guess: (1) `go test -bench . -benchmem` on the suspect path — allocations per op is the first number to read; (2) live services: `net/http/pprof` + `go tool pprof -http=: profile` — CPU profile for compute, heap profile (`inuse_space` for leaks, `alloc_space` for GC pressure), block/mutex profiles for contention, `goroutine` profile for leaks; (3) common wins in order of frequency: unpreallocated slices/maps in hot loops (`make([]T, 0, n)`), `[]byte`↔`string` conversions, fmt in hot paths, tiny interface-boxed allocations, JSON marshal cost. Stopping rule: stop when the top frame is your actual business logic or syscalls, or when p99 meets the SLO — shaving allocations below GC-noise level is waste.
+**Generics or interfaces?** (Generics landed in 1.18; judgment is mature.)
+- Generics: type-safe containers, functions over slices/maps (`Map`, `Keys`, `Dedup`), algorithms with `cmp.Ordered` constraints. The `slices`, `maps`, `cmp` stdlib packages are the calibration for "worth it."
+- Interfaces: *behavioral* polymorphism — things that do (`io.Reader`, `Storer`).
+- Litmus test: if the type parameter appears once in the signature and is never returned, use an interface parameter instead — `func Log(w io.Writer)`, not `func Log[W io.Writer](w W)`.
+- Refuse: generic structs to avoid writing two small concrete types; `any`-constrained parameters recreating `interface{}` with ceremony; premature constraint hierarchies. If the pre-1.18 answer would have been "just write it twice," that often remains the answer.
+
+**Performance investigation order.** Never guess:
+1. `go test -bench . -benchmem` on the suspect path — read allocs/op before ns/op.
+2. Live services: import `net/http/pprof`, then `go tool pprof -http=: <url>/debug/pprof/profile` (CPU), heap profile — `inuse_space` for leaks, `alloc_space` for GC pressure — block/mutex profiles for contention, goroutine profile for leaks.
+3. Wins in order of base rate: unpreallocated slices/maps in hot loops (`make([]T, 0, n)`), `[]byte`↔`string` churn, `fmt` in hot paths, interface-boxing allocations, JSON marshal cost.
+Stopping rule: stop when the top frames are business logic or syscalls, or p99 meets SLO. Shaving allocations below GC noise is waste — and on 1.26 the GC is cheaper, so re-measure before porting old folklore.
 
 ## How an expert thinks through it: rising goroutine count
 
-Dashboard shows goroutines climbing 50/hour, memory following. Internal monologue: *Classic leak. Get evidence before theory: hit `/debug/pprof/goroutine?debug=1` twice, 10 minutes apart, and diff the stacks. Prior: leaks cluster at (a) `chan send` — a worker writing results to a channel whose reader returned early (e.g., on error, or `select` took the ctx branch and abandoned the result channel); (b) `chan receive` on a never-closed channel; (c) blocked on network I/O with no deadline; (d) time.Tick — `time.Tick` leaks its ticker by design, must use `time.NewTicker` + `defer Stop()` in anything long-running (though since Go 1.23 unreferenced tickers are GC-able, a stopped-but-referenced loop still leaks the goroutine around it). Say the diff shows hundreds parked in `results <- r` inside `fetchOne`. So the spawner stopped receiving. Look at the collector: `for i := 0; i < n; i++ { select { case r := <-results: ...; case <-ctx.Done(): return } }` — there it is: on cancellation it returns, orphaning up-to-n senders on an unbuffered channel. Fixes considered: (1) make `results` buffered with capacity n — senders never block; leak fixed with one character. Accept: bounded, simple, idiomatic for known-cardinality fan-in. (2) Have senders `select` on ctx too — also correct, more code; do it if senders are long-lived. (3) errgroup rewrite — `golang.org/x/sync/errgroup` with `g.Go` + shared slice indexed per-worker removes the channel entirely; best if I'm touching this code anyway. Ship (1) now, (3) in the refactor. Verify: goroutine profile flat under load test with injected cancellations.* Prior to internalize: **fan-in + early return = orphaned senders; size result channels to the number of sends, or make senders cancellable.**
+Dashboard: goroutines +50/hour, memory tracking it.
+
+Internal monologue: *Classic leak; get stacks before theories. Hit `/debug/pprof/goroutine?debug=1` twice, 10 minutes apart, diff the counts per stack. Priors, by base rate: (a) parked on `chan send` — worker writing results to a channel whose reader bailed early; (b) parked on `chan receive` from a never-closed channel; (c) network I/O with no deadline set (http.Client without Timeout, raw conns without SetDeadline); (d) tickers — `time.Tick` has no Stop and historically leaked by design; use `time.NewTicker` + `defer Stop()` (since 1.23 unreferenced tickers can be GC'd, but the goroutine looping around one still leaks if it has no exit). The diff shows 400 goroutines in `results <- r` inside `fetchOne` — so senders outlived their reader. Find the collector: `for i := 0; i < n; i++ { select { case r := <-results: ...; case <-ctx.Done(): return } }` — there: on cancellation it returns, orphaning up to n senders on an unbuffered channel, forever. Fixes considered: (1) `make(chan result, n)` — buffer to the number of sends; senders can always complete; one-line fix, idiomatic for known-cardinality fan-in. (2) Senders also select on ctx — correct, more code; right when senders are long-lived or n is unbounded. (3) Rewrite with `errgroup.WithContext` — removes the manual channel entirely; best if I'm refactoring anyway. Rejected: increasing the pod memory limit (treats the symptom); a watchdog that kills "old" goroutines (no such primitive, and the desire for one signals design failure). Ship (1) today, schedule (3).*
+
+Verification: load test with injected cancellations; goroutine profile must return to baseline. Prior to internalize: **fan-in + early return = orphaned senders. Size result channels to the number of sends, or make every send cancellable.**
+
+## Second scenario: intermittent test failure, "concurrent map writes"
+
+CI crashes once in ~30 runs: `fatal error: concurrent map writes` in a cache package that "has a mutex."
+
+Internal monologue: *This is a fatal runtime check, not a flake — the race is real and the mutex has a gap. Don't eyeball; make the detector find it: `go test -race -count=50 ./cache/...` locally. The race detector reports the two racing goroutines with stacks — say, `Get` writing under `RLock`. There it is: `func (c *Cache) Get(k string) V { c.mu.RLock(); defer c.mu.RUnlock(); if v, ok := c.m[k]; ok { return v }; v := c.load(k); c.m[k] = v; return v }` — a write under a* read *lock. Fix options: (1) take the write lock for the whole Get — correct, simplest, serializes all reads; fine unless profiling shows contention. (2) Double-checked pattern: RLock read; miss → RUnlock, Lock, re-check (another goroutine may have filled it), fill, Unlock — standard, more code, still calls `load` under the write lock (bad if load is slow I/O). (3) `singleflight.Group` (golang.org/x/sync) — dedups concurrent loads per key without holding the map lock during I/O; the right answer when `load` is expensive. (4) `sync.Map` — rejected: this is read-modify-write with loads, not one of its blessed workloads. Choose (1) if load is cheap, (3) if load does I/O. Also fix process: `-race` was not in CI, which is how this shipped — that's the root cause; the code bug is a symptom.*
+
+Prior: **"has a mutex" is not "is correct" — audit that every write path holds the* write *lock, and put `-race` where it runs on every merge, not on the developer's laptop.**
 
 ## Failure modes and pitfalls
 
-- **Nil interface gotcha.** An interface is nil only if *both* its type and value are nil. `var p *MyErr; var err error = p; err != nil` is **true**. The bug ships as `func f() error { var e *MyErr; ...; return e }` — returns non-nil error wrapping a nil pointer. Rule: return the literal `nil`, never a possibly-nil concrete pointer through an interface return.
-- **Slice aliasing and append sharing.** `b := a[:2]; b = append(b, x)` writes into `a`'s backing array if capacity allows — `a[2]` silently changes; if capacity is full, append reallocates and they diverge. Both behaviors are correct Go and both surprise. Defenses: full-slice expressions `a[low:high:max]` to cap capacity when handing out sub-slices; `slices.Clone` when the callee might append/mutate; never retain sub-slices of large buffers (pins the whole array — copy out what you keep).
-- **Loop-variable capture is FIXED (Go 1.22+): each iteration gets a fresh variable** — the historical `go func(){ use(v) }()` bug no longer applies on supported versions. Don't "fix" it in new code; do still check `go.mod` says ≥1.22 before relying on it.
-- **defer in loops.** `defer f.Close()` inside a range over 10k files runs all closes at function exit — fd exhaustion. Extract the body into a function or close explicitly.
-- **Context misuse.** Ignoring ctx in a select (`case <-ch:` with no `case <-ctx.Done():`) makes cancellation advisory; forgetting `defer cancel()` from `context.WithTimeout` leaks the timer and its goroutine until expiry; using `context.WithValue` for parameters (a `userID` your function requires belongs in the signature).
-- **Error-handling anti-patterns.** `if err != nil { log.Error(err); return err }` — double reporting; pick one. `errors.New` in hot comparison paths without a package-level sentinel (`var ErrNotFound = errors.New("not found")`) makes `errors.Is` impossible. Wrapping with `%v` instead of `%w` severs the chain. Exporting error *types* when a sentinel would do commits you to API surface.
-- **WaitGroup misuse.** `wg.Add(1)` must happen *before* `go` (inside the goroutine is a race with `Wait`); passing WaitGroup by value copies it (vet catches this — run `go vet` always).
-- **Map iteration order and races.** Order is deliberately randomized — any test depending on it flakes. Concurrent map writes are a fatal runtime crash, not a data corruption: guard with a mutex or use `sync.Map` only for the two blessed cases (append-mostly caches; disjoint key sets per goroutine).
-- **Table-driven tests, the load-bearing conventions:** name each case (`tests := []struct{ name string; ... }`), use `t.Run(tt.name, ...)` for isolation and `-run 'TestX/case'` targeting, `t.Parallel()` where cases are independent, `got`/`want` vocabulary with `cmp.Diff` (google/go-cmp) for structs. Test through the public API of the package (`package foo_test`). For concurrency tests on 1.25+, use `testing/synctest` to make time deterministic instead of sleeps. Run `go test -race ./...` in CI unconditionally — the race detector is the single highest-value flag in the toolchain.
-- **Interface pollution.** Defining interfaces "for mockability" on every type produces one-implementation interfaces everywhere. Mock at architectural boundaries (storage, external APIs) using small consumer-defined interfaces; test everything else with real types.
+- **Nil interface gotcha.** An interface is nil only when *both* its type and value are nil. `var p *MyErr; var err error = p; err != nil` is **true** — a typed nil inside a non-nil interface. Ships as: `func f() error { var e *MyErr; ...; return e }` — callers see a non-nil error that explodes on use. Rule: return literal `nil`, never a possibly-nil concrete pointer through an interface return type.
+- **Slice aliasing and append sharing.** `b := a[:2]; b = append(b, x)` writes into `a`'s backing array when capacity allows — `a[2]` silently changes; when capacity is full, append reallocates and the slices diverge. Both are correct Go; both surprise. Defenses: full-slice expressions `a[low:high:max]` to cap capacity on handed-out sub-slices; `slices.Clone` before a callee might append; never retain a small sub-slice of a huge buffer (pins the whole array — copy out).
+- **Loop variables are per-iteration since Go 1.22** — the historical `go func(){ use(v) }()` capture bug is dead on supported versions. Don't add `v := v` to new code; do check `go.mod` says ≥1.22 before deleting it from old code.
+- **`defer` in loops.** `defer f.Close()` inside a 10k-file range runs every close at *function* exit — fd exhaustion. Extract the loop body into a function, or close explicitly.
+- **Context misuse.** A `select` without a `case <-ctx.Done():` makes cancellation advisory; forgetting `defer cancel()` after `context.WithTimeout` leaks the timer goroutine until expiry; `context.WithValue` for required parameters (a `userID` your function needs belongs in its signature — values are for cross-cutting metadata).
+- **Error anti-patterns.** `log.Error(err); return err` — double handling, pick one. Wrapping with `%v` instead of `%w` — severs the chain, `errors.Is` goes blind. Ad-hoc `errors.New` at each call site instead of a package sentinel (`var ErrNotFound = errors.New("not found")`) — makes matching impossible. Exporting error *types* when a sentinel suffices — needless API surface.
+- **WaitGroup rules.** `wg.Add(1)` *before* `go`, never inside the goroutine (races with `Wait`); pass `*sync.WaitGroup` or capture it — copying is a vet error. Run `go vet ./...` always; it's free and catches this class.
+- **Map behavior.** Iteration order is deliberately randomized — tests depending on it flake; sort keys first. Concurrent map writes are a *fatal runtime crash*, not silent corruption: guard with a mutex; `sync.Map` only for its two blessed workloads (write-once/read-many caches; disjoint key sets per goroutine).
+- **Goroutines in HTTP handlers.** `go doSlowThing(r.Context())` — the request context is cancelled when the handler returns, killing the background work; and nothing waits for the goroutine at shutdown. Background work needs a detached context (`context.WithoutCancel` since 1.21) *and* registration with the server's shutdown WaitGroup/errgroup.
+- **Interface pollution.** An interface per struct "for mockability" produces one-implementation interfaces everywhere and hides the concrete type's docs. Mock at architectural boundaries (storage, external APIs) via small consumer-defined interfaces; test everything else with real types.
+- **Table-driven tests, the load-bearing conventions:** named cases in `[]struct{ name string; ... }`; `t.Run(tt.name, ...)` for isolation and `-run 'TestX/case'` targeting; `t.Parallel()` where independent; `got`/`want` with `cmp.Diff` (google/go-cmp) for structs; test the *public* API from `package foo_test`; `t.Helper()` in assertion helpers so failures point at the case. Concurrency/time logic on 1.25+: `testing/synctest` with its fake clock instead of real sleeps. CI: `go test -race ./...` unconditionally — the race detector is the highest-value flag in the toolchain.
 
 ## Worked micro-examples
 
@@ -55,34 +88,80 @@ func process(ctx context.Context, jobs <-chan Job) error {
             for {
                 select {
                 case <-ctx.Done():
-                    return ctx.Err()          // exit plan 1: cancellation
+                    return ctx.Err()               // exit plan 1: cancellation
                 case j, ok := <-jobs:
-                    if !ok { return nil }      // exit plan 2: channel closed by producer
+                    if !ok {
+                        return nil                 // exit plan 2: producer closed the channel
+                    }
                     if err := handle(ctx, j); err != nil {
-                        return fmt.Errorf("job %s: %w", j.ID, err) // cancels siblings via ctx
+                        return fmt.Errorf("job %s: %w", j.ID, err) // fails group, cancels siblings
                     }
                 }
             }
         })
     }
-    return g.Wait() // exit plan 3: someone provably waits
+    return g.Wait()                                // exit plan 3: someone provably waits
 }
 ```
 
-**Consumer-side interface + error chain:**
+**Consumer-side interface + error chain across layers:**
 ```go
-// package report (the CONSUMER defines what it needs)
-type UserGetter interface{ GetUser(ctx context.Context, id string) (User, error) }
+// package report — the CONSUMER defines the interface it needs, sized to use
+type UserGetter interface {
+    GetUser(ctx context.Context, id string) (User, error)
+}
 
 func Build(ctx context.Context, ug UserGetter, id string) (*Report, error) {
     u, err := ug.GetUser(ctx, id)
-    if errors.Is(err, storage.ErrNotFound) { return nil, fmt.Errorf("report for %s: %w", id, ErrNoSubject) }
-    if err != nil { return nil, fmt.Errorf("loading user %s: %w", id, err) }
-    ...
+    switch {
+    case errors.Is(err, storage.ErrNotFound):
+        return nil, fmt.Errorf("report for %s: %w", id, ErrNoSubject) // translate at the boundary
+    case err != nil:
+        return nil, fmt.Errorf("loading user %s: %w", id, err)       // wrap with context, %w
+    }
+    _ = u
+    // ...
+    return &Report{}, nil
 }
-// package storage returns *storage.Client (concrete); it never heard of UserGetter.
+// package storage returns *storage.Client (concrete). It has never heard of UserGetter —
+// *storage.Client satisfies it structurally. That's the whole design.
+```
+
+**Table-driven test skeleton:**
+```go
+func TestParse(t *testing.T) {
+    tests := []struct {
+        name    string
+        in      string
+        want    Config
+        wantErr error
+    }{
+        {name: "defaults", in: "{}", want: DefaultConfig()},
+        {name: "bad port", in: `{"port":-1}`, wantErr: ErrBadPort},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            t.Parallel()
+            got, err := Parse(strings.NewReader(tt.in))
+            if !errors.Is(err, tt.wantErr) {
+                t.Fatalf("Parse() error = %v, want %v", err, tt.wantErr)
+            }
+            if diff := cmp.Diff(tt.want, got); diff != "" {
+                t.Errorf("Parse() mismatch (-want +got):\n%s", diff)
+            }
+        })
+    }
+}
 ```
 
 ## Verification and stopping rule
 
-Before presenting Go code or advice: (1) point to the exit plan of every goroutine (who stops it, who waits); (2) `go vet` and `-race` must be assumed — does the code survive both? (3) check every `append` on a shared slice and every returned sub-slice for aliasing; (4) confirm error chains use `%w` end-to-end and callers use `Is`/`As`, never `strings.Contains`; (5) version-gate advice: range-over-int and fixed loop vars need 1.22+, synctest needs 1.25+. Stop simplifying when the code reads top-to-bottom without goroutine bookkeeping in your head, interfaces have ≤3 methods, and pprof shows business logic on top — Go rewards stopping early; cleverness is the language's only real enemy.
+Before presenting Go code or advice:
+1. Point to the exit plan of every goroutine — who stops it, who waits for it. No answer, no `go`.
+2. Assume `go vet ./...` and `go test -race ./...` run — does the code survive both?
+3. Check every `append` on shared or returned slices for aliasing, and every interface-typed return for the typed-nil trap.
+4. Confirm error chains use `%w` end-to-end, sentinels exist where callers match, and nothing string-matches error text.
+5. Version-gate: per-iteration loop vars and range-over-int need 1.22+; `synctest` needs 1.25+; Green-Tea-GC-by-default claims need 1.26.
+6. For any performance assertion, name the profile or benchmark that would confirm it — if you can't, present it as a hypothesis to measure, not a fact.
+
+Stopping rule: done when the code reads top-to-bottom without goroutine bookkeeping in your head, interfaces have ≤3 methods and live in consumer packages, and pprof puts business logic on top. Go punishes cleverness more than any mainstream language — when in doubt, write the dumber version and stop.

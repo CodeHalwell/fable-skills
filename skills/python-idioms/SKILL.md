@@ -53,6 +53,12 @@ Internal monologue: *Low CPU + stalls in async = the event loop is blocked, not 
 
 Verification: replay load; the 100ms-callback warnings must disappear and p99 must follow.
 
+## Second scenario: "the CLI takes 4 seconds before printing --help"
+
+Internal monologue: *Slow startup is import time until proven otherwise. Measure, don't read code: `python -X importtime -c "import mycli" 2> imports.log` and sort by cumulative — or `tuna imports.log` to visualize. Typical findings, by base rate: (1) heavyweight libraries imported at top level of modules that rarely need them — pandas (~1s), torch (seconds), boto3; (2) a plugin/registry system importing every plugin eagerly; (3) network or file work at import (reading config, checking versions). The log shows `mycli.report` pulling pandas for one function used by one subcommand. Options: (a) move the import inside the function — function-local imports are cached after first call, cost nanoseconds after that, and are perfectly idiomatic for heavy optional deps; (b) `import defer`-style lazy loading via module `__getattr__` (PEP 562) for a library facade — right when many attributes lazily map to submodules; (c) restructure the CLI so subcommands import their own modules only when dispatched — the structural fix; typer/argparse dispatch makes this natural. Rejected: precompiled/frozen imports or daemonizing the CLI — heavy machinery for a problem that's really "we do work before we're asked." Ship (a) now, (c) at the next refactor. Also grep top levels for `os.environ[...]` and file reads — those are correctness bugs (import order dependence), not just latency.*
+
+Verification: `importtime` again — target under ~200ms for a CLI; `--help` must not import pandas at all.
+
 ## Failure modes and pitfalls
 
 - **Fire-and-forget task garbage collection.** `asyncio.create_task(coro())` without keeping a reference: the loop holds only a *weak* reference, so the task can be GC'd mid-flight and silently vanish. Correct: `t = create_task(...); tasks.add(t); t.add_done_callback(tasks.discard)` — or better, **`asyncio.TaskGroup`** (3.11+), which owns its children, cancels siblings on failure, and raises `ExceptionGroup` (handle with `except*`). TaskGroup is the default; a bare `create_task` needs a written reason.
@@ -68,6 +74,12 @@ Verification: replay load; the 100ms-callback warnings must disappear and p99 mu
 - **stdlib gems experts actually use:** `itertools.pairwise` / `batched` (3.12+), `functools.cache` / `cached_property`, `collections.Counter` / `defaultdict` / `deque`, `pathlib` everywhere, `shutil.which`, `textwrap.dedent`, `tomllib` (3.11+, read-only TOML), `zoneinfo` (never pytz in new code — `pytz.localize` misuse is the classic LMT-offset bug), `dataclasses.replace`, `contextlib.ExitStack` for a dynamic number of context managers, `contextlib.suppress` for intentional ignoring, `bisect`/`heapq` before writing a search or priority queue.
 - **stdlib footguns:** `datetime.utcnow()` — deprecated and returns a *naive* datetime; use `datetime.now(timezone.utc)`. `json.dumps` happily emits `NaN` (invalid JSON — set `allow_nan=False` at boundaries). `str.strip("suffix")` strips a character *set*; use `removesuffix`/`removeprefix`. `os.path.join("/a", "/b")` → `/b`. `copy.copy` shares nested interiors. `subprocess.run` — always list argv, `check=True`, never `shell=True` with interpolated strings. `re` module: catastrophic backtracking on adversarial input — prefer `re2`-style patterns or bound input length.
 - **`is` vs `==` on small ints/strings** — works in tests by interning accident, fails in production. `is` is for `None`, `True`, `False`, and sentinels only.
+- **Generator cleanup surprises.** A generator abandoned mid-iteration runs its `finally` only when GC'd — nondeterministically. If a generator holds a resource (open file, DB cursor), either wrap usage in `contextlib.closing(gen)` or restructure so the resource's `with` lives *inside* the generator around the yield loop.
+- **`yield` inside `with` in async generators** plus early consumer exit can fire cleanup in a *different task* at shutdown (`aclose` from the event loop's finalizer) — causing "task got Future attached to a different loop"-class errors. Prefer `async with` in the consumer, or drive cleanup explicitly with `contextlib.aclosing`.
+- **Exception-swallowing `__exit__`.** Returning a truthy value from `__exit__` (or `contextmanager` code that catches around `yield` without re-raising) silently suppresses exceptions. Suppress only named, expected exception types; never return `True` unconditionally.
+- **Shadowing stdlib module names.** A file named `types.py`, `email.py`, `queue.py`, or `test.py` in your package root breaks imports in ways that produce baffling `AttributeError: partially initialized module` messages. Check filenames first when imports misbehave.
+- **`functools.lru_cache` on methods** retains `self` in the cache — every instance ever cached is immortal. Cache on module-level functions of hashable args, or use `functools.cached_property` for per-instance memoization.
+- **Float and Decimal boundaries.** `json.loads` parses numbers to float — money loses precision before your Decimal ever sees it; parse with `json.loads(s, parse_float=Decimal)` at financial boundaries.
 
 ## Worked micro-examples
 
@@ -105,6 +117,29 @@ def timed(label: str):
 
 with timed("reindex"):
     reindex_all()
+```
+
+**Generator pipeline over a too-big-for-memory file (lazy stages, constant memory):**
+```python
+import gzip
+from collections.abc import Iterator
+
+def read_lines(path: str) -> Iterator[str]:
+    with gzip.open(path, "rt") as f:      # the with lives INSIDE, around the yields
+        yield from f
+
+def parse(lines: Iterator[str]) -> Iterator[dict]:
+    for ln in lines:
+        if ln.startswith("#"):
+            continue
+        ts, level, msg = ln.rstrip("\n").split("\t", 2)
+        yield {"ts": ts, "level": level, "msg": msg}
+
+def errors_only(recs: Iterator[dict]) -> Iterator[dict]:
+    return (r for r in recs if r["level"] == "ERROR")
+
+# Composition without materialization; nothing is read until consumed:
+count = sum(1 for _ in errors_only(parse(read_lines("app.log.gz"))))
 ```
 
 **uv project skeleton (pyproject.toml essentials):**

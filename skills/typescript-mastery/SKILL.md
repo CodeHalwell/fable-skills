@@ -58,6 +58,14 @@ Internal monologue: *The narrowing worked on the `if` line — the discriminated
 
 Prior to internalize: **~80% of "narrowing broke" reports are callback or mutation-boundary resets; the fix is a `const` snapshot, not a cleverer type.** The remaining 20%: narrowing on a non-literal discriminant (discriminants must be literal types, not `string`), or `in`/`instanceof` checks on unions of primitives where a custom guard is needed.
 
+## Second scenario: "typechecks locally, throws `undefined is not a function` in prod"
+
+An ESM service imports a utility: `import { parse } from 'legacy-csv'` — pyright-of-the-JS-world says fine, production throws `parse is not a function`.
+
+Internal monologue: *Types said yes, runtime said no — so the axiom is in the interop layer, not my code. `legacy-csv` is CJS (check: no `"type": "module"`, no `"exports"` with an `import` condition). Its `.d.ts` says `export function parse(...)` — but `.d.ts` files describe intent, not runtime shape. At runtime, Node synthesizes named exports from CJS via static analysis (cjs-module-lexer); if the package builds its exports dynamically (`module.exports = buildApi()`), the lexer finds nothing, and `parse` is `undefined` while the* default *import would hold the whole object. Confirm cheaply: `node -e "import('legacy-csv').then(m => console.log(Object.keys(m)))"` — prints `['default']` only. Diagnosis confirmed. Options: (a) `import pkg from 'legacy-csv'; const { parse } = pkg` — works, slightly ugly, correct; (b) `createRequire(import.meta.url)` and `require('legacy-csv')` — works, heavier, reserve for packages that also misbehave under (a); (c) "fix" the types with a `declare module` override — rejected: types were never the problem; (d) switch tsconfig to `module: bundler` so it typechecks either way — rejected: hides the mismatch instead of resolving it, and this code runs on Node directly. Take (a) with a comment naming the lexer limitation.*
+
+Prior: **when types and runtime disagree at a module boundary, believe the runtime and inspect `Object.keys(await import(pkg))` before touching any types.**
+
 ## Failure modes and pitfalls
 
 - **Method-syntax variance hole.** `interface Handler { handle(e: Animal): void }` — method shorthand checks *bivariantly*: an implementation with `handle(e: Dog)` is accepted, unsoundly. Property syntax `handle: (e: Animal) => void` is properly contravariant under `strictFunctionTypes`. Declare callback-bearing members with property syntax anywhere soundness matters.
@@ -72,6 +80,10 @@ Prior to internalize: **~80% of "narrowing broke" reports are callback or mutati
 - **Template-literal and recursion blowups.** Unions multiply through `` `${A}-${B}` `` (sizes multiply; the compiler bails near 100k members); recursive conditional types hit depth limits (~50 non-tail, ~1000 tail-recursive). "Type instantiation is excessively deep" usually means: stop computing this at the type level, validate at runtime instead.
 - **Branded types with leaky construction.** A brand is worthless if modules cast into it ad hoc. Exactly one validating constructor per brand; grep for `as UserId` in review.
 - **`readonly` is shallow and erased.** `readonly x: T[]` prevents reassigning `x`, not mutating the array — that needs `readonly T[]`. And nothing stops JS callers at runtime; `Object.freeze` if it truly matters.
+- **Array method inference sinks.** `[].includes(x)` demands `x` be the array's element type (annoying with branded/literal unions — widen the array, not the value: `(list as readonly string[]).includes(x)`); `filter(x => x !== null)` did not narrow before 5.5 and still doesn't for complex predicates — write `filter((x): x is T => ...)` when the inferred guard fails.
+- **`keyof` + generics access surprise.** Inside `function get<T, K extends keyof T>(o: T, k: K): T[K]`, writing through `o[k] = value` needs `T[K]` exactly — assignments to generic indexed-access types are checked pessimistically; if you hit "not assignable to T[K]", the honest fixes are a mapped-type setter design or a justified assertion, not loosening `K`.
+- **Losing literal types through intermediate variables.** `let method = 'GET'; fetchIt(method)` fails when `fetchIt` wants `'GET' | 'POST'` — `let` widens to `string`. Use `const`, `as const`, or `satisfies` at the definition, not a cast at the use site.
+- **Global augmentation leakage in tests.** Adding `declare global { var testDb: Db }` in a test helper leaks into production type space for the whole project — scope test globals to a `tsconfig.test.json` include, or pass fixtures explicitly.
 
 ## Worked micro-examples
 
@@ -106,6 +118,21 @@ const routes = {
 } satisfies Record<string, `/${string}`>;
 // typeof routes.user is the literal '/users/:id' (annotation `: Record<...>` would widen to string)
 type RouteName = keyof typeof routes; // 'home' | 'user' — derived, not duplicated
+```
+
+**The generic that earns its keep — a synced event map:**
+```ts
+interface Events {
+  'user.created': { id: string; email: string };
+  'user.deleted': { id: string };
+}
+function emit<K extends keyof Events>(name: K, payload: Events[K]): void { /* ... */ }
+function on<K extends keyof Events>(name: K, fn: (payload: Events[K]) => void): void { /* ... */ }
+
+emit('user.created', { id: '1', email: 'a@b.c' }); // ok
+emit('user.deleted', { id: '1', email: 'x' });     // error: excess property — payloads can't drift
+// Adding an event = one line in Events; every emit/on site is checked. THIS is what
+// generics are for: two things (names, payloads) that must stay in sync.
 ```
 
 **Type-level debugging techniques:**
