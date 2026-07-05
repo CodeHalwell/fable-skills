@@ -58,6 +58,17 @@ The pattern: per-GB charges attached to *movement and retention* — costs propo
 - **Coverage target ≠ 100%.** Chasing full coverage guarantees overcommitment after the next architecture change (that migration to Graviton/ARM or to Fargate you're planning changes what your commitments match). 70–85% coverage of steady-state is the defensible band; review quarterly, buy in tranches (monthly/quarterly purchases ladder the expiry dates and average out mistakes).
 - Watch both dashboards: **utilization** (are we using what we bought) and **coverage** (what fraction of usage is discounted). Alarm on utilization < ~95% — that's money already spent, leaking.
 
+Instrument cheat sheet (as of 2026 — reverify before purchase):
+
+| Instrument | Discount ceiling | Flexibility | Use for |
+|---|---|---|---|
+| AWS Compute Savings Plan | ~66% | Cross-family/region, EC2+Fargate+Lambda | The default baseline layer |
+| AWS EC2 Instance SP / Standard RI | ~72% | Family+region locked | Named, multi-year-stable fleets only |
+| Service RIs (RDS/ElastiCache/OpenSearch/Redshift) | varies | Per-service | Databases — Savings Plans don't cover them |
+| Azure reservations + compute savings plan | comparable | Per-scope, exchangeable | Same layering logic |
+| Azure Hybrid Benefit | large, stacks | License-dependent | Windows/SQL estates — check first |
+| GCP CUDs (+ automatic SUDs) | comparable | Resource- or spend-based | Same layering logic |
+
 ## Spot / preemptible engineering
 
 - **What tolerates interruption:** stateless web fleets behind LBs (with surplus capacity), batch/queue workers (work returns to queue), CI runners, big-data executors (Spark with decommissioning), ML *training with checkpointing*, rendering. **What doesn't:** databases and stateful primaries, long transactions that can't checkpoint, latency-SLO singletons, anything whose interruption cost (rework + human attention) exceeds the ~60–90% discount.

@@ -164,6 +164,8 @@ var client = new BlobServiceClient(
     new DefaultAzureCredential());
 ```
 
+**Cosmos RU envelope (the arithmetic that prevents 429 surprises):** a 1KB point read ≈ 1 RU; a 1KB write ≈ 5–6 RU (more with indexed properties); queries cost by data scanned within the partition. So 2,000 reads/s + 300 writes/s of 1KB items ≈ 2,000 + ~1,700 ≈ 3,700 RU/s *average* — provision autoscale with a max comfortably above the observed peak-to-average ratio, and remember cross-partition queries multiply the read cost by partitions touched. If the RU math lands 10× above budget, the fix is the partition key or the query shape, not a bigger throughput dial.
+
 ## Verification / self-check
 
 1. Zero secrets in app settings/IaC — every data-plane access is a managed identity + RBAC role you can name.

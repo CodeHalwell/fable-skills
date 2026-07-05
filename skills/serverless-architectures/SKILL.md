@@ -81,6 +81,13 @@ Anti-pattern: cron "warmer" pings — they keep one instance warm while real tra
 
 Symptoms: a "microservices" diagram where function A synchronously invokes B invokes C; every deploy requires coordinating three functions; one shared database table written by five functions; a change to one event schema breaks four consumers at runtime. Causes: decomposing by technical layer (validate-fn → transform-fn → save-fn) instead of by business capability, and using sync calls where events belong. Corrections: merge layer-functions into one handler (a function is a deployment unit, not a code-organization unit — three steps in one function is *fine*); schema-version events (registry or explicit `version` field, consumers tolerant of additive change); one writer per table/stream. Ask of any function: "can this deploy alone, and does it own its data?" If either answer is no for many functions at once, you've built a monolith with network partitions inside it.
 
+## Lock-in reasoning — worry about the right layer
+
+- Handler code is the portable part: keep business logic in the pure core (below) and the handler thin, and moving compute between Lambda/Functions/Cloud Run is days of work. Nobody's migration died on the function bodies.
+- The sticky layers, in order: **IAM/RBAC graphs** (hundreds of role-resource edges with cloud-specific semantics), **event source contracts** (EventBridge patterns, SQS semantics, Cosmos change feed behaviors — each with unique delivery/retry quirks), **orchestration definitions** (ASL state machines, Durable Functions replay), and **data services** (DynamoDB single-table designs don't translate).
+- Therefore: judge a design's lock-in by counting event-source types and IAM edges, not function count. Consciously buying deep integration (Step Functions, DynamoDB streams) for velocity is fine — record it as a decision with an exit cost, not a surprise.
+- Anti-pattern: multicloud abstraction frameworks that wrap every service behind a portability layer "just in case" — you pay the abstraction tax on every feature forever to maybe save one migration that statistically never comes. Portability of the *core logic* is cheap insurance; portability of the *platform glue* is expensive insurance against a rare event.
+
 ## Local dev and testing strategy
 
 Split the code so the strategy is possible: **thin handler** (parse event, call logic, shape response) + **pure core** (business logic, unit-testable with zero cloud). Then:

@@ -52,6 +52,16 @@ Capacity says "enough servers"; the latency budget says "fast enough path." Deco
 3. **How bad is the backlog?** Queue draining at 500 msg/s with 900k backlog → 30 minutes to drain *if* arrival stops; with arrivals at 400/s, net drain 100/s → 2.5 hours. Little's Law turns incident guesswork into an ETA.
 Corollary: latency degradation *silently eats capacity* — if downstream latency doubles, the same worker pool sustains half the throughput. Systems fail sideways like this: a slow dependency turns into "we're out of threads" upstream.
 
+## Reading the numbers off a running system in ten minutes
+
+When the system already exists, estimate from telemetry, not first principles — first principles is for greenfield:
+- Peak and ratio: LB/gateway request metrics, max-of-1-minute over 30 days ÷ average — that quotient is your provisioning multiplier.
+- True concurrency: in-flight requests from the LB, or derive λ×W from RPS × p50; compare against thread/connection pool sizes for the margin.
+- Working set: cache hit rate vs cache size (grow the cache until hit rate plateaus — the plateau's knee is the working set), or DB buffer-cache hit ratio.
+- Growth: storage bytes and row counts over 90 days, fit on the recent window, check second derivative.
+- Failure headroom: yesterday's deploy or AZ rebalance is a natural experiment — what did utilization do when 1/3 of capacity briefly left?
+Ten minutes of dashboard archaeology beats an afternoon of assumed constants, and disagreements between the two are where the real findings live.
+
 ## Peak-to-average and growth modeling
 
 - Compute three numbers for any workload: **average rate, daily-peak rate (p99 hour), event-peak rate** (launch/marketing/viral). Provision baseline for daily peak + headroom; have a plan (autoscaling, pre-warming, load shedding, queueing) for event peak rather than owning it 24/7.
@@ -135,6 +145,14 @@ Downstream limits check: FCM/APNS rate limits and connection guidance at 13k/s �
 - **Testing through a different path than production:** load generator inside the VPC hitting the service directly while real users traverse CDN + WAF + LB + TLS — the test validates a system users never touch. Match the entry path or annotate the gap.
 - **Capacity plan without a quota audit:** the Super-Bowl plan needs 400 instances; the account quota is 128. Quotas are raised in days, discovered in seconds — audit them when the plan is written.
 - **One envelope, never revisited:** the estimate that justified the architecture at 100k users silently governs at 5M. Re-run the envelope at every order of magnitude; the conclusions flip (cache→shard, single-region→edge, VM→fleet) at predictable thresholds.
+
+## Worked micro-example — sizing a queue-worker fleet with an SLA
+
+Jobs arrive at 40/s daily-peak, each takes 3s ± heavy tail (p99 = 12s); SLA: 95% of jobs start within 30s.
+- Concurrency needed at peak: L = 40 × 3 = 120 workers *at 100% utilization* — target 70% → **~170 worker slots**.
+- Sanity-check the tail: 170 slots at ρ ≈ 0.7 keeps queue wait around 0.7/(1−0.7) ≈ 2.3× mean service ≈ 7s — inside the 30s SLA with room for the p99-job clumping; at 130 slots (ρ ≈ 0.92) predicted wait ≈ 11× ≈ 33s — **over SLA on the average day**, which is the difference the headroom bought.
+- Burst plan: a 3× marketing burst becomes queue depth, not failure — drain math: backlog 20k jobs at (170 slots ÷ 3s) ≈ 57 jobs/s minus arrivals; state the drain ETA in the runbook.
+- The three numbers to alarm on: queue oldest-age (SLA proxy), worker utilization (>80% sustained = capacity action), and per-job duration drift (latency eats capacity silently — 3s→4s is a 25% fleet shrink you didn't schedule).
 
 ## Worked micro-example — envelope for a URL-shortener-style read path
 
