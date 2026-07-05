@@ -194,7 +194,19 @@ Rank by churn, then flag files that are also large/deep. Expect a power law — 
 | D-14 | Report renderer string templating | inadv-prudent | ~2 dd/yr | ~20 dd | n/a | revisit if reporting re-enters roadmap | ACCEPTED permanently 2026-04 |
 ```
 
-**4. Strangler-fig sequencing** (for the `OrderProcessor` scenario above — the shape generalizes):
+**4. Friction log — format and use** (the highest-ROI debt instrument per unit effort):
+
+```text
+# FRICTION.md — append-only, one line per event, no debate at write time
+2026-06-03  bkim    1.5h  orders/ test suite flaked 3x before green (retry roulette)
+2026-06-03  asousa  0.5h  re-derived PricingRules tier precedence AGAIN; no source of truth
+2026-06-05  jlee    2.0h  local env broke after pulling; billing/ needs undocumented seed data
+2026-06-09  bkim    1.0h  reviewer round-trip because OrderProcessor change touched 4 unrelated concerns
+```
+
+Rules that make it work: entries take <30 seconds to write (or nobody writes them); no fixing, no blaming, no triaging in the log itself; monthly, someone aggregates by path and theme — `sort` + `awk` is enough — and the top 2 themes become the quarter's registry candidates with dev-day interest figures attached. The log's authority comes from being boring, cheap, and written at the moment of pain rather than reconstructed in a planning meeting.
+
+**5. Strangler-fig sequencing** (for the `OrderProcessor` scenario above — the shape generalizes):
 
 ```text
 Step 0  Seam audit: all order-state transitions already pass through dispatch();
