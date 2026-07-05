@@ -77,3 +77,8 @@ Before presenting correctness-sensitive code or analysis, confirm:
 5. **Termination:** named the decreasing variant and checked it strictly decreases on *every* branch, including the branch where the guard nearly holds.
 6. **State machines:** every (state, event) pair has defined behavior — count them: |states| × |events|; unhandled pairs are bugs, not "won't happen".
 7. **If any check above was skipped, say so explicitly** in the answer ("not verified for concurrent callers") rather than implying full correctness.
+
+## Delta notes (vs Opus 4.8 baseline, audited 2026-07)
+- Probed 10 claims: ~7 baseline (compressed), 2 partial (sharpened), ~1 delta. This skill is largely a *practice-injection* sheet, not a knowledge gap — Opus 4.8 cold already nails deadlock lock-ordering, safety/liveness+retry, refinement direction (pre weaken / post strengthen), the 20-interleaving count, property-test ranking, and a full concurrency-pitfall list.
+- Genuine deltas kept: (a) the discipline of *writing the invariant before the code* (behavioral, not factual); (b) needing *two* properties to pin a spec, since one plausible property ratifies broken code; (c) keeping cheap conservation/state-machine asserts ON in production (Opus's reflex is "strip asserts in release"); (d) standardizing on half-open intervals to kill off-by-one bookkeeping.
+- Worked examples were cut to the two that carry non-obvious practice; the rest were mechanics Opus reproduces verbatim.
