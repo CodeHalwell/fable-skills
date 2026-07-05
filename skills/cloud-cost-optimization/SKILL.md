@@ -85,6 +85,13 @@ Worked lifecycle policy (S3, the shape to copy — tier *and* expire, with the m
 ```
 The `AbortIncompleteMultipartUpload` and noncurrent-version rules are where versioned buckets silently hoard invisible gigabytes — invisible in the console object list, fully visible on the bill.
 
+## Analytics and data-platform cost — the per-scan trap
+
+- Scan-priced engines (Athena, BigQuery on-demand) bill per TB scanned: a dashboard auto-refreshing a `SELECT *` over an unpartitioned table every 5 minutes is a money printer in reverse. The fixes are physical, not query-side politeness: partition on the filter columns, columnar formats (Parquet), clustering, and materialized/pre-aggregated tables for anything a dashboard polls.
+- Warehouse-compute engines (Snowflake, BigQuery capacity) bill for *time running*: auto-suspend aggressively (minutes, not hours), size warehouses per workload class instead of one XL for everything, and hunt the scheduled job that keeps the warehouse resumed 24/7 to serve one hourly query.
+- The unit metric here is cost-per-query or cost-per-dashboard — surfacing it per team turns "the data platform is expensive" into three named dashboards someone can fix by Friday.
+- Same prevention logic as everywhere: query/scan budgets and alerts per user or service account, because one analyst's cross-join should page them, not surprise finance.
+
 ## Guardrails and anomaly detection — savings that persist
 
 - **Budgets with actions, not just emails:** per-team/per-account budget alerts at 80/100/forecast-120%, and for sandboxes, automated response (notify → freeze new resource creation) — a human reading a budget email three weeks later is not a control.

@@ -22,6 +22,23 @@ description: Load when debugging network-ish production symptoms (intermittent 5
 
 Localization heuristic: name doesn't resolve → DNS. Resolves but `nc` fails → routing/firewall/security group. TCP opens but TLS fails → certs, SNI, protocol mismatch, or a middlebox doing TLS interception. TLS fine but HTTP errors → now, finally, it's the application (or the proxy in front of it).
 
+The quiver, one line each:
+
+```bash
+dig +short api.example.com                      # what does THIS host's resolver say
+dig api.example.com @1.1.1.1 +short             # vs a public resolver (cache/split-horizon check)
+dig +trace api.example.com                      # authoritative chain from the root
+nc -vz api.example.com 443                      # will TCP even open
+mtr -rwbz -c 50 api.example.com                 # path report: per-hop loss/latency, 50 probes
+openssl s_client -connect h:443 -servername h   # TLS handshake + chain, SNI set
+curl -v https://h/path                          # the whole pipeline, narrated
+curl --resolve h:443:10.0.0.5 https://h/path    # pin DNS: test a specific backend pre-cutover
+ss -tnp | grep :5432                            # live sockets: states, queues, owning process
+sudo tcpdump -i any host 10.0.0.5 and port 443 -w cap.pcap   # ground truth when tools disagree
+```
+
+Run them *from the failing vantage point* — a pod's resolver, routes, and MTU are not your laptop's (use an ephemeral debug container: `kubectl debug -it pod -- sh`).
+
 ## DNS reasoning
 
 - Records applied: A/AAAA (name→IP), CNAME (alias — cannot coexist with other data at the same name, which is why apex domains can't CNAME and cloud providers invented ALIAS/ANAME flattening), NS (delegation), MX, TXT (SPF/DKIM/verification), SRV, CAA (which CAs may issue for you — set it).
