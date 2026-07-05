@@ -226,6 +226,23 @@ Step 5  Repeat by risk-ascending order. Publish a burn-down (transitions remaini
 
 Each step ships independently and the project can pause safely after any step 4 — that pause-safety is the economic argument that beats a rewrite, and it's worth stating explicitly in the product negotiation.
 
+## Priors and stopping rules (compact reference)
+
+Priors to reason from before any data arrives — then let data override:
+
+- Most of the felt "debt problem" is 2–5 hotspot files; whole-codebase despair is almost always measurement error.
+- The proposed rewrite is almost never justified; the un-costed strangler is almost always the actual gap in the proposal.
+- Debt that regrew after a cleanup has a running generator (pressure, tooling gradient, skill gap) — look for the generator, not a better cleanup.
+- When product "never gives time for quality," the requests were probably framed as cleanliness — fix the framing before blaming the PM.
+- As of 2026, if a codebase adopted AI codegen recently, expect elevated duplication and wrapper-accretion around old cores; check those two signals first.
+
+Stopping rules — more work past these points is waste:
+
+- **Analysis:** stop when the top hotspots clearly separate from the pack and each has an interest estimate; a full-codebase quality audit adds cost, not signal.
+- **Paydown:** stop when the triggering roadmap item is unblocked and the ratchet holds; "the file is now beautiful" is past the stopping point.
+- **Testing-before-refactor:** stop when the behaviors the refactor could plausibly break are pinned; full coverage of the legacy module is past it.
+- **Negotiation:** stop escalating when you have a decision — a documented "no, we accept this risk" from product is a valid outcome that converts the debt to deliberate-prudent; re-raise only when the evidence materially changes.
+
 ## Verification / self-check
 
 Before presenting a debt plan, confirm:

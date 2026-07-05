@@ -112,6 +112,11 @@ Scenario: "Our Llama-3.1-70B chat service on 4×H100 (TP=4) feels sluggish; user
 - **Buying GPUs by FLOPs for a decode-dominated workload.** A GPU with 2× FLOPs and 1.2× bandwidth serves chat ~1.2× faster. Read the workload first: chat/agents are decode-heavy (bandwidth); document-ingestion/RAG-indexing/batch-scoring are prefill-heavy (FLOPs). Fleet mistakes here are seven-figure mistakes.
 - **Fixing TTFT by disabling chunked prefill.** It "works" for the request you're staring at and destroys ITL for the batch it stalls. Chunked prefill exists to bound decode starvation; tune the chunk size against your ITL SLO instead of turning it off.
 - **Assuming quantization quality claims transfer across use cases.** "FP8 loses <1% on MMLU" says nothing about your agentic tool-calling loop, where small per-step degradation compounds across 20 steps. Eval quantized candidates on *your* end-to-end task with *your* prompts; benchmark deltas are a prior, not a verdict.
+- **Small model on big GPU bottlenecked on CPU, blamed on the GPU.** An 8B model on an H200 can decode faster than a single-process Python frontend can tokenize/detokenize/schedule; GPU utilization sits at 40% while everyone tunes kernels. Signature: throughput plateaus while GPU util is low and batch won't fill. Fix the serving process (more API-server workers, separate tokenizer processes) before touching anything on the GPU.
+- **Benchmarking before warm-up.** First requests pay CUDA-graph capture, kernel autotuning/JIT, and (TensorRT-LLM) engine load; including them makes TTFT look catastrophic and steady-state numbers noisy. Warm the server with representative shapes, then measure. Conversely, don't let a 28-minute TensorRT-LLM compile surprise you at deploy time — it's a known cost you schedule, not a regression.
+- **Guided/structured decoding overhead unaccounted.** JSON-schema/grammar-constrained generation adds per-token mask computation; a naive backend serializes it on CPU and doubles ITL. If structured output is a core workload, this is a first-class benchmark axis (and a reason SGLang gets picked), not a checkbox.
+- **`gpu_memory_utilization` pushed to 0.98 to "use all the memory."** Long-context spikes, CUDA graph pools, and fragmentation need slack; the failure is an OOM crash hours into production, taking every in-flight request with it. 0.90–0.95 is the sane band; buy concurrency with KV quantization and `max_model_len`, not by shaving the safety margin.
+- **Long-context TTFT surprise: prefill is quadratic in the attention term.** A 100k-token prompt isn't 10× a 10k prompt — attention FLOPs grow ~quadratically with sequence length even though the MLP term is linear, and TTFT for six-figure contexts runs to many seconds regardless of engine. Budget it: estimate prefill FLOPs ≈ 2 × params × prompt_tokens (plus attention term), divide by achievable FLOPs, and check against the TTFT SLO *before* promising 128k support in an interactive product.
 
 ## Worked micro-examples
 
@@ -141,6 +146,18 @@ Draft + verify overhead ≈ 25–30%  → real speedup ≈ 3.05 × 0.72 ≈ 2.2�
 α = 0.4 → 1.7 raw → ≈ 1.2× — likely a loss after tail effects; turn it off
 ```
 EAGLE-3-class heads hit α ≈ 0.75–0.8 on greedy/low-temp workloads (as of 2026). Read your engine's measured acceptance metric and rerun this formula before crediting any speedup claim.
+
+**4. Cost per million output tokens — from the batching example, not from vibes:**
+```
+H200 on-demand ≈ $3–4/hr (2026 cloud ballpark; substitute your real rate).
+Batch-32 aggregate from example 2: ≈ 1,370 tok/s ≈ 4.9M output tok/hr
+→ ≈ $0.6–0.8 per 1M output tokens for self-hosted 70B-class FP8.
+Batch-1 (dedicated latency box): 55 tok/s ≈ 0.2M tok/hr → ≈ $15–20 per 1M — 25× worse.
+```
+This spread is the whole economics of inference: utilization *is* the price. It's why
+batch APIs are cheap, why providers fight for prefix-cache hits, and why "we'll just
+self-host" is only true for teams that can keep batches full. Redo this arithmetic with
+your measured aggregate throughput before making any build-vs-buy claim.
 
 ## Verification / self-check
 
