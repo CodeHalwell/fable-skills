@@ -13,6 +13,18 @@ description: Load when adding, evaluating, upgrading, pinning, vendoring, or aud
 - **Compromise windows are hours; your exposure window is your choice.** The 2025–2026 npm attacks (chalk/debug, Shai-Hulud, AntV/TanStack) had malicious versions live for 2 hours to ~2 days before takedown. Consumers who install versions <24h old absorb nearly all of that risk; a 3–14 day cooldown on new versions eliminates most of it at almost zero cost. This is the single highest-leverage supply-chain control that exists as of 2026.
 - **Trust attaches to people and pipelines, not artifacts.** xz-utils (2024) was a multi-year social-engineering attack on a burned-out maintainer — every artifact was "authentic." In May 2026 the Mini Shai-Hulud campaign published malicious npm packages with *cryptographically valid SLSA Build L3 provenance* by stealing the OIDC token from a compromised CI runner. Provenance tells you *which pipeline built it*, never *whether that pipeline was clean*. Signatures verify identity, not intent.
 
+## First move by situation
+
+| Situation | First move | Why |
+|---|---|---|
+| PR adds a new dependency | Run the 15-minute evaluation below before reading the feature code | The dep outlives the feature; it's the bigger review surface |
+| CVE advisory fired | Check reachability first: do you call the vulnerable function with attacker-influenced input? | Most advisories are unreachable in your usage; triage beats panic-upgrading everything |
+| Build broke, no code change | Diff the lockfile against last green; check whether CI runs an unfrozen install | "Nothing changed" almost always means a dependency changed |
+| npm/PyPI compromise in the news | Grep your *lockfile* (not manifest) for the affected names+versions, then check CI secret exposure during the window | Transitive closure is what you run; manifests lie by omission |
+| Package deprecated/unmaintained | Check if it's *finished* vs. *abandoned* (does it wrap a moving target?) before migrating | Migrating off stable, done code is negative-value churn |
+| Two teams want different majors of X | Escalate now; never ship the split | Dual-major installs create singleton split-brain bugs that surface far from the cause |
+| Lockfile merge conflict | Take one side wholesale, re-run the resolver | Hand-merged lockfiles produce graphs no resolver ever validated |
+
 ## Decision framework: should this dependency exist at all?
 
 Ask in this order; each answer gates the next:
